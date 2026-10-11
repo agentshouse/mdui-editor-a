@@ -1,0 +1,47 @@
+{
+  "name": "house-document-editor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "node scripts/prepare-release.mjs && vite build",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src/house tests scripts",
+    "release:check": "node scripts/check-release.mjs",
+    "licenses:check": "node scripts/generate-notices.mjs --check",
+    "lint:donor": "eslint src/editor src/ui src/utils src/vendor src/config.js src/services.js src/uri.js src/table.js --rule 'no-unused-vars:off' --rule 'no-redeclare:off' --rule 'no-dupe-keys:off' --rule 'no-dupe-class-members:off' --rule 'no-useless-escape:off' --rule 'no-empty:off'"
+  },
+  "dependencies": {
+    "@agentshouse/app-bridge": "0.1.0-ce524f6608238",
+    "@dokieli/web-annotation": "1.1.0",
+    "dompurify": "3.4.13",
+    "micromark": "4.0.0",
+    "micromark-extension-gfm": "3.0.0",
+    "micromark-extension-gfm-tagfilter": "2.0.0",
+    "papaparse": "5.5.3",
+    "prosemirror-commands": "1.6.2",
+    "prosemirror-history": "1.4.1",
+    "prosemirror-keymap": "1.2.2",
+    "prosemirror-model": "1.24.1",
+    "prosemirror-schema-list": "1.5.0",
+    "prosemirror-state": "1.4.3",
+    "prosemirror-view": "1.37.2",
+    "turndown": "7.2.2",
+    "turndown-plugin-gfm": "1.0.2",
+    "uri-templates": "0.2.0",
+    "yaml": "2.7.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.24.0",
+    "@types/node": "22.14.1",
+    "eslint": "9.24.0",
+    "globals": "16.0.0",
+    "jsdom": "26.0.0",
+    "typescript": "5.8.3",
+    "vite": "6.3.2",
+    "vitest": "3.1.1"
+  }
+}

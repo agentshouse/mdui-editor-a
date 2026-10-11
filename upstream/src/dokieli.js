@@ -1,0 +1,176 @@
+/*!
+Copyright 2012-2026 Sarven Capadisli <https://csarven.ca/>
+Copyright 2023-2026 Virginia Balseiro <https://virginiabalseiro.com/>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+import { showActionMessage, addMessageToLog } from './doc.js'
+import { getDeviceStorageItem } from './storage.js'
+import { restoreSession, setUserInfo, afterSetUserInfo, showUserIdentityInput } from './auth.js'
+import Config from './config.js';
+import { i18n, i18nextInit } from './i18n.js'
+import { init } from './init.js'
+import { getDocumentContentNode } from './utils/html.js';
+import { showDocumentMenu } from './dialog.js';
+import { initTheme } from './theme.js';
+import { updateUILanguage } from './actions.js';
+import { getButtonStates } from './ui/buttons.js';
+
+const DO = window.DO ?? {
+  C: Config,
+
+  U: {
+    handleIncomingRedirect: async function() {
+      // const params = new URLSearchParams(window.location.search);
+
+      getDeviceStorageItem('DO.Config.OIDC').then(OIDC => {
+        // console.log(OIDC)
+        if (OIDC?.authStartLocation && OIDC.authStartLocation !== window.location.href) {
+          var urlsHtml = `<a href="${OIDC.authStartLocation}" rel="noopener" target="_blank">${OIDC.authStartLocation}</a>`
+          var message = `Hang on tight, redirecting you to where you want to be ${urlsHtml}`;
+          var actionMessage = `Redirecting to ${urlsHtml}`;
+
+          const messageObject = {
+            'content': actionMessage,
+            'type': 'info',
+            'timer': 10000
+          }
+
+          addMessageToLog({...messageObject, content: message}, Config.MessageLog);
+          const messageId = showActionMessage(document.body, messageObject);
+
+          // Kept until init restores the editor state on the next load
+          const here = new URL(window.location.href);
+          const there = new URL(OIDC.authStartLocation);
+          window.location.replace(OIDC.authStartLocation);
+
+          // The session library has already dropped the callback query, so a target that differs only in the hash would not reload, and the opened document lives in the hash
+          if (here.origin + here.pathname + here.search === there.origin + there.pathname + there.search) {
+            window.location.reload();
+          }
+        }
+        else {
+          DO.U.initAuth();
+        }
+      });
+    },
+
+    load: function() {
+      initTheme();
+
+      document.addEventListener('i18n-ready', () => {
+        DO.U.initUserLanguage().then(() => {
+          const params = new URLSearchParams(window.location.search);
+
+          // Started before init() so document modes that fetch resources can await a live session
+          Config.AuthReady = (params.has('code') && params.has('iss') && params.has('state'))
+            ? DO.U.initAuth().then(() => DO.U.handleIncomingRedirect())
+            : DO.U.initAuth();
+
+          init();
+        })
+      });
+
+      i18nextInit().then(() => {
+        document.dispatchEvent(new Event('i18n-ready'));
+      })
+    },
+
+    initAuth: async function() {
+      return restoreSession().then(async () => {
+        if (!Config['Session']) {
+          console.log("No session");
+          return;
+        }
+
+        const webId = Config['Session'].webId;
+        console.log("Logged in: ", webId);
+
+        if (webId) {
+          while (!Config.Storage) await new Promise(r => setTimeout(r, 50));
+          try {
+            await setUserInfo(webId);
+            await afterSetUserInfo();
+          } catch (e) {
+            console.error('dokieli: initAuth profile load failed', e);
+          }
+        }
+      }).finally(() => {
+        Config['AuthReady'] = true;
+        document.dispatchEvent(new Event('dokieli:auth-ready'));
+      })
+    },
+
+    initUserLanguage: async function() {
+      //Try to recall previously selected language if not figure out most appropriate language.
+      const lang = await getDeviceStorageItem('DO.Config.UI.Language') || i18n.code();
+
+      if (lang && Config.Languages[lang]) {
+        Config.User.UI['Language'] = lang;
+        Config.User.UI['LanguageDir'] = Config.Languages[lang].dir;
+      }
+
+      return Promise.resolve();
+    },
+
+    // WebExtension aliases
+    getContentNode: function(node) {
+      return getDocumentContentNode(document);
+    },
+
+    showDocumentMenu: function() {
+      return showDocumentMenu();
+    },
+
+    showUserIdentityInput: function() {
+      return showUserIdentityInput();
+    },
+
+    updateUILanguage: function(lang) {
+      return updateUILanguage(lang);
+    },
+
+    getButtonStates: function() {
+      return getButtonStates();
+    },
+
+    menuClick: function(className) {
+      if (!className) return;
+
+      if (className === 'editor-enable') return Config.Editor.toggleEditor('author');
+      if (className === 'editor-disable') return Config.Editor.toggleEditor('social');
+
+      const wrapper = document.createElement('div');
+      wrapper.style.display = 'none';
+      const b = document.createElement('button');
+      b.className = className;
+      b.type = 'button';
+      wrapper.appendChild(b);
+      document.body.appendChild(wrapper);
+      b.click();
+      wrapper.remove();
+    }
+
+  } //DO.U
+}; //DO
+
+if (document.readyState === "loading") {
+  document.addEventListener('DOMContentLoaded', () => { DO.U.load(); });
+}
+else {
+  window.addEventListener("load", () => { DO.U.load(); });
+}
+
+window.DO = DO;
+export default DO

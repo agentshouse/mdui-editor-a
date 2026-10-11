@@ -1,0 +1,714 @@
+/*!
+Copyright 2012-2026 Sarven Capadisli <https://csarven.ca/>
+Copyright 2023-2026 Virginia Balseiro <https://virginiabalseiro.com/>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+import rdf from 'rdf-ext';
+import uriTemplates from 'uri-templates';
+import Config from './config.js';
+import { getResource } from './fetcher.js';
+import { getResourceGraph } from './graph.js';
+import { requestOriginConsent } from './consent.js';
+
+// Lookup services bind an identifier column to a remote description of what it identifies; CSVW stops at the table, this is the extension.
+export const LookupServices = {
+  // The RDF endpoint 302s without CORS on the redirect; the JSON API answers directly.
+  openlibrary: {
+    label: 'Open Library (openlibrary.org)',
+    identifier: 'ISBN',
+    url: 'https://openlibrary.org/api/books?bibkeys=ISBN:{id}&format=json&jscmd=data',
+    format: 'json',
+    record: 'ISBN:{id}',
+    accept: 'application/json',
+    scan: 'isbn',
+    identifierClean: /[^0-9Xx]/g,
+    identifierPattern: /(?:97[89])?\d{9}[\dXx]/,
+    identifierValid: isValidISBN,
+    // An ISBN does not say what kind of material it names, so the generic type.
+    tableSchema: {
+      typeof: 'schema:CreativeWork',
+      aboutUrl: 'urn:isbn:{isbn}'
+    },
+    columns: [
+      { name: 'isbn', titles: 'ISBN', propertyUrl: 'schema:isbn', lang: '', identifier: true },
+      { titles: 'Title', propertyUrl: 'schema:name', valueRel: 'schema:url', lookup: { source: 'title', urlSource: 'url' } },
+      { titles: 'Authors', propertyUrl: 'schema:author', lang: '', lookup: { source: 'authors.*.name' } },
+      { titles: 'Publisher', propertyUrl: 'schema:publisher', lang: '', lookup: { source: 'publishers.*.name' } },
+      { titles: 'Published', propertyUrl: 'schema:datePublished', time: true, lookup: { source: 'publish_date' } },
+      { titles: 'Cover', propertyUrl: 'schema:image', image: true, lookup: { source: 'cover.medium' } }
+    ]
+  },
+
+  specref: {
+    label: 'Specref (specref.org)',
+    identifier: 'Reference',
+    url: 'https://api.specref.org/bibrefs?refs={id}',
+    format: 'json',
+    record: '{id}',
+    accept: 'application/json',
+    search: 'specref',
+    // The row's claims attach to the spec itself; no subject until the URL cell is filled.
+    tableSchema: { typeof: 'doap:Specification', aboutUrl: '{+url}' },
+    columns: [
+      // Typing a title here searches; picking a result fills Reference with its id.
+      { titles: 'Title', propertyUrl: 'schema:name', valueRel: 'schema:url', identifier: true, lookup: { source: 'title', urlSource: 'href' } },
+      { titles: 'Reference', propertyUrl: 'schema:identifier', lang: '', lookup: { source: 'id' } },
+      { titles: 'Authors', propertyUrl: 'schema:author', lang: '', lookup: { source: 'authors.*' } },
+      { titles: 'Publisher', propertyUrl: 'schema:publisher', lang: '', lookup: { source: 'publisher' } },
+      { titles: 'Status', propertyUrl: 'schema:creativeWorkStatus', lookup: { source: 'status' } },
+      { titles: 'Date', propertyUrl: 'schema:datePublished', time: true, lookup: { source: 'date' } },
+      // {+url}: reserved expansion, else the href is percent-encoded.
+      { name: 'url', titles: 'URL', propertyUrl: 'schema:url', valueUrl: '{+url}', lookup: { source: 'href' } }
+    ]
+  },
+
+  doi: {
+    label: 'DOI (doi.org)',
+    identifier: 'DOI',
+    // {+id}: a DOI contains "/", which simple expansion would percent-encode.
+    url: 'https://doi.org/{+id}',
+    format: 'rdf',
+    subject: 'https://doi.org/{+id}',
+    identifierPattern: /10\.\d{4,9}\/[^\s?#]+/,
+    tableSchema: { typeof: 'schema:CreativeWork', aboutUrl: 'https://doi.org/{+doi}' },
+    // lookup.source: predicates Crossref answers with; DataCite uses schema.org, the propertyUrl fallback.
+    columns: [
+      { name: 'doi', titles: 'DOI', propertyUrl: 'bibo:doi', lang: '', identifier: true, valueRel: 'schema:url', valueUrl: 'https://doi.org/{+doi}' },
+      { titles: 'Title', propertyUrl: 'schema:name', lookup: { source: 'dcterms:title' } },
+      { titles: 'Authors', propertyUrl: 'schema:author', lang: '', lookup: { source: 'dcterms:creator' } },
+      { titles: 'Publisher', propertyUrl: 'schema:publisher', lang: '', lookup: { source: 'dcterms:publisher' } },
+      { titles: 'Published', propertyUrl: 'schema:datePublished', time: true, lookup: { source: 'dcterms:date' } }
+    ]
+  },
+
+  wikidata: {
+    label: 'Wikidata (wikidata.org)',
+    identifier: 'Q-id',
+    url: 'https://www.wikidata.org/wiki/Special:EntityData/{id}.ttl',
+    format: 'rdf',
+    subject: 'http://www.wikidata.org/entity/{id}',
+    identifierPattern: /^[QP]\d+$/i,
+    search: 'wikidata',
+    // The entity IRI is canonically http:, as Wikidata's own RDF states it.
+    tableSchema: { aboutUrl: '{+entity}' },
+    columns: [
+      // Typing a label here searches; picking a result resolves it to an entity.
+      { titles: 'Label', propertyUrl: 'rdfs:label', identifier: true },
+      { titles: 'Description', propertyUrl: 'schema:description' },
+      // SUBJECT_SOURCE fills this with the entity the search resolved to.
+      { name: 'entity', titles: 'Entity', propertyUrl: 'owl:sameAs', lookup: { source: '@id' } }
+    ]
+  },
+
+  // orcid.org/{id} 302s twice and CORS applies per hop, so request the rdfs/foaf RDF endpoint directly.
+  orcid: {
+    label: 'ORCID (orcid.org)',
+    identifier: 'ORCID',
+    url: 'https://pub.orcid.org/experimental_rdf_v1/{id}',
+    format: 'rdf',
+    subject: 'https://orcid.org/{id}',
+    accept: 'text/turtle',
+    identifierPattern: /\d{4}-\d{4}-\d{4}-\d{3}[\dXx]/,
+    // The type ORCID's own RDF asserts of the iD; ORCID names people only, organisations use ROR.
+    tableSchema: { typeof: 'foaf:Person', aboutUrl: 'https://orcid.org/{orcid}' },
+    columns: [
+      { name: 'orcid', titles: 'ORCID', propertyUrl: 'schema:identifier', lang: '', identifier: true },
+      { titles: 'Name', propertyUrl: 'rdfs:label', lang: '' },
+      { titles: 'Given name', propertyUrl: 'foaf:givenName', lang: '' },
+      { titles: 'Family name', propertyUrl: 'foaf:familyName', lang: '' }
+    ]
+  },
+
+  // A template rather than a lookup: no endpoint, the selects carry the vocabulary.
+  threatmodel: {
+    label: 'Threat Model (STRIDE/LINDDUN)',
+    identifier: 'Feature',
+    url: '',
+    format: 'json',
+    // dcat only appears in the saved markup, so the columns alone would not declare it.
+    prefixes: ['dcat'],
+    tableSchema: { typeof: 'dpv:Risk', aboutUrl: '#risk-{_slug_threat}' },
+    columns: [
+      { name: 'feature', titles: 'Feature', propertyUrl: 'dcterms:subject', valueUrl: '{+_fragment_feature}' },
+      { name: 'threat', titles: 'Threat', propertyUrl: 'dcterms:description' },
+      { name: 'type', titles: 'STRIDE type', select: 'threat-type', kindSelect: true },
+      { name: 'element', titles: 'Threat-model element', select: 'threat-element' },
+      { name: 'risk', titles: 'Risk level', select: 'risk-level' },
+      { name: 'mitigation', titles: 'Mitigation', propertyUrl: 'dpv:isMitigatedByMeasure', valueUrl: '#mitigation-{_slug_threat}' }
+    ]
+  },
+
+  custom: {
+    label: 'Custom endpoint',
+    identifier: 'Identifier',
+    url: '',
+    format: 'json',
+    columns: []
+  }
+};
+
+export function getLookupService(name) {
+  return LookupServices[name] || null;
+}
+
+// Selection lists show sources alphabetically; the custom escape hatch stays last.
+export function listLookupServices() {
+  return Object.entries(LookupServices).sort(([a, serviceA], [b, serviceB]) =>
+    (a === 'custom') - (b === 'custom') || serviceA.label.localeCompare(serviceB.label));
+}
+
+// Services whose identifiers can come off a barcode.
+export function getScannableServices() {
+  return Object.entries(LookupServices)
+    .filter(([, service]) => service.scan)
+    .map(([name]) => name);
+}
+
+function fill(template, values) {
+  if (!template) return null;
+  try {
+    return uriTemplates(template).fill(values);
+  } catch {
+    return template;
+  }
+}
+
+// URL.canParse accepts any scheme; "is this a followable link" means http(s).
+function isHttpUrl(value) {
+  if (!URL.canParse(value)) return false;
+  const protocol = new URL(value).protocol;
+  return protocol === 'http:' || protocol === 'https:';
+}
+
+// Reduce a pasted identifier (URL, hyphenated ISBN, "doi:") to the form the template expects.
+export function normalizeIdentifier(service, raw) {
+  let value = String(raw ?? '').trim();
+  if (!value) return '';
+
+  if (service?.identifierClean) {
+    value = value.replace(service.identifierClean, '');
+  }
+
+  const segment = lastPathSegment(value);
+
+  if (service?.identifierPattern) {
+    // Whole value first so unanchored patterns win; then the segment for anchored ones.
+    for (const candidate of [value, segment]) {
+      const match = candidate?.match(service.identifierPattern);
+      if (match) return match[0];
+    }
+
+    // No shape match: hand back the search term for a resolver to look up.
+    return segment && !service.search ? segment : value;
+  }
+
+  return segment ?? value;
+}
+
+function lastPathSegment(value) {
+  if (!isHttpUrl(value)) return null;
+  const segments = new URL(value).pathname.split('/').filter(Boolean);
+  return segments.length ? decodeURIComponent(segments[segments.length - 1]) : null;
+}
+
+// Turn a search term into an entity id; anything already in identifier form passes through.
+async function resolveWikidataEntity(value, options = {}) {
+  if (/^[QP]\d+$/i.test(value)) return value.toUpperCase();
+
+  const results = await searchWikidataEntities(value, { ...options, limit: 1 });
+  return results[0]?.id || null;
+}
+
+// Label search, so the identifier column offers real choices for ambiguous terms.
+export async function searchWikidataEntities(keyword, options = {}) {
+  // No quote syntax here; quotes would only break the match
+  const term = String(keyword ?? '').trim().replace(/^"(.*)"$/, '$1');
+  if (!term) return [];
+
+  const language = (Config.User?.UI?.Language || 'en').split('-')[0];
+  const limit = options.limit || 10;
+  const url = `https://www.wikidata.org/w/api.php?action=wbsearchentities&search=${encodeURIComponent(term)}&language=${language}&uselang=${language}&type=item&limit=${limit}&format=json&origin=*`;
+
+  if (!(await requestOriginConsent(url, { reason: 'search' }))) return [];
+
+  try {
+    const response = await getResource(url, { Accept: 'application/json' }, options);
+    const data = await response.json();
+
+    return (data?.search || []).map((r) => ({
+      id: r.id,
+      label: r.label || r.id,
+      description: r.description || '',
+      uri: r.concepturi || `http://www.wikidata.org/entity/${r.id}`
+    }));
+  } catch (e) {
+    console.warn('Wikidata entity search failed:', e?.message || e);
+    return [];
+  }
+}
+
+const IDENTIFIER_RESOLVERS = {
+  wikidata: resolveWikidataEntity
+};
+
+// https://github.com/tobie/specref#api
+export async function searchSpecrefEntries(keyword, options = {}) {
+  // No quote syntax here; quotes would only break the match
+  const term = String(keyword ?? '').trim().replace(/^"(.*)"$/, '$1');
+  if (!term) return [];
+
+  const url = `https://api.specref.org/search-refs?q=${encodeURIComponent(term)}`;
+
+  if (!(await requestOriginConsent(url, { reason: 'search' }))) return [];
+
+  try {
+    const response = await getResource(url, { Accept: 'application/json' }, options);
+    const data = await response.json();
+
+    return Object.entries(data || {})
+      .filter(([, ref]) => ref && typeof ref === 'object' && ref.title)
+      .slice(0, options.limit || 10)
+      .map(([id, ref]) => ({
+        id,
+        label: ref.title,
+        description: [`[${id}]`, [ref.publisher, ref.status, ref.date].filter(Boolean).join(', ')].filter(Boolean).join(' '),
+        uri: ref.href || `https://api.specref.org/bibrefs?refs=${encodeURIComponent(id)}`
+      }));
+  } catch (e) {
+    console.warn('Specref search failed:', e?.message || e);
+    return [];
+  }
+}
+
+// https://openlibrary.org/dev/docs/api/search
+export async function searchOpenLibraryEntries(keyword, options = {}) {
+  const term = String(keyword ?? '').trim();
+  if (!term) return [];
+
+  // Quote the phrase unless the user already did; their plain q matches too loosely
+  const quotedTerm = /^".*"$/.test(term) ? term : '"' + term + '"';
+  const url = `https://openlibrary.org/search.json?q=${encodeURIComponent(quotedTerm)}&limit=${options.limit || 10}&fields=key,title,author_name,first_publish_year`;
+
+  if (!(await requestOriginConsent(url, { reason: 'search' }))) return [];
+
+  try {
+    const response = await getResource(url, { Accept: 'application/json' }, options);
+    const data = await response.json();
+
+    return (data?.docs || []).map((doc) => ({
+      id: doc.key,
+      label: doc.title,
+      description: [doc.author_name?.join(', '), doc.first_publish_year].filter(Boolean).join(', '),
+      uri: `https://openlibrary.org${doc.key}`
+    }));
+  } catch (e) {
+    console.warn('Open Library search failed:', e?.message || e);
+    return [];
+  }
+}
+
+// Fetch metadata for an identifier, reusing the table lookup
+async function describeIdentifier(name, id, options = {}) {
+  const service = LookupServices[name];
+  const columns = (service.columns || []).map((column) => ({ ...column, name: column.name || column.titles }));
+  const lookup = { service: name, url: service.url, format: service.format, accept: service.accept, record: service.record, subject: service.subject };
+
+  try {
+    const result = await lookupIdentifier({ lookup }, columns, id, { ...options, resolvedId: id });
+    const text = (key) => result?.values?.[key]?.text;
+    const label = text('Title') || text('Name') || [text('Given name'), text('Family name')].filter(Boolean).join(' ') || text('Label');
+    const description = [text('Authors'), text('Publisher'), text('Published'), text('Description')].filter(Boolean).join(', ');
+    if (label) return { label, description };
+  } catch (e) {
+    console.warn(`${name} identifier lookup failed:`, e?.message || e);
+  }
+
+  return null;
+}
+
+const IDENTIFIER_URI_TEMPLATES = [
+  ['openlibrary', (id) => `https://openlibrary.org/isbn/${id}`],
+  ['doi', (id) => `https://doi.org/${id}`],
+  ['orcid', (id) => `https://orcid.org/${id}`],
+  ['wikidata', (id) => `http://www.wikidata.org/entity/${id.toUpperCase()}`]
+];
+
+function matchedIdentifierServices(term, options = {}) {
+  const wanted = options.sources?.length ? new Set(options.sources) : null;
+
+  return IDENTIFIER_URI_TEMPLATES.filter(([name]) => {
+    if (wanted && !wanted.has(name)) return false;
+    const service = LookupServices[name];
+    const id = normalizeIdentifier(service, term);
+    if (!service.identifierPattern.test(id)) return false;
+    return !service.identifierValid || service.identifierValid(id);
+  });
+}
+
+async function resolveIdentifierEntry(name, toURI, term, options = {}) {
+  const service = LookupServices[name];
+  const id = normalizeIdentifier(service, term);
+  const described = await describeIdentifier(name, id, options);
+
+  return {
+    id,
+    label: described?.label || `${service.identifier} ${id}`,
+    description: [described?.description, `${service.identifier} ${id}`].filter(Boolean).join('. '),
+    uri: toURI(id),
+    source: name
+  };
+}
+
+// Input matching an identifier pattern links directly to it
+export async function resolveIdentifierSources(term, options = {}) {
+  return Promise.all(matchedIdentifierServices(term, options)
+    .map(([name, toURI]) => resolveIdentifierEntry(name, toURI, term, options)));
+}
+
+// One promise per source so results can render as they arrive
+export function searchSourceStreams(keyword, options = {}) {
+  const term = String(keyword ?? '').trim();
+  if (!term) return [];
+
+  const wanted = options.sources?.length ? new Set(options.sources) : null;
+  const streams = matchedIdentifierServices(term, options).map(([name, toURI]) => ({
+    source: name,
+    promise: resolveIdentifierEntry(name, toURI, term, options).then(entry => [entry])
+  }));
+
+  [
+    ['specref', searchSpecrefEntries],
+    ['wikidata', searchWikidataEntities],
+    ['openlibrary', searchOpenLibraryEntries]
+  ].filter(([source]) => !wanted || wanted.has(source)).forEach(([source, search]) => {
+    streams.push({ source, promise: search(term, options).then(items => items.map(item => ({ ...item, source }))) });
+  });
+
+  return streams;
+}
+
+// One query across every source; identifiers first, then keyword matches
+export async function searchSources(keyword, options = {}) {
+  const term = String(keyword ?? '').trim();
+  if (!term) return [];
+
+  const wanted = options.sources?.length ? new Set(options.sources) : null;
+  const keywordSearches = [
+    ['specref', searchSpecrefEntries],
+    ['wikidata', searchWikidataEntities],
+    ['openlibrary', searchOpenLibraryEntries]
+  ].filter(([source]) => !wanted || wanted.has(source));
+
+  const [identified, ...searchedAll] = await Promise.all([
+    resolveIdentifierSources(term, options),
+    ...keywordSearches.map(([source, search]) =>
+      search(term, options).then(items => items.map(item => ({ ...item, source })))
+    )
+  ]);
+
+  return [...identified, ...searchedAll.flat()];
+}
+
+const IDENTIFIER_SEARCHERS = {
+  wikidata: searchWikidataEntities,
+  specref: searchSpecrefEntries
+};
+
+// Does this table's service offer a pick-list for its identifier column?
+export function getIdentifierSearch(lookup) {
+  const service = getLookupService(lookup?.service);
+  const name = lookup?.search || service?.search;
+  return name ? IDENTIFIER_SEARCHERS[name] || null : null;
+}
+
+// True when the value is a search term, so the suggestion list decides rather than the top hit.
+export function needsIdentifierPick(lookup, value) {
+  if (!getIdentifierSearch(lookup)) return false;
+
+  const service = getLookupService(lookup?.service);
+  if (!service?.identifierPattern) return false;
+
+  return !service.identifierPattern.test(String(value ?? '').trim());
+}
+
+// Columns able to drive lookups: those mapped to the service's identifier property, else all.
+export function identifierColumnCandidates(lookup, columns) {
+  const service = getLookupService(lookup?.service);
+  const template = service?.columns?.find((column) => column.identifier);
+  if (!template?.propertyUrl) return columns;
+
+  const matching = columns.filter((column) => column.propertyUrl === template.propertyUrl);
+  return matching.length ? matching : columns;
+}
+
+// Whether the value can be an identifier at all; asking otherwise is a wasted request.
+export function looksLikeIdentifier(lookup, value) {
+  const service = getLookupService(lookup?.service);
+  if (!service?.identifierPattern) return true;
+
+  const id = normalizeIdentifier(service, value);
+  if (!service.identifierPattern.test(id)) return false;
+
+  // A shape can carry a check digit; a service that can verify it, does.
+  return service.identifierValid ? service.identifierValid(id) : true;
+}
+
+// ISBN-10 (X-check allowed) and ISBN-13 check digits, per ISO 2108.
+export function isValidISBN(value) {
+  const id = String(value ?? '').replace(/[^0-9Xx]/g, '');
+
+  if (/^\d{9}[\dXx]$/.test(id)) {
+    const sum = [...id].reduce((total, c, i) => total + (c.toUpperCase() === 'X' ? 10 : +c) * (10 - i), 0);
+    return sum % 11 === 0;
+  }
+
+  if (/^97[89]\d{10}$/.test(id)) {
+    const sum = [...id].reduce((total, c, i) => total + +c * (i % 2 ? 3 : 1), 0);
+    return sum % 10 === 0;
+  }
+
+  return false;
+}
+
+// Reserved source: the resource the lookup resolved to rather than one of its properties.
+export const SUBJECT_SOURCE = '@id';
+
+// Read values out of a JSON record via dotted paths, with * mapping across arrays.
+export function extractJSONValues(record, path) {
+  if (!record || !path) return [];
+
+  const values = path
+    .split('.')
+    .reduce((acc, segment) => {
+      if (!acc.length) return acc;
+
+      if (segment === '*') {
+        return acc.flatMap((v) => (Array.isArray(v) ? v : [v]));
+      }
+
+      return acc
+        .map((v) => (v === null || v === undefined ? undefined : v[segment]))
+        .filter((v) => v !== undefined && v !== null);
+    }, [record])
+    .flatMap((v) => (Array.isArray(v) ? v : [v]))
+    .filter((v) => v !== undefined && v !== null && typeof v !== 'object');
+
+  return [...new Set(values.map(String))];
+}
+
+export function extractJSONValue(record, path) {
+  const values = extractJSONValues(record, path);
+  return values.length ? values.join(', ') : null;
+}
+
+// Consult the prefix map before URL.canParse, which accepts CURIEs as URIs.
+function expandTerm(term) {
+  if (!term || typeof term !== 'string') return null;
+
+  const [prefix, ...rest] = term.split(':');
+  const name = rest.join(':');
+
+  if (prefix && name && Config.ns[prefix]) return Config.ns[prefix](name).value;
+
+  return URL.canParse(term) ? term : null;
+}
+
+// Read each column's value off the graph by its propertyUrl; graph is a grapoi pointer.
+export function extractRDFValues(graph, subject, columns) {
+  if (!graph?.node) return {};
+
+  const node = graph.node(rdf.namedNode(subject));
+  const preferred = (Config.User?.UI?.Language || 'en').split('-')[0];
+  const values = {};
+
+  columns.forEach((column) => {
+    // lookup.source names the response's own predicate(s); the output property is the fallback.
+    const predicates = [column.lookup?.source, column.propertyUrl].flat().map(expandTerm).filter(Boolean);
+    if (!predicates.length) return;
+
+    let terms = [];
+    for (const predicate of predicates) {
+      terms = [...node.out(rdf.namedNode(predicate)).terms];
+      if (terms.length) break;
+    }
+    if (!terms.length) return;
+
+    const literals = terms.filter((t) => t.termType === 'Literal');
+    const inLanguage = literals.filter((t) => t.language?.startsWith(preferred));
+    const chosen = inLanguage.length ? inLanguage : literals.length ? literals : terms;
+
+    const texts = [...new Set(chosen.map((t) => labelFor(graph, t, preferred)))];
+
+    values[column.name] = {
+      text: texts.join(', '),
+      values: texts.length > 1 ? texts : undefined,
+      // A cell of several labelled resources must not link wholesale to the first one.
+      valueUrl: texts.length === 1 && chosen[0]?.termType === 'NamedNode' ? chosen[0].value : null
+    };
+  });
+
+  return values;
+}
+
+// The response may describe the entity under another IRI form than the template, e.g. dx.doi.org for doi.org.
+export function resolveGraphSubject(graph, subject, id) {
+  if (!graph?.dataset || !subject) return subject;
+  if (graph.dataset.match(rdf.namedNode(subject)).size) return subject;
+
+  for (const quad of graph.dataset) {
+    const s = quad.subject;
+    if (s.termType !== 'NamedNode') continue;
+    if (id && (s.value.includes(id) || s.value.includes(encodeURIComponent(id)))) return s.value;
+  }
+
+  return subject;
+}
+
+// A named node is more useful with its label than as a bare IRI.
+function labelFor(graph, term, preferred) {
+  if (term.termType !== 'NamedNode') return term.value;
+
+  const node = graph.node(term);
+  const labels = ['http://www.w3.org/2000/01/rdf-schema#label', 'http://schema.org/name', 'http://xmlns.com/foaf/0.1/name']
+    .flatMap((p) => [...node.out(rdf.namedNode(p)).terms])
+    .filter((t) => t.termType === 'Literal');
+
+  const inLanguage = labels.find((t) => t.language?.startsWith(preferred));
+  return (inLanguage || labels[0])?.value || term.value;
+}
+
+// Run a lookup for one identifier; returns { values, subject } or null.
+export async function lookupIdentifier(tableSchema, columns, identifier, options = {}) {
+  const lookup = tableSchema?.lookup;
+  if (!lookup?.url || !identifier) return null;
+
+  // First contact with a service origin asks the user; resolvers fetch too, so gate before them
+  if (!(await requestOriginConsent(lookup.url, { reason: 'lookup' }))) return null;
+
+  const service = getLookupService(lookup.service);
+  const format = lookup.format || service?.format || 'json';
+
+  // options.resolvedId short-circuits the resolver, e.g. after a suggestion pick.
+  let id = options.resolvedId || normalizeIdentifier(service, identifier);
+  if (!id) return null;
+
+  if (!options.resolvedId) {
+    // Some services accept a search term where an id is expected.
+    const resolve = IDENTIFIER_RESOLVERS[lookup.service];
+    if (resolve) {
+      id = await resolve(id, options);
+      if (!id) return null;
+    }
+  }
+
+  const fillValues = { ...(options.fillValues || {}), id };
+
+  const url = fill(lookup.url, fillValues);
+  if (!url || !URL.canParse(url)) return null;
+
+  const subjectTemplate = lookup.subject || service?.subject;
+  const subject = subjectTemplate ? fill(subjectTemplate, fillValues) : null;
+
+  if (format === 'rdf') {
+    const accept = lookup.accept || service?.accept;
+    const { graph, error } = await getResourceGraph(url, accept ? { Accept: accept } : null, options);
+    if (error || !graph) return null;
+
+    const values = extractRDFValues(graph, resolveGraphSubject(graph, subject || url, id), columns);
+    return { values: withSubjectValues(values, columns, subject || url), subject, id };
+  }
+
+  const accept = lookup.accept || service?.accept || 'application/json';
+  const response = await getResource(url, { Accept: accept }, options);
+  const data = await response.json();
+
+  const recordPath = lookup.record || service?.record;
+  const record = recordPath ? data[fill(recordPath, fillValues)] ?? resolveRecord(data, fill(recordPath, fillValues)) : data;
+  if (!record) return null;
+
+  const values = {};
+  columns.forEach((column) => {
+    const source = column.lookup?.source;
+    if (!source || source === SUBJECT_SOURCE) return;
+
+    const texts = extractJSONValues(record, source);
+    if (!texts.length) return;
+
+    const text = texts.join(', ');
+
+    // urlSource names a result field holding the value's own page.
+    const url = column.lookup.urlSource ? extractJSONValue(record, column.lookup.urlSource) : null;
+
+    values[column.name] = {
+      text,
+      values: texts.length > 1 ? texts : undefined,
+      valueUrl: isHttpUrl(url) ? url : isHttpUrl(text) ? text : null
+    };
+  });
+
+  return { values: withSubjectValues(values, columns, subject), subject, id };
+}
+
+function withSubjectValues(values, columns, subject) {
+  if (!subject) return values;
+
+  columns.forEach((column) => {
+    if (column.lookup?.source !== SUBJECT_SOURCE) return;
+    values[column.name] = { text: subject, valueUrl: isHttpUrl(subject) ? subject : null };
+  });
+
+  return values;
+}
+
+// A record path may be a plain key with dots in it (`ISBN:978…`) or a real path.
+function resolveRecord(data, path) {
+  if (!path) return data;
+  if (data && Object.prototype.hasOwnProperty.call(data, path)) return data[path];
+
+  return path.split('.').reduce((acc, segment) => (acc ? acc[segment] : undefined), data);
+}
+
+// Suggest a JSON path per column by matching titles against a sample record's keys.
+export function suggestSources(record, columns) {
+  const paths = collectPaths(record);
+
+  return columns.map((column) => {
+    if (column.lookup?.source) return column;
+
+    const title = String(column.titles || column.name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (!title) return column;
+
+    const match = paths.find((p) => {
+      const leaf = p.split('.').pop().toLowerCase().replace(/[^a-z0-9]/g, '');
+      return leaf === title;
+    });
+
+    return match ? { ...column, lookup: { ...column.lookup, source: match } } : column;
+  });
+}
+
+function collectPaths(value, prefix = '', depth = 0) {
+  if (depth > 3 || value === null || typeof value !== 'object') return [];
+
+  if (Array.isArray(value)) {
+    return value.length ? collectPaths(value[0], prefix ? `${prefix}.*` : '*', depth + 1) : [];
+  }
+
+  return Object.entries(value).flatMap(([key, v]) => {
+    const path = prefix ? `${prefix}.${key}` : key;
+    if (v !== null && typeof v === 'object') return collectPaths(v, path, depth + 1);
+    return [path];
+  });
+}

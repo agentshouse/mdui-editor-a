@@ -1,0 +1,2318 @@
+/*!
+Copyright 2012-2026 Sarven Capadisli <https://csarven.ca/>
+Copyright 2023-2026 Virginia Balseiro <https://virginiabalseiro.com/>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+import rdf from "rdf-ext";
+import { RdfaParser } from "rdfa-streaming-parser";
+import { Readable } from "readable-stream";
+import Config from './config.js'
+import { stripFragmentFromString, currentLocation, getMediaTypeURIs } from './uri.js'
+import { escapeRegExp, scoreMatch, uniqueArray, isUserAuthenticated } from './util.js'
+import { domSanitize, safeObjectAssign, sanitizeInsertAdjacentHTML, sanitizeIRI, sanitizeIRIOrBNode, sanitizeIRIs, sanitizeObject } from './utils/sanitization.js'
+import { parseMarkdown } from "./utils/html.js";
+import { getResource, setAcceptRDFTypes } from './fetcher.js'
+import { requestOriginConsent } from './consent.js';
+import { multikeyToJWK } from './crypto.js'
+import { serializeAnnotationToJSONLD, parseAnnotation } from '@dokieli/web-annotation';
+import LinkHeader from "http-link-header";
+
+const ns = Config?.ns;
+const localhostUUID = 'http://localhost/d79351f4-cdb8-4228-b24f-3e9ac74a840d';
+const PARSER_MEDIA_TYPES = ['application/ld+json', 'text/turtle', 'application/activity+json', 'text/html'];
+
+const jsonldContexts = new Map();
+
+//XXX: this should move to WA lib. Legacy http context IRIs are blocked on https pages
+const jsonldDocumentLoader = {
+  async load(url) {
+    const target = url.replace(/^http:\/\//, 'https://');
+
+    if (!jsonldContexts.has(target)) {
+      jsonldContexts.set(target, fetch(target, { headers: { 'Accept': 'application/ld+json' } })
+        .then(response => {
+          if (!response.ok) { throw new Error(`Could not load context ${target}: ${response.status}`); }
+          return response.json();
+        })
+        .catch(error => {
+          jsonldContexts.delete(target);
+          throw error;
+        }));
+    }
+
+    return jsonldContexts.get(target);
+  }
+};
+
+//https://github.com/rdfjs-base/io
+// https://github.com/rdfjs-base/formats/
+
+export function processResources(resources, options) {
+  if (Array.isArray(resources)) {
+    return Promise.resolve(resources);
+  }
+  else {
+    return getItemsList(resources, options);
+  }
+}
+
+export function getGraphFromData (data, options = {}) {
+  options['contentType'] = options.contentType || 'text/turtle';
+  if (!('subjectURI' in options)) {
+    options['subjectURI'] = localhostUUID;
+  }
+  // console.log(options)
+  var baseIRI = options.subjectURI
+  //  || Config.DocumentURL;
+
+  // console.log(data)
+  // console.log(baseIRI)
+
+  baseIRI = stripFragmentFromString(baseIRI);
+  // console.log(baseIRI)
+
+  // FIXME: These are fugly but a temporary fix to get around the baseURI not being passed to the DOM parser. This injects the `base` element into the document so that the parsers fallsback to that. The actual fix should happen upstream. See related issues:
+  // https://github.com/dokieli/dokieli/issues/132
+  // https://github.com/rdf-ext/rdf-parser-dom/issues/2
+  // https://github.com/rdf-ext/rdf-parser-rdfa/issues/3
+  // https://github.com/simplerdf/simplerdf/issues/19
+
+  // // TODO: Revisit this as setting base will be now be taken care of by rdf-ext in getRDFParser, so this may not be needed
+  // const baseNeededMediaTypes = ['text/html', 'application/xhtml+xml', 'text/turtle', 'application/ld+json', 'application/activity+json'];
+  // if (baseNeededMediaTypes.includes(options.contentType)){
+  //   data = setDocumentBase(data, options.subjectURI, options.contentType)
+  // }
+
+  // if (options.contentType == 'text/html' || options.contentType == 'application/xhtml+xml' || options.contentType == 'text/turtle' || options.contentType == 'application/ld+json' || options.contentType == 'application/activity+json') {
+
+  //     data = setDocumentBase(data, options.subjectURI, options.contentType)
+  // }
+
+  switch (options.contentType) {
+    case 'application/activity+json': case 'application/json':
+      options.contentType = 'application/ld+json';
+      break;
+    case 'text/plain':
+    case 'text/markdown':
+    // case 'image/svg+xml':
+      options.contentType = 'text/html';
+      break;
+    default:
+      break;
+  }
+
+  //TODO: Look into a wrapping function so that we don't have to pass baseURI twice; getRDFParser, parser.import
+  const parser = getRDFParser(baseIRI, options.contentType);
+  const nodeStream = Readable.from([data]);
+  const quadStream = parser.import(nodeStream, { baseIRI: baseIRI, documentLoader: jsonldDocumentLoader });
+  // const dataset = rdf.dataset().import(quadStream);
+  // console.log(quadStream)
+  // return rdf.grapoi({ dataset });
+  return rdf.dataset().import(quadStream).then((dataset) => {
+  // console.log(dataset.toCanonical())
+    return rdf.grapoi({ dataset });
+  });
+
+
+  // console.log(data)
+  // console.log(options)
+  //   return SimpleRDF.parse(data, options['contentType'], options['subjectURI'])
+  //     .then(g => {
+  //       // var o = { 'contentType': 'application/n-triples' };
+  //       var o = { 'contentType': 'text/turtle' };
+  //       return serializeGraph(g, o).then(d => {
+  //         d = skolem(d, o);
+  //         d = setDocumentBase(d, options.subjectURI, o.contentType);
+  // // console.log(d)
+  //         return SimpleRDF.parse(d, o['contentType'], options['subjectURI']);
+  //       })});
+}
+
+export function getRDFParser(baseIRI, contentType) {
+  var RDFaMediaTypes = ['text/html', 'application/xhtml+xml', 'image/svg+xml', 'application/xml', 'text/xml'];
+
+  var profile = '';
+  switch(contentType) {
+    case 'text/html':
+      profile = 'html';
+      break;
+    case 'application/xhtml+xml':
+      profile = 'xhtml';
+      break;
+    case 'image/svg+xml':
+    case 'application/xml':
+    case 'text/xml':
+      profile = 'xml';
+      break;
+  }
+
+  if (RDFaMediaTypes.includes(contentType)) {
+    return new RdfaParser({
+      baseIRI: baseIRI,
+      contentType: contentType,
+      profile: profile
+    });
+  }
+  else {
+    return rdf.formats.parsers.get(contentType);
+  }
+}
+
+export function getSubjectInfo(subjectIRI, options = {}) {
+  if (!subjectIRI) {
+    return Promise.reject(new Error('Could not set subject info - no subjectIRI'));
+  }
+  else if (!subjectIRI.toLowerCase().startsWith('http:') && !(subjectIRI.toLowerCase().startsWith('https:'))) {
+    return Promise.reject(new Error('Could not set subject info - subjectIRI is not `http(s):`'));
+  }
+
+  var headers = {};
+  options['noStore'] = !!options['noStore'];
+
+  return getResourceGraph(subjectIRI, headers, options)
+    .then(({ graph: g }) => {
+      //TODO: Consider whether to construct an empty graph (useful to work only with their IRI);
+
+      if (!isGraphValid(g)) {
+        // console.warn('Invalid graph object:', g);
+        return {}
+      }
+
+      g = g.node(rdf.namedNode(subjectIRI));
+
+      return {
+        Graph: g,
+        IRI: subjectIRI,
+        Name: getAgentName(g),
+        Image: getGraphImage(g),
+        URL: getAgentURL(g),
+        Role: options.role,
+        UI: options.ui,
+        OIDCIssuer: getAgentOIDCIssuer(g),
+        ProxyURL: getAgentPreferredProxy(g),
+        PreferredPolicy: getAgentPreferredPolicy(g),
+        PreferredLanguages: getAgentPreferredLanguages(g),
+        Delegates: getAgentDelegates(g),
+        Contacts: {},
+        Knows: getAgentKnows(g),
+        Following: getAgentFollowing(g),
+        SameAs: [],
+        SeeAlso: [],
+        PrimaryTopicOf: [],
+        Storage: getAgentStorage(g),
+        Outbox: getAgentOutbox(g),
+        Inbox: getAgentInbox(g),
+        TypeIndex: {},
+        Preferences: {},
+        PreferencesFile: getAgentPreferencesFile(g),
+        PublicTypeIndex: getAgentPublicTypeIndex(g),
+        PrivateTypeIndex: getAgentPrivateTypeIndex(g),
+        Liked: getAgentLiked(g),
+        Occupations: getAgentOccupations(g),
+        Skills: getGraphSkills(g),
+        Publications: getAgentPublications(g),
+        Made: getAgentMade(g),
+        Types: getGraphTypes(g)
+      }
+    })
+  }
+
+export function getMatchFromData (data, spo = {}, options = {}) {
+  if (!data) { return Promise.resolve({}) }
+
+  spo['subject'] = spo.subject || Config.DocumentURL || currentLocation();
+  spo['predicate'] = spo.predicate || ns.rdfs.label.value;
+
+  options['contentType'] = options.contentType || 'text/html';
+  options['subjectURI'] = options.subjectURI || spo.subject;
+
+  return getGraphFromData(data, options)
+    .then(g => {
+      return g.out(spo.predicate);
+    })
+    .catch(() => {
+      return undefined
+    })
+}
+
+export function serializeDataToPreferredContentType(data, options) {
+  switch (options['preferredContentType']) {
+    case 'text/html':
+    case 'application/xhtml+xml':
+      return Promise.resolve(data);
+
+    case 'text/turtle':
+    case 'application/n-triples':
+    case 'application/n-quads':
+    case 'text/n3':
+    case 'application/trig':
+      return serializeData(data, options['contentType'], options['preferredContentType'], options);
+
+    case 'application/ld+json':
+    case 'application/activity+json':
+    case 'application/json':
+    case '*/*':
+    default:
+      // Prefer model-built JSON-LD when supplied; fall back to the RDFa graph path
+      if (options.activityJSONLD) {
+        return Promise.resolve(JSON.stringify(options.activityJSONLD));
+      }
+      if (options.annotationObject) {
+        return Promise.resolve(JSON.stringify(serializeAnnotationToJSONLD(options.annotationObject)));
+      }
+      return serializeData(data, options['contentType'], 'application/ld+json', options);
+  }
+}
+
+export function serializeData(data, fromContentType, toContentType, options = {}) {
+  // if (!rdf.formats.serializers.get(toContentType)) { return Promise.reject('XXX: Should not be here'); }
+  if (fromContentType === toContentType && !options.sanitize) {
+    return Promise.resolve(data);
+  }
+
+  options['contentType'] = fromContentType;
+
+  return getGraphFromData(data, options)
+    .then(g => {
+      options['contentType'] = toContentType;
+
+      if (options.sanitize) {
+        g = sanitizeGraph(g, options);
+      }
+
+      return serializeGraph(g, options);
+    });
+}
+
+export function sanitizeGraph(g) {
+  var quads = g.out().quads();
+
+  const sanitizedQuads = [];
+
+  Array.from(quads).forEach(q => {
+    if (q.object.termType == 'Literal') {
+      q.object.value = domSanitize(q.object.value);
+    }
+
+    sanitizedQuads.push(q);
+  })
+
+  const dataset = rdf.dataset(sanitizedQuads);
+  g = rdf.grapoi({ dataset });
+
+ return g;
+}
+
+
+/**
+ * @param data
+ * @param fromContentType
+ * @param toContentType
+ * @param options
+ *
+ * @returns {Promise}
+ */
+export function XXXOLDserializeData(data, fromContentType, toContentType, options) {
+  if (fromContentType === toContentType) {
+    return Promise.resolve(data)
+  }
+
+  options.contentType = fromContentType
+
+  // console.log(data)
+
+  return getGraphFromData(data, options)
+    .then(g => {
+
+      options.contentType = toContentType
+
+      switch (toContentType) {
+        case 'application/ld+json':
+          // console.log(g)
+          return serializeGraph(g, options).then(subjectTriples => {
+            subjectTriples = JSON.parse(subjectTriples)
+
+            var data = {}
+            if (options["@context"]) {
+              data["@context"] = options["@context"]
+            }
+
+            var subjectsChecked = []
+            var subjectsList = []
+            var rootIndex = 0
+
+            for(var i = 0; i < subjectTriples.length; i++) {
+              subjectsList.push(subjectTriples[i]["@id"])
+
+              if ("@id" in subjectTriples[i] && subjectTriples[i]["@id"] == options.subjectURI) {
+                safeObjectAssign(data, subjectTriples[i])
+
+                subjectsChecked.push(options.subjectURI)
+
+                rootIndex = i
+              }
+            }
+
+            var processObject = function(subject) {
+              var properties = Object.keys(subject)
+              properties.forEach(property => {
+                if (typeof subject[property] === 'object') {
+                  if ("@id" in subject[property]
+                    && subjectsChecked.indexOf(subject[property]["@id"]) < 0
+                    && subjectsList.indexOf(subject[property]["@id"]) > -1) {
+
+                    subjectTriples.forEach(o => {
+                      if (o["@id"] == subject[property]["@id"]) {
+                        subject[property] = o;
+
+                        subjectsChecked.push(subject[property]["@id"])
+                      }
+                    })
+                  }
+
+                  return sanitizeObject({}, processObject(subject[property]))
+                }
+              })
+
+              return subject
+            }
+
+            var subject = subjectTriples[rootIndex]
+
+            safeObjectAssign(data, processObject(subject))
+
+            // console.log(data)
+            // console.log(JSON.stringify(data))
+            return JSON.stringify(data) + '\n'
+          })
+
+        default:
+          return serializeGraph(g, options)
+      }
+    })
+    .then(data => {
+      const replacements = {
+        'http://www.w3.org/ns/oa#autoDirection': 'auto',
+        'http://www.w3.org/ns/oa#cachedSource': 'cached',
+        'http://www.w3.org/ns/oa#hasBody': 'body',
+        'http://www.w3.org/ns/oa#hasEndSelector': 'endSelector',
+        'http://www.w3.org/ns/oa#hasPurpose': 'purpose',
+        'http://www.w3.org/ns/oa#hasScope': 'scope',
+        'http://www.w3.org/ns/oa#hasSelector': 'selector',
+        'http://www.w3.org/ns/oa#hasSource': 'source',
+        'http://www.w3.org/ns/oa#hasStartSelector': 'startSelector',
+        'http://www.w3.org/ns/oa#hasTarget': 'target',
+        'http://www.w3.org/ns/oa#ltrDirection': 'ltr',
+        'http://www.w3.org/ns/oa#motivatedBy': 'motivation',
+        'http://www.w3.org/ns/oa#rtlDirection': 'rtl',
+        'http://www.w3.org/ns/oa#styledBy': 'stylesheet',
+        '"oa:': '"',
+        '"as:': '"',
+        '"schema:': '"',
+        'http://www.w3.org/ns/oa#': '',
+        'https://www.w3.org/ns/activitystreams#': '',
+        'http://schema.org/': ''
+      };
+
+      switch (toContentType) {
+        default:
+          break;
+
+        case 'application/ld+json':
+          //TODO: Lazy person's JSON-LD compacting. Expect errors!
+          if (options["@context"]) {
+            var context = (typeof options["@context"] === 'string') ? [options["@context"]] : options['@context']
+
+            data = JSON.parse(data);
+            delete data["@context"]
+            data = JSON.stringify(data)
+
+            data = data.replace(new RegExp('"@id"', 'g'), '"id"')
+            data = data.replace(new RegExp('"@type"', 'g'), '"type"')
+
+            context.forEach(c => {
+              var search = '';
+              var replace = '';
+
+              if (typeof c === 'string') {
+                for (const [pattern, replacement] of Object.entries(replacements)) {
+                  data = data.replace(new RegExp(escapeRegExp(pattern), 'g'), replacement);
+                }
+              }
+              else {
+                replace = Object.keys(c)[0];
+
+                switch(replace) {
+                  case 'oa':
+                    search = 'http://www\\.w3\\.org/ns/oa#'
+                    break
+
+                  case 'as':
+                    search = 'https://www\\.w3\\.org/ns/activitystreams#'
+                    break
+
+                  case 'schema':
+                    search = 'http://schema\\.org/'
+                    break
+                }
+
+                //XXX: I don't understand this:
+                replace = replace + ':'
+              }
+
+              data = data.replace(new RegExp(search, 'g'), replace)
+            })
+
+            data = JSON.parse(data)
+            //XXX: Is it ever possible that via could already exist and this mistakenly overwrites it?
+            //Why is this specific to JSON-LD?
+            if (!options['canonical'] && 'id' in data) {
+              data[ "via" ] = data[ "id" ]
+              data[ "id" ] = ""
+            }
+            data = safeObjectAssign({"@context": options["@context"]}, data)
+            data = JSON.stringify(data)
+          }
+
+          break;
+      }
+      // console.log(data)
+      return data
+    })
+}
+
+export function isGraphValid(g) {
+  if (!g) return false;
+  if (g.resource || g.cause) return false;
+  if (g.status?.toString().startsWith('4') || g.status?.toString().startsWith('5')) return false;
+  if (typeof g.out !== 'function') return false;
+  if (!Array.from(g.out().quads()).length) return false;
+  return true;
+}
+
+function streamToString(stream) {
+  const chunks = [];
+  return new Promise((resolve, reject) => {
+    stream.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+    stream.on('error', (err) => reject(err));
+    stream.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+  })
+}
+
+/**
+ * Descends an LDN/ActivityStreams notification wrapper, following `as:object`
+ * (cycle-guarded) to the inner `oa:Annotation`, and returns its IRI. Unwrapping
+ * the notification envelope is dokieli's job, not the annotations library's, so
+ * we resolve it here before handing a plain annotation IRI to core's parser.
+ *
+ * @param {object} g - rdf-ext graph (grapoi dataset).
+ * @param {string} [annotationIRI] - wrapper or annotation IRI.
+ * @returns {string|undefined} The inner annotation IRI, or the input unchanged.
+ */
+function unwrapToAnnotationIRI(g, annotationIRI) {
+  if (!annotationIRI) { return annotationIRI; }
+
+  const seen = new Set();
+  let iri = annotationIRI;
+
+  while (iri && !seen.has(iri)) {
+    seen.add(iri);
+    const node = g.node(rdf.namedNode(iri));
+    if (node.out(ns.rdf.type).values.includes(ns.oa.Annotation.value)) { return iri; }
+    const object = node.out(ns.as.object).values[0];
+    if (!object) { break; }
+    iri = object;
+  }
+
+  return annotationIRI;
+}
+
+/**
+ * Parses an annotation out of an rdf-ext graph into an `@dokieli/web-annotation`
+ * `Annotation`, using core's `parseAnnotation` with a `JSONLDParser` backed by
+ * our rdf-ext serializer. Because the graph is already RDF (any source format,
+ * RDFa/Turtle/JSON-LD), this works regardless of how the resource was fetched.
+ *
+ * @param {object} g - rdf-ext graph (grapoi dataset).
+ * @param {string} [annotationIRI] - IRI to pick the annotation node (may be a notification wrapper); also set as `annotation.iri`.
+ * @returns {Promise<object|null>} The parsed Annotation, or null.
+ */
+export function parseAnnotationFromGraph(g, annotationIRI) {
+  const resolvedIRI = unwrapToAnnotationIRI(g, annotationIRI);
+
+  // The JSONLDParser: rdf-ext graph → JSON-LD. core maps it to an Annotation.
+  const parser = async (graph) => {
+    // Serialize the whole dataset; scoping to the resource term drops selector subjects
+    const fullGraph = graph?.dataset ? rdf.grapoi({ dataset: graph.dataset }) : graph;
+    const jsonld = await serializeGraph(fullGraph, { contentType: 'application/ld+json' });
+    return jsonld ? JSON.parse(jsonld) : [];
+  };
+  return parseAnnotation(g, { parser, annotationIRI: resolvedIRI });
+}
+
+// JSONLDParser for @dokieli/notifications: RDF in any serialization to JSON-LD nodes
+export async function jsonldNodesFromData(data, options = {}) {
+  if (typeof data !== 'string') { return data; }
+  const contentType = (options.contentType || 'text/turtle').split(';')[0].trim();
+  const g = await getGraphFromData(data, { contentType, subjectURI: options.baseIRI, documentURI: options.baseIRI });
+  const fullGraph = g?.dataset ? rdf.grapoi({ dataset: g.dataset }) : g;
+  const jsonld = await serializeGraph(fullGraph, { contentType: 'application/ld+json' });
+  return jsonld ? flattenJSONLDNodes(JSON.parse(jsonld)) : [];
+}
+
+// Merge the serializer's per-quad node objects into one node per subject
+function flattenJSONLDNodes(nodes) {
+  if (!Array.isArray(nodes)) { return nodes; }
+  const bySubject = new Map();
+  const merged = [];
+  nodes.forEach(node => {
+    const id = node?.['@id'];
+    const target = typeof id === 'string' ? bySubject.get(id) : undefined;
+    if (!target) {
+      const copy = { ...node };
+      merged.push(copy);
+      if (typeof id === 'string') { bySubject.set(id, copy); }
+      return;
+    }
+    Object.entries(node).forEach(([key, value]) => {
+      if (key === '@id') return;
+      if (!(key in target)) {
+        target[key] = value;
+        return;
+      }
+      const existing = Array.isArray(target[key]) ? target[key] : [target[key]];
+      target[key] = existing.concat(value);
+    });
+  });
+  return merged;
+}
+
+jsonldNodesFromData.mediaTypes = PARSER_MEDIA_TYPES;
+
+export function serializeGraph(g, options = {}) {
+  if (!('contentType' in options)) {
+    options['contentType'] = 'text/turtle'
+  }
+  // console.log(options)
+
+  try {
+    var quads = g.out().quads();
+
+    // TODO: should there be a serializer in the SinkMap for trig? 
+    if (options.contentType === 'application/trig') {
+      options.contentType = 'text/n3';
+    }
+
+    const serializer = getRDFSerializer(options.contentType);
+
+    if (!serializer) {
+      throw new Error(`No serializer found for mediaType: ${options.contentType}`);
+    }
+
+    return streamToString(serializer.import(Readable.from(quads), { compact: true, prettyPrint: true })).then((data) => {
+      return data.replace(new RegExp(escapeRegExp(localhostUUID), 'g'), '');
+    });
+  }
+  catch(e) {
+    console.log(e)
+  }
+
+  // XXX: This comment is left here so that it can be reviewed for grapoi when the RDF vocabs that may need fixing.
+  // return store.serializers[options.contentType].serialize(g._graph)
+  //   .then(data => {
+  //     data = applyParserSerializerFixes(data, options.contentType)
+
+      // XXX: .compact doesn't work as advertised
+      // if (options.contentType === 'application/ld+json' && '@context' in options) {
+      //   return jsonld.promises().compact(data, options['@context'], {'skipExpansion': true})
+      // }
+
+    //   return data
+    // })
+}
+
+export function getRDFSerializer(mediaType) {
+  return rdf.formats.serializers.get(mediaType, { compact: true, prettyPrint: true });
+}
+
+export function applyParserSerializerFixes(data, contentType) {
+  // FIXME: FUGLY because parser defaults to localhost. Using UUID to minimise conflict
+
+  data = data.replace(new RegExp(escapeRegExp(localhostUUID), 'g'), '');
+
+  switch(contentType) {
+    case 'text/turtle':
+      //XXX: Workaround for rdf-parser-rdfa bug that gives '@langauge' instead of @type when encountering datatype in HTML+RDFa . TODO: Link to bug here
+      data = data.replace(/Z"@en;/g, 'Z"^^<http://www.w3.org/2001/XMLSchema#dateTime>;');
+      data = data.replace(/start> "(\d+)"@en;/g, 'start> "$1"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger>;');
+      data = data.replace(/end> "(\d+)"@en;/g, 'end> "$1"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger>;');
+      data = data.replace(/\%2523/g, '%23');
+
+      //XXX: Seems to get added when https://schema.org/docs/jsonldcontext.jsonld is used. After using 'http' -> 'https' (for fetching purpose) but then the serializer adds `@prefix 0: <https://schema.org/>` which seems invalid.
+      data = data.replace(/^@prefix 0: .*$/gm, '');
+      break;
+
+    case 'application/ld+json':
+      var x = JSON.parse(data);
+
+      //XXX: Workaround for rdf-parser-rdfa bug that gives '@language' instead of @type when encountering datatype in HTML+RDFa . See also https://github.com/rdf-ext/rdf-parser-rdfa/issues/5
+      var properties = ['https://www.w3.org/ns/activitystreams#published', 'https://www.w3.org/ns/activitystreams#updated', 'http://schema.org/dateCreated', 'http://schema.org/datePublished', 'http://schema.org/dateModified', 'http://www.w3.org/ns/oa#start', 'http://www.w3.org/ns/oa#end'];
+
+      for(var i = 0; i < x.length; i++){
+        for(var j = 0; j < properties.length; j++){
+          if(properties[j] in x[i]) {
+            if (properties[j] == 'http://www.w3.org/ns/oa#start' || properties[j] == 'http://www.w3.org/ns/oa#end') {
+              x[i][properties[j]] = {
+                '@type': 'http://www.w3.org/2001/XMLSchema#nonNegativeInteger',
+                '@value': x[i][properties[j]]['@value']
+              };
+            }
+            else {
+              x[i][properties[j]] = {
+                '@type': 'http://www.w3.org/2001/XMLSchema#dateTime',
+                '@value': x[i][properties[j]]['@value']
+              };
+            }
+          }
+        }
+      }
+
+      data = JSON.stringify(x);
+      break;
+  }
+
+  return data;
+}
+
+export function skolem(data, options) {
+  //XXX: Perhaps this should just be part of applyParserSerializerFixes or an option of it
+  //TODO: Reuse an existing function/library for this (from parsers?) instead of the hack here. Proper skolem for different options.contentType needed?
+
+  //XXX: Perhaps for Turtle
+  data = data.replace(new RegExp('_:([^ ,;]*)([ ,;]+)', 'g'), "<http://example.com/.well-known/genid/$1>$2");
+  //XXX: Simpler for N-Triples https://www.w3.org/TR/n-triples/#BNodes but not actually conforming:
+  // data = data.replace(new RegExp('_:([^ \.]*)([ \.]+)', 'g'), "<http://example.com/.well-known/genid/$1>$2");
+
+  // console.log(data)
+  return data;
+}
+
+export function* filterQuads(quads, options) {
+  for (const q of quads) {
+    if (
+      ('subjects' in options.filter && options.filter.subjects.includes(q.subject.value)) ||
+      ('predicates' in options.filter && options.filter.predicates.includes(q.predicate.value))
+    ) {
+      yield q;
+    }
+  }
+}
+
+export function transformJsonldContextURLScheme(data) {
+  if (typeof data["@context"] === "string") {
+    data["@context"] = data["@context"].replace(/^http:/, 'https:');
+  }
+  // else if (typeof data["@context"] === "object") {
+  //   for (var key in data["@context"]) {
+  //     if (data["@context"].hasOwnProperty(key) && typeof data["@context"][key] === "string") {
+  //       data["@context"][key] = data["@context"][key].replace(/^http:/, 'https:');
+  //     }
+  //   }
+  // }
+  return data;
+}
+
+export function setDocumentBase(data, baseURI, contentType) {
+  baseURI = stripFragmentFromString(baseURI)
+  let template;
+  let base;
+  switch(contentType) {
+    case 'text/html': case 'application/xhtml+xml':
+      template = document.implementation.createHTMLDocument()
+      template.documentElement.setHTMLUnsafe(domSanitize(data));
+      base = template.querySelector('head base[href]')
+      if (!base) {
+        sanitizeInsertAdjacentHTML(template.querySelector('head'), 'afterbegin', '<base href="' + baseURI + '" />')
+        data = template.documentElement.outerHTML
+      }
+      break;
+
+    case 'text/turtle':
+      data = `@base <` + baseURI + `> .\n` + data;
+      break;
+
+    case 'application/json': case 'application/ld+json': case 'application/activity+json':
+      data = data.replace(/(\\)(?=\/)/g, '');
+      data = JSON.parse(data);
+      //TODO: This is outside the scope of this function. Should move to applyParserSerializerFixes or getGraphFromData?
+      data = transformJsonldContextURLScheme(data);
+
+      data['@context'] = (data['@context']) ? data['@context'] : {'@base': baseURI};
+
+      if (Array.isArray(data['@context'])) {
+        var found = false;
+        data['@context'].forEach(a => {
+          if (typeof a === 'object' && '@base' in a) {
+            found = true;
+          }
+        })
+        if (!found) {
+          data['@context'].push({'@base': baseURI});
+        }
+      }
+      else if (typeof data['@context'] === 'object' && !('@base' in data['@context'])) {
+        data['@context']['@base'] = baseURI;
+      }
+      else if (typeof data['@context'] === 'string') {
+        data['@context'] = [
+          data['@context'],
+          {'@base': baseURI}
+        ]
+      }
+
+      data = JSON.stringify(data);
+      break;
+
+    default:
+      break;
+  }
+// console.log(data)
+  return data
+}
+
+export function traverseRDFList(g, resource) {
+  var b = g.node(rdf.namedNode(resource));
+  var result = [];
+
+  if (b.out(ns.rdf.first).values.length) {
+    result.push(b.out(ns.rdf.first).values[0]);
+  }
+  if (b.out(ns.rdf.rest).values.length && b.out(ns.rdf.rest).values[0] !== 'http://www.w3.org/1999/02/22-rdf-syntax-ns#nil') {
+    result = result.concat(traverseRDFList(g, b.out(ns.rdf.rest).values[0]));
+  }
+
+  return result;
+}
+
+// Resolves { response, graph }; rejects { response, error }
+const inFlightGraphs = new Map();
+
+export function getResourceGraph(iri, headers, options = {}) {
+  let wildCard = options.excludeMarkup ? '' : ',*/*;q=0.1';
+  let defaultHeaders = {'Accept': setAcceptRDFTypes(options) + wildCard}
+  headers = headers || defaultHeaders
+  if (!('Accept' in headers)) {
+    headers['Accept'] = defaultHeaders['Accept'];
+  }
+
+  // Collapse concurrent identical GETs into one request
+  const dedupable = !options.noCache && !options.noStore && !headers['If-None-Match'] && !headers['If-Modified-Since'];
+  const dedupKey = iri + '\n' + headers['Accept'];
+  if (dedupable && inFlightGraphs.has(dedupKey)) return inFlightGraphs.get(dedupKey);
+
+  const isWebExtensionURL = Config.WebExtensionBaseURL ? iri.startsWith(Config.WebExtensionBaseURL) : false;
+
+  let savedResponse;
+
+  const result = Config.Storage.get(iri, headers, options)
+    .then(response => {
+      savedResponse = response;
+      let cT = response.headers.get('Content-Type');
+
+      cT = (isWebExtensionURL && (!cT || cT === 'application/x-unknown-content-type')) ? 'text/html' : cT;
+      options['contentType'] = (cT) ? cT.split(';')[0].toLowerCase().trim() : 'text/turtle'
+      options['subjectURI'] = iri
+
+      // Sniff RDF served as generic binary: JSON starts with { or [, else assume Turtle
+      if (options['contentType'] === 'application/octet-stream') {
+        return response.text().then(text => {
+          const t = text.trimStart();
+          if (t.startsWith('{') || t.startsWith('[')) {
+            options['contentType'] = 'application/ld+json';
+            const data = JSON.parse(t);
+            if (data['@context']) {
+              return JSON.stringify(transformJsonldContextURLScheme(data));
+            }
+            return Promise.reject(new Error('Unsupported media type for RDF parsing (without @context): application/octet-stream'));
+          }
+          options['contentType'] = 'text/turtle';
+          return text;
+        });
+      }
+
+      //XXX: Perhaps okay for text/markdown but not text/plain?
+      if  (['text/markdown', 'text/plain'].includes(options['contentType'])) {
+        return response.text().then(data => {
+          options.contentType = 'text/html';
+          return parseMarkdown(data, {createDocument: true});
+        });
+      }
+      else if (options['contentType'] == 'application/json') {
+        return response.json().then(data => {
+          if (data['@context']) {
+            data = transformJsonldContextURLScheme(data);
+            return JSON.stringify(data);
+          }
+
+          return Promise.reject(new Error('Unsupported media type for RDF parsing (without @context): ' + options['contentType']));
+        });
+      }
+      else if (!Config.MediaTypes.RDF.includes(options['contentType'])) {
+        return Promise.reject(new Error('Unsupported media type for RDF parsing: ' + options['contentType']));
+      }
+
+      if (['application/ld+json', 'application/activity+json'].includes(options['contentType'])) {
+        return response.text().then(text => {
+          try {
+            return JSON.stringify(transformJsonldContextURLScheme(JSON.parse(text)));
+          } catch (e) {
+            return text;
+          }
+        });
+      }
+
+      return response.text();
+    })
+    .then(data => getGraphFromData(data, options))
+    .then(g => {
+      const graph = rdf.grapoi({ dataset: g.dataset, term: rdf.namedNode(stripFragmentFromString(iri))});
+      return { response: savedResponse, graph, error: undefined };
+    })
+    .catch(error => Promise.reject({
+      response: savedResponse || error?.response,
+      graph: undefined,
+      error
+    }));
+
+  if (dedupable) {
+    inFlightGraphs.set(dedupKey, result);
+    const clear = () => inFlightGraphs.delete(dedupKey);
+    result.then(clear, clear);
+  }
+
+  return result;
+}
+export function getResourceOnlyRDF(url) {
+  // One GET; a HEAD first doubled requests and tripped rate limiters
+  return getResourceGraph(url, { 'Accept': setAcceptRDFTypes() })
+    .catch(rejected => {
+      // Pass through if already in shape; else wrap fetch failures the same way
+      if (rejected && 'graph' in rejected && 'error' in rejected) {
+        return Promise.reject(rejected);
+      }
+      return Promise.reject({
+        response: rejected?.response,
+        graph: undefined,
+        error: rejected
+      });
+    });
+}
+
+export function getLinkRelation(property, url, data) {
+  if (url) {
+    return getLinkRelationFromHead(property, url)
+      .catch(() => {
+        if (!data) {
+          return getLinkRelationFromRDF(property, url)
+        }
+      });
+  }
+  else if (data) {
+    var subjectURI = Config.DocumentURL || currentLocation();
+    // var subjectURI = window.location.href.split(window.location.search || window.location.hash || /[?#]/)[0]
+
+    var options = {
+      'contentType': 'text/html',
+      'subjectURI': subjectURI
+    }
+
+    return getGraphFromData(data, options)
+      .then(g => {
+        g = g.node(rdf.namedNode(subjectURI));
+        // TODO: Should this get all or a given subject's?
+        var endpoints = g.out(rdf.namedNode(property)).values;
+
+        endpoints = sanitizeIRIs(endpoints);
+
+        if (endpoints.length) {
+          return endpoints;
+        }
+
+        // console.log(property + ' endpoint was not found in message body')
+        return getLinkRelationFromHead(property, subjectURI)
+      })
+
+    }
+}
+
+export function getLinkRelationFromHead(property, url) {
+  var properties = (Array.isArray(property)) ? property : [property];
+
+  return Config.Storage.head(url).then(
+    function (i) {
+      var link = i.headers.get('Link')
+      if (link && link.length) {
+        var linkHeaders = LinkHeader.parse(link)
+        // console.log(property)
+        // console.log(linkHeaders)
+        var uris = [];
+        properties.forEach(property => {
+          if (linkHeaders.has('rel', property)) {
+            // console.log(linkHeaders.rel(property)[0].uri)
+            uris.push(linkHeaders.rel(property)[0].uri);
+          }
+        });
+
+        uris = sanitizeIRIs(uris);
+        // console.log(uris)
+
+        if (uris.length) {
+          return uris;
+        }
+
+       return Promise.reject({'message': properties.join(', ') + " endpoint(s) was not found in 'Link' header"})
+      }
+      return Promise.reject({'message': properties.join(', ') + " endpoint(s) was not found in 'Link' header"})
+    },
+    function (reason) {
+      return Promise.reject({'message': "'Link' header not found"})
+    }
+  );
+}
+
+export function getLinkRelationFromRDF(property, url) {
+  if (!url) { return Promise.reject({'message': 'Missing url paramater' })}
+
+  return getResourceGraph(url)
+    .then(({ graph: g }) => {
+        g = g.node(rdf.namedNode(url));
+        var values = g.out(rdf.namedNode(property)).values;
+
+        values = sanitizeIRIs(values);
+
+        if (values.length) {
+          return values;
+        }
+
+        return Promise.reject({'message': property + " endpoint was not found in message body"})
+      }
+    )
+}
+
+export function isActorType(s) {
+  return Config.Actor.Type.hasOwnProperty(s)
+}
+
+export function isActorProperty(s) {
+  return Config.Actor.Property.hasOwnProperty(s)
+}
+
+export function isEventType(s) {
+  return Config.Event.Type.hasOwnProperty(s)
+}
+
+export function getAgentEncryptionPublicKey(g, subjectIRI) {
+  if (!g || !subjectIRI) return null;
+  const quads = [...g.match(rdf.namedNode(subjectIRI), Config.ns.sec.publicKeyJwk, null)];
+  if (!quads.length) return null;
+  try {
+    return JSON.parse(quads[0].object.value);
+  } catch {
+    return null;
+  }
+}
+
+export function getAgentPreferencesInfo(g) {
+  if (!g) { return; }
+
+  var preferencesFile = getAgentPreferencesFile(g) || Config.User.PreferencesFile;
+
+  if (preferencesFile?.length) {
+    return getResourceGraph(preferencesFile[0]).then(({ graph }) => graph);
+  }
+  else {
+    return Promise.reject({});
+  }
+}
+
+//TODO: Review grapoi
+export function getAgentPreferredPolicyRule(s) {
+  var preferredPolicyRule = {};
+
+  var prohibitions = s.out(ns.odrl.prohibition).values;
+  if (prohibitions.length) {
+    var prohibitionG = s.node(rdf.namedNode(prohibitions[0]));
+
+    if (prohibitionG.out(ns.odrl.action).values.length) {
+      preferredPolicyRule['Prohibition'] = {};
+      preferredPolicyRule['Prohibition']['Actions'] = sanitizeIRIs(prohibitionG.out(ns.odrl.action).values);
+    }
+  }
+
+  var permissions = s.out(ns.odrl.permissions).values;
+  if (permissions.length) {
+    var permissionG = s.node(rdf.namedNode(permissions[0]));
+
+    if (permissionG.out(ns.odrl.action).values.length) {
+      preferredPolicyRule['Permission'] = {};
+      preferredPolicyRule['Permission']['Actions'] = sanitizeIRIs(permissionG.out(ns.odrl.action).values);
+    }
+  }
+
+  return preferredPolicyRule;
+}
+
+//TODO: Review grapoi
+export function setPreferredPolicyInfo(g) {
+  Config.User['PreferredPolicy'] = getAgentPreferredPolicy(g);
+  var s = g.node(rdf.namedNode(Config.User.PreferredPolicy));
+  Config.User['PreferredPolicyRule'] = getAgentPreferredPolicyRule(s);
+}
+
+//TODO: Review grapoi
+export function getAgentSupplementalInfo(iri) {
+  if (iri == Config.User.IRI) {
+    return processSameAs(Config.User.Graph, getAgentSupplementalInfo);
+  }
+  else {
+    return getResourceGraph(iri)
+      .then(({ graph: g }) => {
+        if (!Array.from(g.out().quads()).length) {
+          return Promise.resolve([]);
+        }
+
+        var s = g.node(rdf.namedNode(iri));
+
+        Config.User.Name = Config.User.Name || getAgentName(s);
+
+        Config.User.Image = Config.User.Image || getGraphImage(s);
+
+        var storage = getAgentStorage(s) || [];
+        var outbox = getAgentOutbox(s) || [];
+        var knows = getAgentKnows(s) || [];
+        var liked = getAgentLiked(s) || [];
+        var occupations = getAgentOccupations(s) || [];
+        var skills = getGraphSkills(s) || [];
+        var publications = getAgentPublications(s) || [];
+        var made = getAgentMade(s) || [];
+        //TODO publicTypeIndex privateTypeIndex ??
+
+        if (storage.length > 0) {
+          Config.User.Storage = (Config.User.Storage)
+            ? uniqueArray(Config.User.Storage.concat(storage))
+            : storage;
+        }
+
+        if (outbox.length > 0) {
+          Config.User.Outbox = (Config.User.Outbox)
+            ? uniqueArray(Config.User.Outbox.concat(outbox))
+            : outbox;
+        }
+
+        if (knows.length > 0) {
+          Config.User.Knows = (Config.User.Knows)
+            ? uniqueArray(Config.User.Knows.concat(knows))
+            : knows;
+        }
+
+        if (liked.length > 0) {
+          Config.User.Liked = (Config.User.Liked)
+            ? uniqueArray(Config.User.Liked.concat(liked))
+            : liked;
+        }
+
+        if (occupations.length > 0) {
+          Config.User.Occupations = (Config.User.Occupations)
+            ? uniqueArray(Config.User.Occupations.concat(occupations))
+            : occupations;
+        }
+
+        if (skills.length > 0) {
+          Config.User.Skills = (Config.User.Skills)
+            ? uniqueArray(Config.User.Skills.concat(skills))
+            : skills;
+        }
+
+        if (publications.length > 0) {
+          Config.User.Publications = (Config.User.Publications)
+            ? uniqueArray(Config.User.Publications.concat(publications))
+            : occupations;
+        }
+
+        if (made.length > 0) {
+          Config.User.Made = (Config.User.Made)
+            ? uniqueArray(Config.User.Made.concat(made))
+            : made;
+        }
+
+        return processSameAs(s, getAgentSupplementalInfo)
+                .then(() => {
+                  return getAgentSeeAlsoPrimaryTopicOf(s)
+                });
+      },
+      function(reason){
+        return Promise.resolve([]);
+      });
+  }
+}
+
+export function getAgentSeeAlsoPrimaryTopicOf(g, subjectURI) {
+  if (!g) { return Promise.resolve([]); }
+
+  subjectURI = subjectURI || g.term.value;
+  subjectURI = sanitizeIRI(subjectURI);
+  var baseURI = stripFragmentFromString(subjectURI);
+  var seeAlso = sanitizeIRIs(g.out(ns.rdfs.seeAlso).values);
+  var isPrimaryTopicOf = sanitizeIRIs(g.out(ns.foaf.isPrimaryTopicOf).values);
+
+  if (seeAlso.length || isPrimaryTopicOf.length) {
+    var promises = [];
+
+    seeAlso.forEach(iri => {
+      if (
+        Config.User.SeeAlso.includes(iri) ||
+        Config.User.PrimaryTopicOf.includes(iri) ||
+        stripFragmentFromString(iri) === baseURI
+      ) return;
+
+      Config.User.SeeAlso.push(iri);
+
+      promises.push(getResourceGraph(iri));
+    });
+
+    isPrimaryTopicOf.forEach(iri => {
+      if (
+        Config.User.SeeAlso.includes(iri) ||
+        Config.User.PrimaryTopicOf.includes(iri) ||
+        stripFragmentFromString(iri) === baseURI
+      ) return;
+
+      Config.User.PrimaryTopicOf.push(iri);
+
+      promises.push(getResourceGraph(iri));
+    });
+
+    return Promise.allSettled(promises)
+      .then(results => {
+        var promisesGetAgentSeeAlsoPrimaryTopicOf = [];
+
+        results.forEach(result => {
+          // Rejected entries are skipped
+          if (result.status !== 'fulfilled') return;
+          var g = result.value?.graph;
+
+          if (g) {
+            var s = g.node(rdf.namedNode(subjectURI));
+
+            var knows = getAgentKnows(s) || [];
+            var liked = getAgentLiked(s) || [];
+            var occupations = getAgentOccupations(s) || [];
+            var skills = getGraphSkills(s) || [];
+            var publications = getAgentPublications(s) || [];
+            var made = getAgentMade(s) || [];
+
+            if (knows.length) {
+              Config.User.Knows = (Config.User.Knows)
+                ? uniqueArray(Config.User.Knows.concat(knows))
+                : knows;
+            }
+
+            if (liked.length) {
+              Config.User.Liked = (Config.User.Liked)
+                ? uniqueArray(Config.User.Liked.concat(liked))
+                : liked;
+            }
+
+            if (occupations.length) {
+              Config.User.Occupations = (Config.User.Occupations)
+                ? uniqueArray(Config.User.Occupations.concat(occupations))
+                : occupations;
+            }
+
+            if (skills.length) {
+              Config.User.Skills = (Config.User.Skills)
+                ? uniqueArray(Config.User.Skills.concat(skills))
+                : skills;
+            }
+
+            if (publications.length) {
+              Config.User.Publications = (Config.User.Publications)
+                ? uniqueArray(Config.User.Publications.concat(publications))
+                : publications;
+            }
+
+            if (made.length) {
+              Config.User.Made = (Config.User.Made)
+                ? uniqueArray(Config.User.Made.concat(made))
+                : made;
+            }
+
+            promisesGetAgentSeeAlsoPrimaryTopicOf.push(getAgentSeeAlsoPrimaryTopicOf(g, subjectURI))
+          }
+        })
+
+        return Promise.allSettled(promisesGetAgentSeeAlsoPrimaryTopicOf)
+          .then(results => {
+            return Promise.resolve([]);
+          })
+      })
+      .catch(e => {
+        return Promise.resolve([]);
+      });
+  }
+  else {
+    return Promise.resolve([])
+  }
+}
+
+export function getUserContacts(iri) {
+  var fyn = function(iri){
+    if ((iri == Config.User.IRI) && Config.User.Graph) {
+      return processSameAs(Config.User.Graph, getUserContacts);
+    }
+    else {
+      return getResourceGraph(iri)
+        .then(({ graph: g }) => {
+          if (typeof g === 'undefined') {
+            return Promise.resolve([]);
+          }
+
+          var s = g.node(rdf.namedNode(iri));
+
+          var knows = getAgentKnows(s) || [];
+
+          if (knows.length > 0) {
+            Config.User.Knows = (Config.User.Knows)
+              ? uniqueArray(Config.User.Knows.concat(knows))
+              : knows;
+          }
+
+          return processSameAs(s, getUserContacts);
+        })
+        .catch(e => {
+          return Promise.resolve([]);
+        });
+    }
+  }
+
+  return fyn(iri).then(i => { return Config.User.Knows || []; });
+}
+
+export function getAgentTypeIndex(s) {
+  //XXX: TypeRegistration forClasses of interest but for now lets store what we find without filtering.
+  // const TypeRegistrationClasses = [ns.oa.Annotation, ns.as.Announce];
+
+  var fetchTypeRegistration = function(iri, typeIndexType) {
+    return getResourceGraph(iri)
+      .then(({ graph: g }) => {
+        //XXX: https://github.com/solid/type-indexes/issues/29 for potential property to discover TypeRegistrations.
+
+        if (!g) {
+          return {};
+        }
+
+        g = rdf.grapoi({ dataset: g.dataset });
+
+        var triples = Array.from(g.out().quads());
+
+        if (triples.length == 0) {
+          return {};
+        }
+
+        var typeIndexes = {};
+        typeIndexes[typeIndexType] = {};
+
+        triples.forEach(t => {
+          var p = t.predicate.value;
+          
+          if (p == ns.solid.forClass.value) {
+            var s = sanitizeIRIOrBNode(t.subject);
+            var o = sanitizeIRIOrBNode(t.object);
+            typeIndexes[typeIndexType][s] = {};
+            typeIndexes[typeIndexType][s][p] = o;
+          }
+        });
+
+        triples.forEach(t => {
+          var p = t.predicate.value;
+          var s = sanitizeIRIOrBNode(t.subject);
+
+          if (typeIndexes[typeIndexType][s]) {
+            if (p == ns.solid.instance.value || p == ns.solid.instanceContainer.value) {
+              var o = sanitizeIRIOrBNode(t.object);
+              typeIndexes[typeIndexType][s][p] = o;
+            }
+            // Registration label and subject surface in the annotation Notify list
+            else if (p == ns.rdfs.label.value || p == ns.dcterms.subject.value) {
+              var o = t.object.termType === 'Literal' ? t.object.value : sanitizeIRIOrBNode(t.object);
+              if (o) {
+                typeIndexes[typeIndexType][s][p] = o;
+              }
+            }
+          }
+        });
+
+        // console.log(typeIndexes)
+        return typeIndexes;
+      })
+  }
+
+  var promises = [];
+
+  var publicTypeIndex = getAgentPublicTypeIndex(s);
+  var privateTypeIndex = getAgentPrivateTypeIndex(s);
+
+  if (publicTypeIndex?.length) {
+    for (const iri of publicTypeIndex) {
+      promises.push(fetchTypeRegistration(iri, ns.solid.publicTypeIndex.value));
+    }
+  }
+
+  if (privateTypeIndex?.length && isUserAuthenticated()) {
+    for (const iri of privateTypeIndex) {
+      promises.push(fetchTypeRegistration(iri, ns.solid.privateTypeIndex.value));
+    }
+  }
+
+  return Promise.allSettled(promises)
+    .then(results => {
+      const validResults = results.filter(
+        r => r.status === "fulfilled" && r.value && Object.keys(r.value).length > 0
+      );
+
+      const typeIndexes = {};
+      validResults.forEach(result => {
+        safeObjectAssign(typeIndexes, result.value);
+      });
+
+      return typeIndexes;
+    });
+}
+
+export function processSameAs(s, callback) {
+  var sameAs = sanitizeIRIs(s.out(ns.owl.sameAs).values);
+
+  if (sameAs.length){
+    var promises = [];
+    sameAs.forEach(iri => {
+      // console.log(iri);
+      if(iri != Config.User.IRI && !Config.User.SameAs.includes(iri)) {
+        Config.User.SameAs = uniqueArray(Config.User.SameAs.concat(iri));
+
+        if (typeof callback !== 'undefined') {
+          promises.push(callback(iri));
+        }
+        else {
+          promises.push(Promise.resolve(Config.User.SameAs));
+        }
+      }
+    });
+
+    return Promise.all(promises)
+      .then(results => {
+        return Promise.resolve([]);
+      })
+      .catch(e => {
+        return Promise.resolve([]);
+      });
+  }
+  else {
+    return Promise.resolve([]);
+  }
+}
+
+export function getAgentPreferredProxy(s) {
+  const proxies = sanitizeIRIs(s.out(ns.solid.preferredProxy).values);
+  return proxies[0];
+}
+
+export function getAgentPreferredPolicy(s) {
+  const policies = sanitizeIRIs(s.out(ns.solid.preferredPolicy).values);
+  return policies[0];
+}
+
+export function getListValues(ptr) {
+  try {
+    const list = ptr.list();
+    return list ? [...list].map(p => p.value) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// solid:preferredLanguages is an ordered fallback list (RDF Collection) of BCP
+// 47 tags; the remaining terms express competence, not preference, and are
+// unordered, so they only serve as a fallback.
+export function getAgentPreferredLanguages(s) {
+  const preferredLanguages = getListValues(s.out(ns.solid.preferredLanguages));
+
+  if (preferredLanguages?.length) {
+    return preferredLanguages;
+  }
+
+  var vcardLanguages = s.out(ns.vcard.language).values;
+  var knowsLanguages = s.out(ns.schema.knowsLanguage).values;
+  var solidPreferredLanguages = s.out(ns.solid.preferredLanguage).values;
+
+  return (
+    vcardLanguages.length > 0 ? vcardLanguages :
+    knowsLanguages.length > 0 ? knowsLanguages :
+    solidPreferredLanguages.length > 0 ? solidPreferredLanguages :
+    undefined
+  );
+}
+
+//TODO: undefined?
+export function getAgentOIDCIssuer(s) {
+  const idp = sanitizeIRIs(s.out(ns.solid.oidcIssuer).values);
+  return idp[0];
+}
+
+export function getAgentName(s) {
+  var name = s.out(ns.foaf.name).values[0] || s.out(ns.schema.name).values[0] || s.out(ns.vcard.fn).values[0] || s.out(ns.as.name).values[0] || s.out(ns.rdfs.label).values[0] || undefined;
+  // var name = s.out([ns.foaf.name, ns.schema.name]).values[0]
+  if (typeof name === 'undefined') {
+    // s.hasOut(ns.schema.familyName).hasOut(ns.schema.givenName)
+    // .map(ptr => {
+    //   return ptr.out(ns.schema.familyName).values[0] + ' '
+    //   ptr.out(ns.schema.givenName).values[0]
+    // })
+    // .out([ns.schema.familyName, ns.schema.givenName]).join(' ')
+
+    if (s.out(ns.schema.familyName).values.length && s.out(ns.schema.givenName).values.length) {
+      name = s.out(ns.schema.givenName).values[0] + ' ' + s.out(ns.schema.familyName).values[0];
+    } else if (s.out(ns.foaf.familyName).values.length && s.out(ns.foaf.givenName).values.length) {
+      name = s.out(ns.foaf.givenName).values[0] + ' ' + s.out(ns.foaf.familyName).values[0];
+    } else if (s.out(ns.vcard['family-name']).values.length && s.out(ns.vcard['given-name']).values.length) {
+      name = s.out(ns.vcard['given-name']).values[0] + ' ' + s.out(ns.vcard['family-name']).values[0];
+    } else if (s.out(ns.foaf.nick).values.length) {
+      name = s.out(ns.foaf.nick).values;
+    } else if (s.out(ns.vcard.nickname).values.length){
+      name = s.out(ns.vcard.nickname).values;
+    }
+  }
+  return name === undefined ? undefined : domSanitize(name);
+}
+
+export function getAgentURL(s) {
+  const candidates = [
+    ...s.out(ns.foaf.homepage).values,
+    ...s.out(ns.foaf.weblog).values,
+    ...s.out(ns.schema.url).values,
+    ...s.out(ns.vcard.url).values
+  ];
+  const sanitized = sanitizeIRIs(candidates);
+  return sanitized[0];
+}
+
+export function getAgentDelegates(s) {
+  const d = sanitizeIRIs(s.out(ns.acl.delegates).values);
+  return d.length ? d : undefined;
+}
+
+export function getAgentStorage(s) {
+  const d = sanitizeIRIs(s.out(ns.ws.storage).values);
+  return d.length ? d : undefined;
+}
+
+export function getAgentOutbox(s) {
+  const d = sanitizeIRIs(s.out(ns.as.outbox).values);
+  return d.length ? d : undefined;
+}
+
+export function getAgentInbox(s) {
+  return getGraphInbox(s);
+}
+
+export function getGraphInbox(s) {
+  const ldpinbox = s.out(ns.ldp.inbox).values;
+  const asinbox = s.out(ns.as.inbox).values;
+
+  let inbox = ldpinbox.length
+    ? ldpinbox
+    : asinbox.length
+    ? asinbox
+    : [];
+
+  inbox = sanitizeIRIs(inbox);
+  return inbox.length ? inbox : undefined;
+}
+
+export function getAgentKnows(s) {
+  let knows = [
+    ...(s.out(ns.foaf.knows).values || []),
+    ...(s.out(ns.schema.knows).values || [])
+  ];
+
+  if (Array.isArray(Config.User.SameAs)) {
+    for (const iri of Config.User.SameAs) {
+      const userG = s.node(rdf.namedNode(iri));
+      knows.push(
+        ...(userG.out(ns.foaf.knows).values || []),
+        ...(userG.out(ns.schema.knows).values || [])
+      );
+    }
+  }
+
+  knows = sanitizeIRIs(knows);
+  knows = uniqueArray(knows);
+  return knows.length ? knows : undefined;
+}
+
+export function getAgentFollowing(s) {
+  const following = sanitizeIRIs(s.out(ns.as.following).values);
+
+  if (following.length) {
+    const options = {
+      headers: {
+        'Accept': 'application/ld+json; profile="https://www.w3.org/ns/activitystreams", application/activity+json, text/turtle'
+      }
+    };
+    return getItemsList(following[0], options)
+      .then(items => items.length ? items : undefined);
+  }
+}
+
+export function getAgentPublicTypeIndex(s) {
+  const d = sanitizeIRIs(s.out(ns.solid.publicTypeIndex).values);
+  return d.length ? d : undefined;
+}
+
+export function getAgentPrivateTypeIndex(s) {
+  const d = sanitizeIRIs(s.out(ns.solid.privateTypeIndex).values);
+  return d.length ? d : undefined;
+}
+
+export function getAgentPreferencesFile(s) {
+  const d = sanitizeIRIs(s.out(ns.ws.preferencesFile).values);
+  return d.length ? d : undefined;
+}
+
+// The primaryTopic check guards Web-CID authoritativeness against key substitution
+export function getPublicKeysForWebId(webid) {
+  return getResourceGraph(webid).then(({ graph }) => {
+    const doc = stripFragmentFromString(webid);
+    const primaryTopics = graph.node(rdf.namedNode(doc)).out(ns.foaf.primaryTopic).values;
+    if (primaryTopics.length && !primaryTopics.includes(webid)) {
+      console.warn('dokieli: profile document primaryTopic does not match WebID; ignoring published keys', doc);
+      return [];
+    }
+
+    const s = graph.node(rdf.namedNode(webid));
+    const keyIRIs = sanitizeIRIs([
+      ...s.out(ns.sec.keyAgreementMethod).values,
+      ...s.out(ns.sec.verificationMethod).values
+    ]);
+    const jwks = [];
+    keyIRIs.forEach(iri => {
+      const key = graph.node(rdf.namedNode(iri));
+      const literal = key.out(ns.sec.publicKeyJwk).values[0];
+      let jwk = null;
+      if (literal) {
+        try { jwk = JSON.parse(literal); } catch {}
+      } else {
+        jwk = multikeyToJWK(key.out(ns.sec.publicKeyMultibase).values[0]);
+      }
+      if (jwk) {
+        if (!jwk.kid) jwk.kid = iri;
+        jwks.push(jwk);
+      }
+    });
+    return jwks;
+  });
+}
+
+export function getAgentLiked(s) {
+  const d = sanitizeIRIs(s.out(ns.as.liked).values);
+  return d.length ? d : undefined;
+}
+
+export function getAgentOccupations(s) {
+  const d = sanitizeIRIs(s.out(ns.schema.hasOccupation).values);
+  return d.length ? d : undefined;
+}
+
+export function getGraphAudience(s) {
+  const d = sanitizeIRIs(s.out(ns.schema.audience).values);
+  return d.length ? d : undefined;
+}
+
+export function getGraphSkills(s) {
+  const ccoSkills = s.out(ns.cco.skill).values;
+  const schemaSkills = s.out(ns.schema.skills).values;
+  const d = uniqueArray(ccoSkills.concat(schemaSkills));
+  const sanitized = sanitizeIRIs(d);
+  return sanitized.length ? sanitized : undefined;
+}
+
+export function getAgentPublications(s) {
+  const d = sanitizeIRIs(s.out(ns.foaf.publications).values);
+  return d.length ? d : undefined;
+}
+
+export function getAgentMade(s) {
+  const d = sanitizeIRIs(s.out(ns.foaf.made).values);
+  return d.length ? d : undefined;
+}
+
+export function getGraphImage(s) {
+  const iconTerms = s.out(ns.as.icon).terms;
+  const imageTerms = s.out(ns.as.image).terms;
+
+  let image;
+
+  if (imageTerms.length || iconTerms.length) {
+    const terms = [...imageTerms, ...iconTerms];
+
+    for (const term of terms) {
+      if (term.termType === 'NamedNode') {
+        image = term.value;
+        break;
+      }
+
+      if (term.termType === 'BlankNode') {
+        const match = Array.from(s.out().quads()).find(t => {
+          const pred = t.predicate.value;
+          const subj = t.subject.value;
+          return (
+            (pred === ns.as.url.value || pred === ns.as.href.value) &&
+            (subj === term.value || '_:' + subj === term.value)
+          );
+        });
+        if (match) {
+          image = match.object.value;
+          break;
+        }
+      }
+    }
+  }
+  else {
+    const props = [
+      ns.foaf.img,
+      ns.schema.image,
+      ns.vcard.photo,
+      ns.vcard.hasPhoto,
+      ns.sioc.avatar,
+      ns.foaf.depiction
+    ];
+
+    image = props
+      .flatMap(prop => s.out(prop).terms)
+      .find(term => term?.termType === 'NamedNode')
+      ?.value;
+  }
+
+  return sanitizeIRI(image) || undefined;
+}
+
+export function getGraphEmail(s) {
+  const props = [ns.schema.email, ns.foaf.mbox];
+
+  for (const prop of props) {
+    const terms = s.out(prop).terms;
+    for (const term of terms) {
+      if (term.termType === 'NamedNode') {
+        return sanitizeIRI(term.value);
+      }
+      if (term.termType === 'Literal') {
+        return domSanitize(term.value);
+      }
+    }
+  }
+
+  return undefined;
+}
+
+export function getGraphContributors(s) {
+  let d = sanitizeIRIs(s.out(ns.schema.contributor).values);
+  return d.length ? d : undefined;
+}
+
+export function getGraphEditors(s) {
+  let d = sanitizeIRIs(s.out(ns.schema.editor).values);
+  return d.length ? d : undefined;
+}
+
+export function getGraphAuthors(s) {
+  const props = [
+    ns.schema.author,
+    ns.as.author
+  ];
+
+  for (const prop of props) {
+    let values = sanitizeIRIs(s.out(prop).values);
+    if (values.length) {
+      return values;
+    }
+  }
+
+  return undefined;
+}
+
+export function getGraphCreators(s) {
+  const props = [
+    ns.schema.creator,
+    ns.dcterms.creator
+  ];
+
+  for (const prop of props) {
+    let values = sanitizeIRIs(s.out(prop).values);
+    if (values.length) {
+      return values;
+    }
+  }
+
+  return undefined;
+}
+
+export function getGraphPerformers(s) {
+  let d = sanitizeIRIs(s.out(ns.schema.performer).values);
+  return d.length ? d : undefined;
+}
+
+export function getGraphPublishers(s) {
+  let schemaPublishers = s.out(ns.schema.publisher).values;
+  let dctermsPublishers = s.out(ns.dcterms.publisher).values;
+
+  let publishers = schemaPublishers.length
+    ? schemaPublishers
+    : dctermsPublishers.length
+    ? dctermsPublishers
+    : [];
+
+  publishers = sanitizeIRIs(publishers);
+  return publishers.length ? publishers : undefined;
+}
+
+export function getGraphDate(s) {
+  return getGraphUpdated(s) || getGraphPublished(s) || getGraphCreated(s);
+}
+
+export function getGraphPublished(s) {
+  var d = s.out(ns.schema.datePublished).values[0] || s.out(ns.as.published).values[0] || s.out(ns.dcterms.issued).values[0] || s.out(ns.dcterms.date).values[0] || s.out(ns.prov.generatedAtTime).values [0] || undefined;
+  return d === undefined ? undefined : domSanitize(d);
+}
+
+export function getGraphUpdated(s) {
+  var d = s.out(ns.schema.dateModified).values[0] || s.out(ns.as.updated).values[0] || s.out(ns.dcterms.modified).values[0] || s.out(ns.dcterms.date).values[0] || s.out(ns.prov.generatedAtTime).values[0] || undefined;
+  return d === undefined ? undefined : domSanitize(d);
+}
+
+export function getGraphCreated(s) {
+  var d = s.out(ns.schema.dateCreated).values[0] || s.out(ns.dcterms.created).values[0] || s.out(ns.dcterms.date).values[0] || s.out(ns.prov.generatedAtTime).values[0] || undefined;
+  return d === undefined ? undefined : domSanitize(d);
+}
+
+export function getGraphLanguage(s) {
+  return s.out(ns.dcterms.language).values[0] || s.out(ns.dcelements.language).values[0] || s.out(ns.schema.inLanguage).values[0] || undefined;
+}
+
+export function getGraphLicense(s) {
+  let d = s.out(ns.dcterms.license).values || s.out(ns.schema.license).values || s.out(ns.cc.license).values || s.out(ns.xhv.license).values;
+  d = sanitizeIRIs(d);
+  return d[0];
+}
+
+export function getGraphRights(s) {
+  let d = s.out(ns.dcterms.rights).values[0] || getGraphLicense(s);
+  d = sanitizeIRIs(d);
+  return d[0];
+}
+
+export function getGraphLabel(s) {
+  var d = s.out(ns.schema.name).values[0] || s.out(ns.dcterms.title).values[0] || s.out(ns.dcelements.title).values[0] || getAgentName(s) || s.out(ns.as.summary).values[0] || undefined;
+  return d === undefined ? undefined : domSanitize(d)
+}
+
+export function getGraphTitle(s) {
+  var d = s.out(ns.schema.name).values[0] || s.out(ns.dcterms.title).values[0] || s.out(ns.dcelements.title).values[0] || s.out(ns.as.name).values[0] || s.out(ns.skos.prefLabel).values[0] || undefined;
+  return d === undefined ? undefined : domSanitize(d)
+}
+
+export function getGraphLabelOrIRI(s) {
+  return getGraphLabel(s) || s.term.value;
+}
+
+export function getUserLabelOrIRI(iri) {
+  let name = iri;
+
+  if (Config.User.Name && (iri == Config.User.IRI || Config.User?.SameAs.includes(iri))) {
+    name = Config.User.Name;
+  }
+  //XXX: This could potentially incorporate checking the sameAses of all contacts to match iri
+  else if (Config.User.Contacts && Config.User.Contacts[iri] && Config.User.Contacts[iri].Name) {
+    name = Config.User.Contacts[iri].Name;
+  }
+
+  return name;
+}
+
+//XXX: RDFa issue retaining markup on non `datatype` nodes: https://github.com/rubensworks/rdfa-streaming-parser.js/issues/49
+export function getGraphConceptLabel(g, options) {
+  var labels = {
+    prefLabel: [],
+    xlprefLabel: [],
+    altLabel: [],
+    xlaltLabel: [],
+    notation: []
+  };
+  options = options || {};
+  options['subjectURI'] = options['subjectURI'] || g.term.value;
+  options['lang'] = options['lang'] || 'en';
+
+  var documentURL = Config.DocumentURL;
+
+  //FIXME: Using this approach temporarily that is tied to SimpleRDF for convenience until it is replaced. It is fugly but it works. Make it better!
+
+  var triples = Array.from(g.out().quads());
+
+  triples.forEach(t => {
+  // console.log(t)
+    var s = t.subject.value;
+    var p = t.predicate.value;
+    var o = t.object.value;
+
+    if (s == options['subjectURI']){
+      if (p == ns.skos.prefLabel.value && (t.object.language && (t.object.language == '' || t.object.language.toLowerCase().startsWith(options['lang'])))) {
+        labels.prefLabel.push(o);
+      }
+      else if (p == ns.skosxl.prefLabel.value) {
+        var quads = Config.Resource[documentURL]['graph'].node(rdf.namedNode(o)).out().quads();
+        quads.forEach(oT => {
+          var oS = oT.subject.value;
+          var oP = oT.predicate.value;
+          var oO = oT.object.value;
+
+          if (oS == o && oP == ns.skosxl.literalForm.value && (oT.object.language && (oT.object.language == '' || oT.object.language.toLowerCase().startsWith(options['lang'])))) {
+            labels.xlprefLabel.push(oO);
+          }
+        })
+      }
+      else if (p == ns.skos.altLabel.value && (t.object.language && (t.object.language == '' || t.object.language.toLowerCase().startsWith(options['lang'])))) {
+        labels.altLabel.push(o);
+      }
+      else if (p == ns.skosxl.altLabel.value) {
+        var quads = Config.Resource[documentURL]['graph'].node(rdf.namedNode(o)).out().quads();
+        quads.forEach(oT => {
+          var oS = oT.subject.value;
+          var oP = oT.predicate.value;
+          var oO = oT.object.value;
+
+          if (oS == o && oP == ns.skosxl.literalForm.value && (oT.object.language && (oT.object.language == '' || oT.object.language.toLowerCase().startsWith(options['lang'])))) {
+            labels.xlaltLabel.push(oO);
+          }
+        })
+      }
+      else if (p == ns.skos.notation.value) {
+        labels.notation.push(o);
+      }
+    }
+  })
+
+  var flattenedLabels = [];
+
+  for (var key in labels) {
+    if (labels.hasOwnProperty(key)) {
+      flattenedLabels = flattenedLabels.concat(labels[key].sort().map(element => domSanitize(element)));
+    }
+  }
+
+  labels = uniqueArray(flattenedLabels);
+
+  // console.log(labels)
+  return labels;
+}
+
+export function getGraphDescription(s) {
+  var d = s.out(ns.schema.description).value || s.out(ns.dcterms.description).value || s.out(ns.dcelements.description).value || s.out(ns.schema.name).value || s.out(ns.as.name).value || s.out(ns.skos.definition).value || undefined;
+  return d === undefined ? undefined : domSanitize(d)
+}
+
+export function getGraphTypes(s) {
+  return sanitizeIRIs(s.out(ns.rdf.type).values);
+}
+
+export function sortGraphTriples(g, options) {
+  options = options || {};
+  if (!("sortBy" in options)) {
+    options["sortBy"] = "object";
+  }
+  g = rdf.grapoi({ dataset: g.dataset });
+  var quads = Array.from(g.out().quads());
+  quads.sort(function(a, b) {
+    return a[options.sortBy].value
+      .toLowerCase()
+      .localeCompare(b[options.sortBy].value.toLowerCase());
+  });
+
+  return quads;
+}
+
+export function getItemsList(url, options) {
+  url = url || Config.DocumentURL || currentLocation();
+  options = options || {};
+  options['resourceItems'] = options.resourceItems || [];
+  options['headers'] = options.headers || {};
+  options['excludeMarkup'] = true;
+
+  Config['CollectionItems'] = Config['CollectionItems'] || {};
+  Config['CollectionPages'] = ('CollectionPages' in Config && Config.CollectionPages.length) ? Config.CollectionPages : [];
+  Config['Collections'] = ('Collections' in Config && Config.Collections.length) ? Config.Collections : [];
+
+  const mediaTypeURIPrefix = "http://www.w3.org/ns/iana/media-types/";
+  //TODO: Move this elsewhere (call from Config.init()?) where it runs once and stores it in e.g, Config.MediaTypeURIs
+  var mediaTypeURIs = getMediaTypeURIs(Config.MediaTypes.RDF);
+
+  // if (Config.Notification[url]) {
+  //   return Promise.resolve([]);
+  // }
+
+  return getResourceGraph(url, options.headers, options)
+    .then(
+      function({ graph: g }) {
+        if (!g) return [];
+
+        var s = g.node(rdf.namedNode(url));
+        // console.log(s.toString());
+
+        var types = getGraphTypes(s);
+
+        if (types.includes(ns.ldp.Container.value) ||
+            types.includes(ns.as.Collection.value) ||
+            types.includes(ns.as.OrderedCollection.value)) {
+          Config.Collections.push(url);
+        }
+
+        if (!types.includes(ns.ldp.Container.value) &&
+            !types.includes(ns.as.Collection.value) &&
+            !types.includes(ns.as.OrderedCollection.value)) {
+          Config.CollectionPages.push(url);
+        }
+
+        var items = [s.out(ns.as.items).values, s.out(ns.as.orderedItems).values, s.out(ns.ldp.contains).values];
+
+        items = items.map(arr => sanitizeIRIs(arr));
+
+        items.forEach(i => {
+          i.forEach(resource => {
+            // console.log(resource)
+            var r = s.node(rdf.namedNode(resource));
+
+            if (r.out(ns.rdf.first).values.length || r.out(ns.rdf.rest).values.length) {
+              options.resourceItems = options.resourceItems.concat(traverseRDFList(s, resource));
+              options.resourceItems = sanitizeIRIs(options.resourceItems);
+            }
+            else {
+              //FIXME: This may need to be processed outside of items? See also comment above about processing Collection and CollectionPages.
+              var types = getGraphTypes(r);
+              //Include only non-container/collection and items that's not from an RDFList
+              if (!types.includes(ns.ldp.Container.value) &&
+                  !types.includes(ns.as.Collection.value) &&
+                  !types.includes(ns.as.CollectionPage.value) &&
+                  !types.includes(ns.as.OrderedCollection.value) &&
+                  !types.includes(ns.as.OrderedCollectionPage.value)) {
+                //XXX: The following is not used at the moment:
+                // Config.CollectionItems[resource] = s;
+
+                const hasPrefix = types.some(url => url.startsWith(mediaTypeURIPrefix));
+                const mediaTypeFound = hasPrefix && types.some(item => mediaTypeURIs.includes(item));
+                
+                if (mediaTypeFound || !hasPrefix) {
+                  options.resourceItems.push(resource);
+                  options.resourceModified = options.resourceModified || {};
+                  options.resourceModified[resource] = r.out(ns.dcterms.modified).values[0] || r.out(ns.as.updated).values[0] || r.out(ns.as.published).values[0] || '';
+                }
+              }
+            }
+          });
+        });
+
+        var first = s.out(ns.as.first).values;
+        var next = s.out(ns.as.next).values;
+
+        if (first.length && !Config.CollectionPages.includes(first[0])) {
+          return getItemsList(first[0], options);
+        }
+        else if (next.length && !Config.CollectionPages.includes(next[0])) {
+          return getItemsList(next[0], options);
+        }
+        else {
+          // Newest first so the item cap keeps recent annotations
+          var modified = options.resourceModified || {};
+          return uniqueArray(options.resourceItems).sort((a, b) => (modified[b] || '').localeCompare(modified[a] || ''));
+        }
+      })
+    .catch (e => {
+      console.log(e)
+      return [];
+    })
+}
+
+export function getSPARQLResourcesOfTypeWithLabel(sparqlEndpoint, resourceType, textInput, options) {
+  options = options || {};
+  var labelsPattern = '', resourcePattern = '';
+
+  if(!('lang' in options)) {
+    options['lang'] = 'en';
+  }
+
+  if ('filter' in options) {
+    if(resourceType == '<http://purl.org/linked-data/cube#DataSet>' || resourceType == 'qb:DataSet'
+      && 'dimensionRefAreaNotation' in options.filter) {
+        var dimensionPattern, dimensionDefault = '';
+        var dataSetPattern = "\n\
+    [] qb:dataSet ?resource";
+      if ('dimensionProperty' in options.filter) {
+        dimensionPattern = " ; " + options.filter.dimensionProperty;
+      }
+      else {
+        dimensionDefault = " .\n\
+  { SELECT DISTINCT ?propertyRefArea WHERE { ?propertyRefArea rdfs:subPropertyOf* sdmx-dimension:refArea . } }";
+        dimensionPattern = " ; ?propertyRefArea ";
+
+      }
+      var notationPattern = " [ skos:notation '" + options.filter.dimensionRefAreaNotation.toUpperCase() + "' ] ."
+    }
+    resourcePattern = dimensionDefault + dataSetPattern + dimensionPattern + notationPattern;
+  }
+
+  labelsPattern = "\n\
+  ";
+
+  if ('optional' in options) {
+    if('prefLabels' in options.optional) {
+      if (options.optional.prefLabels.length == 1) {
+        labelsPattern += "  ?resource " + options.optional.prefLabels[0] + " ?prefLabel .";
+      }
+      else {
+        labelsPattern += "  VALUES ?labelProperty {";
+        options.optional.prefLabels.forEach(property => {
+          labelsPattern += ' ' + property;
+        });
+        labelsPattern += " } ?resource ?labelProperty ?prefLabel .";
+      }
+    }
+  }
+  else {
+    labelsPattern += "  ?resource rdfs:label ?prefLabel .";
+  }
+
+//  FILTER (!STRSTARTS(STR(?resource), 'http://purl.org/linked-data/sdmx/'))\n\
+  var query = "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>\n\
+PREFIX dcterms: <http://purl.org/dc/terms/>\n\
+PREFIX qb: <http://purl.org/linked-data/cube#>\n\
+PREFIX sdmx-dimension: <http://purl.org/linked-data/sdmx/2009/dimension#>\n\
+PREFIX sdmx-measure: <http://purl.org/linked-data/sdmx/2009/measure#>\n\
+CONSTRUCT {\n\
+  ?resource skos:prefLabel ?prefLabel .\n\
+}\n\
+WHERE {\n\
+  ?resource a " + resourceType + " ."
++ labelsPattern + "\n\
+  FILTER (CONTAINS(LCASE(?prefLabel), '" + textInput + "') && (LANG(?prefLabel) = '' || LANGMATCHES(LANG(?prefLabel), '" + options.lang + "')))"
++ resourcePattern + "\n\
+}";
+  return sparqlEndpoint + "?query=" + encodeString(query);
+}
+
+export function getObservationsWithDimension(sparqlEndpoint, dataset, paramDimension, options) {
+  var query = "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>\n\
+PREFIX dcterms: <http://purl.org/dc/terms/>\n\
+PREFIX qb: <http://purl.org/linked-data/cube#>\n\
+PREFIX sdmx-dimension: <http://purl.org/linked-data/sdmx/2009/dimension#>\n\
+PREFIX sdmx-measure: <http://purl.org/linked-data/sdmx/2009/measure#>\n\
+CONSTRUCT {\n\
+  ?observation sdmx-dimension:refPeriod ?refPeriod .\n\
+  ?observation sdmx-measure:obsValue ?obsValue .\n\
+}\n\
+WHERE {\n\
+  ?observation qb:dataSet <" + dataset + "> .\n\
+  " + paramDimension + "\n\
+  ?propertyRefPeriod rdfs:subPropertyOf* sdmx-dimension:refPeriod .\n\
+  ?observation ?propertyRefPeriod ?refPeriod .\n\
+  ?propertyMeasure rdfs:subPropertyOf* sdmx-measure:obsValue .\n\
+  ?observation ?propertyMeasure ?obsValue .\n\
+}";
+
+  return sparqlEndpoint + "?query=" + encodeString(query);
+}
+
+
+export async function getWikidataResults (keywords, options = {}) {
+  // console.log(`getWikidataResults: ${keywords}`)
+  // console.log(options);
+
+  keywords = Array.isArray(keywords) ? keywords : [keywords];
+
+  // TODO: This function so far only does one keyword at a time
+  const keyword = keywords[0].trim();
+
+  //TODO: Using the root language only for now, without locale.
+  let wikidataSearchLanguage = Config.User.UI.Language;
+  wikidataSearchLanguage = wikidataSearchLanguage.split('-')[0];
+
+  let wikidataSearchLimit = 100;
+
+  let wikidataQueryUrl;
+
+  // city, village, city or town, township
+  const wikidataAddressLocality = ["wd:Q515", "wd:Q532", "wd:Q7930989", "wd:Q19610511"];
+  // state, province, federal state, department, canton
+  const wikidataAddressRegion = ["wd:Q7275", "wd:Q34876", "wd:Q107390", "wd:Q643589", "wd:Q28575"];
+  // country, political territorial entity
+  const wikidataAddressCountry = ["wd:Q6256", "wd:Q1048835"];
+  // human settlement, geographic location, administrative territorial entity
+  const wikidataPlace = ["wd:Q486972", "wd:Q2221906", "wd:Q56061"];
+
+  const wikidataTypes = [...wikidataAddressLocality, ...wikidataAddressRegion, ...wikidataAddressCountry].join(' ');
+  const wikidataRegionTypes = wikidataAddressRegion.join(' ');
+  const wikidataLocalityTypes = wikidataAddressLocality.join(' ');
+
+  const typeFilter = `
+?id wdt:P31/wdt:P279* ?baseType .
+VALUES ?baseType { ${wikidataTypes} }
+`
+
+  let wikidataSparqlQuery = `
+PREFIX wikibase: <http://wikiba.se/ontology#>
+PREFIX mwapi: <https://www.mediawiki.org/ontology#API/>
+PREFIX wd: <http://www.wikidata.org/entity/>
+PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+PREFIX schema: <http://schema.org/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+SELECT DISTINCT ?id ?label ?url ?locationType ?selfRegionCode ?selfCountryCode ?region ?regionCode ?regionLabel ?country ?countryCode ?countryLabel
+WHERE {
+{
+  SELECT DISTINCT ?id
+  WHERE {
+    SERVICE wikibase:mwapi {
+      bd:serviceParam
+        wikibase:endpoint "www.wikidata.org" ;
+        wikibase:api "EntitySearch" ;
+        mwapi:search "${keyword}" ;
+        mwapi:language "${wikidataSearchLanguage}" ;
+        mwapi:limit "${wikidataSearchLimit}" .
+      ?id wikibase:apiOutputItem mwapi:item .
+    }
+    ${typeFilter}
+  }
+}
+
+OPTIONAL {
+?id rdfs:label ?labelStr .
+FILTER(LANG(?labelStr) IN ("", "${wikidataSearchLanguage}", "mul"))
+BIND(STR(?labelStr) AS ?label)
+}
+
+OPTIONAL {
+?url
+  schema:about ?id ;
+  schema:isPartOf <https://${wikidataSearchLanguage}.wikipedia.org/> .
+}
+
+BIND(
+  IF(EXISTS { ?id wdt:P31/wdt:P279* wd:Q6256 }, "addressCountry",
+  IF(EXISTS { VALUES ?rt { ${wikidataRegionTypes} } ?id wdt:P31/wdt:P279* ?rt }, "addressRegion",
+  "addressLocality")) AS ?locationType
+)
+
+OPTIONAL { ?id wdt:P300 ?selfRegionCode . }
+OPTIONAL { ?id wdt:P297 ?selfCountryCode . }
+
+OPTIONAL {
+?id wdt:P131 ?region .
+OPTIONAL { ?region wdt:P300 ?regionCode . }
+OPTIONAL {
+?region rdfs:label ?regionLabelStr .
+FILTER(LANG(?regionLabelStr) IN ("", "${wikidataSearchLanguage}", "mul"))
+BIND(STR(?regionLabelStr) AS ?regionLabel)
+}
+}
+
+OPTIONAL {
+?id wdt:P17 ?country .
+OPTIONAL { ?country wdt:P297 ?countryCode . }
+OPTIONAL {
+?country rdfs:label ?countryLabelStr .
+FILTER(LANG(?countryLabelStr) IN ("", "${wikidataSearchLanguage}", "mul"))
+BIND(STR(?countryLabelStr) AS ?countryLabel)
+}
+}
+
+SERVICE wikibase:label { bd:serviceParam wikibase:language "${wikidataSearchLanguage}". }
+}
+`.trim();
+
+  // console.log(wikidataSparqlQuery);
+
+  wikidataQueryUrl = "https://query.wikidata.org/sparql?query=" + encodeURIComponent(wikidataSparqlQuery);
+
+  if (!(await requestOriginConsent(wikidataQueryUrl, { reason: 'search' }))) { return []; }
+
+  let sparqlRequestOptions = {};
+
+  let headers = { 'Accept': 'application/json' };
+
+  // console.log(sparqlResultsGraph)
+
+  try {
+    const response = await getResource(
+      wikidataQueryUrl,
+      { 'Accept': 'application/json' },
+      { timeout: 20000, ...options }
+    );
+    const graph = await response.json();
+    const byId = new Map();
+    graph.results.bindings
+      .filter(item => !!item.label)
+      .forEach(item => {
+        const id = item.id?.value;
+        if (!id) return;
+        const prev = byId.get(id);
+        if (!prev || (!prev.regionCode?.value && item.regionCode?.value)) {
+          byId.set(id, item);
+        }
+      });
+    return Array.from(byId.values())
+      .sort((a, b) => scoreMatch(keyword, b?.label?.value || '') - scoreMatch(keyword, a?.label?.value || ''));
+  } catch (error) {
+    console.warn('Wikidata search failed:', error?.message || error);
+    return [];
+  }
+}
+
+
+export async function getEscoResults(keyword, options = {}) {
+  let language = Config.User.UI.Language;
+  language = language.split('-')[0];
+
+  const escoApi = `https://ec.europa.eu/esco/api/search?language=${language}&limit=10&type=skill&text=${encodeURIComponent(keyword)}`;
+  const headers = { 'Accept': 'application/json; charset=utf-8' };
+
+  try {
+    const response = await getResource(escoApi, headers, options);
+    const data = await response.json();
+    return (data._embedded?.results || []).map(skill => ({
+      uri: skill.uri || '',
+      title: skill.title || '',
+    }));
+  } catch (e) {
+    console.warn('ESCO search failed:', e?.message || e);
+    return [];
+  }
+}

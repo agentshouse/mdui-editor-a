@@ -1,0 +1,785 @@
+/*!
+Copyright 2012-2026 Sarven Capadisli <https://csarven.ca/>
+Copyright 2023-2026 Virginia Balseiro <https://virginiabalseiro.com/>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+import rdf from 'rdf-ext';
+import Config from './config.js';
+const ns = Config.ns;
+import { highlightItems, updateSelectedStylesheets, initCurrentStylesheet, showActionMessage, addMessageToLog, initCopyToClipboard, showFragment, setDocRefType, showRobustLinksDecoration, focusNote, showAsTabs, setDocumentString, setDocumentURL, getDocument } from './doc.js';
+import { initButtons } from './ui/buttons.js'
+import { initOriginConsent } from './consent.js';
+import { setWebExtensionURL } from './util.js';
+import { getDeviceStorageItem, removeDeviceStorageItem, loadMessageLog } from './storage.js';
+const GIT_FORGE_HOSTS_KEY = 'DO.Config.GitForge.hosts';
+const HTTP_ORIGINS_KEY = 'DO.Config.Http.origins';
+import { syncLocalRemoteResource, monitorNetworkStatus, showResourceReviewChanges, enableLocalBackup, disableLocalBackup } from './sync.js';
+import { domSanitize, sanitizeInsertAdjacentHTML, sanitizeIRI, sanitizeObject } from './utils/sanitization.js';
+import { afterSetUserInfo, setUserInfo, processLoginInvocation } from './auth.js';
+import { showNotificationSources, showActivitiesSources, processAgentActivities, registerEncryptionUnlockHandler } from './activity.js';
+import { initNanopubAnnotations } from './nanopub-query.js';
+import { generateDataURI, getProxyableIRI, getUrlParams, stripFragmentFromString, stripUrlSearchHash } from './uri.js';
+import { SolidStorage, GitForgeStorage, HttpStorage, initStorage } from './storage/backend.js';
+import { initEditor } from './editor/initEditor.js';
+import { showGraph, showVisualisationGraph } from './viz.js';
+import * as Slideshow from './ui/templates/slideshow.js';
+import { initCV } from './ui/templates/cv.js';
+import { initSpecification } from './ui/templates/specification.js';
+import { initQuestionnaire } from './ui/templates/questionnaire.js';
+import './ui/anchors.js';
+import { openResource, initDocumentMenu, spawnDokieli, showDocumentMenu, initSlideshowInteraction, initDocumentDoEvents, showNewDocument, createNewDocument, createNewSlideshow, createNewCV, createNewSpecification, createNewQuestionnaire } from './dialog.js';
+import { Icon } from './ui/icons.js';
+import { eventButtonClose, eventButtonSignIn, eventButtonSignOut, eventButtonNotificationsToggle, eventButtonInfo, emitDocEvent } from './events.js';
+import { hasNonWhitespaceText, getDocumentContentNode, selectArticleNode } from "./utils/html.js";
+import { isUnlocked, getSessionKid, hasKeystore, decryptWithSession } from './keystore.js';
+import { initTableSort } from './tableSort.js';
+
+export async function init (url) {
+  initServiceWorker();
+  initWebManifest();
+  initInstallPrompt();
+  loadMessageLog();
+  await initOriginConsent();
+  await initStorageBackend();
+
+  var contentNode = getDocumentContentNode(document);
+  if (contentNode) {
+    initButtons();
+    initIcons();
+    initDocumentMenu();
+    initDocumentDoEvents();
+    
+    emitDocEvent('loading');
+    
+    setDocumentURL(url);
+    setWebExtensionURL();
+    setDocumentString();
+    setDocumentModeParams();
+    initUser();
+    initDeviceStorage();
+    initEvents();
+    initEditor();
+
+    await initSyncLocalRemoteResource();
+    await restoreEditorAfterSignIn();
+
+    await initDocumentActions();
+    await initDocumentMode();
+    await initEncryptedDocument();
+
+    emitDocEvent('ready', { url: Config.DocumentURL });
+
+    monitorNetworkStatus();
+    initPrint();
+  }
+}
+
+async function initStorageBackend() {
+  if (Config.Storage) return;
+
+  const solid = new SolidStorage();
+  const gitforge = new GitForgeStorage();
+  const http = new HttpStorage();
+
+  gitforge.addHost('github.com', {
+    apiBase: 'https://api.github.com',
+    rawHost: 'raw.githubusercontent.com',
+    provider: 'github',
+  });
+
+  const persistedForge = await getDeviceStorageItem(GIT_FORGE_HOSTS_KEY);
+  if (persistedForge && typeof persistedForge === 'object') {
+    for (const [host, cfg] of Object.entries(persistedForge)) {
+      gitforge.addHost(host, cfg);
+    }
+  }
+
+  const persistedHttp = await getDeviceStorageItem(HTTP_ORIGINS_KEY);
+  if (persistedHttp && typeof persistedHttp === 'object') {
+    for (const [origin, cfg] of Object.entries(persistedHttp)) {
+      http.addOrigin(origin, cfg);
+    }
+  }
+
+  const router = initStorage({
+    default: solid,
+    backends: { solid, gitforge, http },
+  });
+
+  Object.defineProperty(Config, 'Storage', {
+    value: router,
+    writable: false,
+    configurable: false,
+    enumerable: true,
+  });
+}
+
+function initServiceWorker() {
+  if ('serviceWorker' in navigator && !Config.WebExtensionEnabled) {
+    fetch('/service-worker.js', { method: 'HEAD' })
+      .then(res => {
+        if (!res.ok) return;
+        return navigator.serviceWorker.register('/service-worker.js', { scope: '/' });
+      })
+      .then(registration => {
+        if (registration) console.log('Service Worker registered');
+      })
+      .catch(() => {
+        // SW not available on this domain, silently skip
+      });
+  }
+}
+
+// Same posture as initServiceWorker: probe the host, silently skip if absent
+function initWebManifest() {
+  if (Config.WebExtensionEnabled) return;
+  if (document.querySelector('link[rel="manifest"]')) return;
+
+  fetch('/app.webmanifest', { method: 'HEAD' })
+    .then(res => {
+      if (!res.ok) return;
+      const link = document.createElement('link');
+      link.rel = 'manifest';
+      link.href = '/app.webmanifest';
+      link.crossOrigin = 'use-credentials';
+      link.className = 'do';
+      document.head.appendChild(link);
+    })
+    .catch(() => {});
+}
+
+function initInstallPrompt() {
+  if (Config.WebExtensionEnabled) return;
+
+  window.addEventListener('beforeinstallprompt', (e) => {
+    e.preventDefault();
+    Config.InstallPrompt = e;
+  });
+
+  window.addEventListener('appinstalled', () => {
+    Config.InstallPrompt = null;
+    document.getElementById('install-app')?.remove();
+  });
+}
+
+function initUser() {
+  getDeviceStorageItem('DO.Config.User').then(user => {
+    if (user && 'object' in user) {
+      // user.object.describes.Role = (Config.User.IRI && user.object.describes.Role) ? user.object.describes.Role : 'social';
+
+      // Restore user info only, do not fetch profile or TypeIndex here. Auth (restoreSession) runs in parallel and may not have completed yet, so any authenticated fetch here gets a 401. The dokieli:auth-ready event fires after initAuth completes and triggers setUserInfo + afterSetUserInfo with a live session.
+      Config.User = { Keys: { Encryption: { Enabled: false, KeyId: null }, Signing: { Enabled: false, KeyId: null } }, ...sanitizeObject(user.object.describes) };
+    }
+  })
+}
+
+export function initDeviceStorage() {
+  if (Config.DocumentURL.startsWith('blob:')) {
+    return;
+  }
+
+  getDeviceStorageItem(Config.DocumentURL).then(collection => {
+    // First visit: don't seed a local snapshot here. A freshly loaded page is
+    // the remote, not an unsaved edit; seeding it (with no published marker)
+    // would make syncLocalRemoteResource treat it as a pending local change and
+    // push it back to the remote. The first sync records the remote as the
+    // baseline and seeds a published local copy instead (see the first-sync
+    // branch in syncLocalRemoteResource).
+    if (collection?.autoSave) {
+      Config.AutoSave.Items[Config.DocumentURL] ||= {};
+      Config.AutoSave.Items[Config.DocumentURL]['IndexedDB'] ||= {};
+      // Config.AutoSave.Items[Config.DocumentURL]['IndexedDB']['digestSRI'] = latestLocalDocumentItem.digestSRI;
+      Config.AutoSave.Items[Config.DocumentURL]['IndexedDB']['updated'] = collection.updated;
+    }
+  });
+}
+
+async function initEvents() {
+  // Local backup of edits for everyone in edit mode
+  window.addEventListener('dokieli:editor-mode-changed', (e) => {
+    if (e.detail?.mode === 'author') {
+      enableLocalBackup(Config.DocumentURL);
+    }
+    else {
+      disableLocalBackup(Config.DocumentURL, { saveSnapshot: true });
+    }
+  });
+  eventButtonClose();
+  eventButtonInfo();
+  eventButtonSignIn();
+  eventButtonSignOut();
+  eventButtonNotificationsToggle();
+}
+
+async function initDocumentActions() {
+  showFragment();
+  initCopyToClipboard();
+  showRobustLinksDecoration();
+  processPotentialAction();
+  processActivateAction();
+  highlightItems();
+  showAsTabs();
+  initSlideshow();
+  initCV();
+  initSpecification();
+  initQuestionnaire();
+  initCurrentStylesheet();
+  registerEncryptionUnlockHandler(async () => {
+    if (!document.getElementById('encryption-unlock') && await hasKeystore()) {
+      const { showEncryptionUnlock } = await import('./dialog.js');
+      showEncryptionUnlock();
+    }
+  });
+  // Non-critical: fetch inbox/annotation sources after first paint
+  (window.requestIdleCallback || ((cb) => setTimeout(cb, 0)))(() => initShowNotificationSources());
+  focusNote();
+  setDocRefType();
+  initTableSort();
+}
+
+export function initShowNotificationSources() {
+  var documentURL = Config.DocumentURL;
+
+  if (documentURL.startsWith('blob:')) return;
+
+  // On open= pages wait for spawnDokieli to call this with the opened resource
+  var openTargets = (Config.DocumentModes?.open || []).map(u => stripFragmentFromString(encodeURI(u)));
+  if (openTargets.length && !openTargets.includes(documentURL)) return;
+
+  if (Config.Resource[documentURL].inbox?.length && !Config.Inbox[Config.Resource[documentURL].inbox[0]]) {
+    showNotificationSources(Config.Resource[documentURL].inbox[0]);
+  }
+
+  (Config.Resource[documentURL].annotationService || []).forEach(service => {
+    showActivitiesSources(service, { activityType: 'instanceContainer' });
+  });
+
+  initNanopubAnnotations(documentURL);
+
+  var showUserActivities = () => {
+    if (Config.User.IRI) {
+      Promise.allSettled(processAgentActivities(Config.User));
+    }
+  };
+
+  // auth-ready fires after the TypeIndex loads, on page load and later sign-ins
+  document.addEventListener('dokieli:auth-ready', showUserActivities);
+  if (Config.AuthReady === true) {
+    showUserActivities();
+  }
+}
+
+// After a sign-in redirect, re-enter the editor as it was
+async function restoreEditorAfterSignIn() {
+  const OIDC = await getDeviceStorageItem('DO.Config.OIDC');
+  if (!OIDC?.editor || OIDC.authStartLocation !== window.location.href) return;
+
+  if (OIDC.editor.mode === 'author' && Config.Editor?.mode !== 'author') {
+    Config.Editor.toggleEditor('author');
+  }
+  Config.Editor['new'] = !!OIDC.editor.isNew;
+
+  delete Config.OIDC.authStartLocation;
+  delete Config.OIDC.editor;
+  await removeDeviceStorageItem('DO.Config.OIDC');
+}
+
+async function initSyncLocalRemoteResource() {
+  var documentURL = Config.DocumentURL;
+
+  if (!(documentURL in Config.Resource && 'state' in Config.Resource[documentURL])) {
+    await syncLocalRemoteResource();
+  }
+}
+
+export function setDocumentModeParams() {
+  const params = ['author', 'diff', 'graph', 'graph-view', 'login', 'open', 'output', 'social', 'style', 'template'];
+  Config['DocumentModes'] =  {};
+  params.forEach((p) => Config['DocumentModes'][p] = getUrlParams(p));
+}
+
+export async function initDocumentMode(mode) {
+  Config.Editor.mode = mode || Config.Editor.mode;
+
+  const documentOptions = {
+    ...Config.DOMProcessing,
+    removeNodesWithSelector: [],
+    sanitize: true,
+    normalize: true
+  };
+
+  const paramLogin = Config['DocumentModes']['login'];
+  const paramAuthor = Config['DocumentModes']['author'];
+  const paramDiff = Config['DocumentModes']['diff'];
+  const paramGraph = Config['DocumentModes']['graph'];
+  const paramGraphView = Config['DocumentModes']['graph-view'];
+  const paramOpen = Config['DocumentModes']['open'];
+  const paramOutput = Config['DocumentModes']['output'];
+  const paramSocial = Config['DocumentModes']['social'];
+  const paramStyle = Config['DocumentModes']['style'];
+
+  if (paramStyle.length) {
+    let style = paramStyle[0];
+    style = domSanitize(style);
+    var title = style.lastIndexOf('/');
+    title = (title > -1) ? style.substr(title + 1) : style;
+
+    if (style.startsWith('http')) {
+      var pIRI = getProxyableIRI(style);
+      var link = '<link class="do" href="' + pIRI + '" media="all" rel="stylesheet" title="' + title + '" />'
+      sanitizeInsertAdjacentHTML(document.querySelector('head'), 'beforeend', link);
+    }
+
+    stripUrlSearchHash();
+
+    var stylesheets = document.querySelectorAll('head link[rel~="stylesheet"][title]:not([href$="dokieli.css"])');
+    updateSelectedStylesheets(stylesheets, title);
+  }
+
+  if (paramOpen.length) {
+    // Access-controlled resources need the restored session; auth runs in parallel with init
+    if (Config.AuthReady) {
+      try { await Config.AuthReady } catch {}
+    }
+
+    let openResources = paramOpen.map((url) => domSanitize(sanitizeIRI(url)));
+
+    let spawnOptions = {};
+    spawnOptions['defaultStylesheet'] = false;
+    spawnOptions['init'] = true;
+    if (paramOutput.length) {
+      spawnOptions['output'] = domSanitize(paramOutput[0]);
+    }
+
+    if (paramOpen.length > 1) {
+      let urlsHtml = openResources.map((url) => `<a href="${url} rel="noopener" target="_blank">${url}</a>`).join(', ');
+      var message = `Opening ${urlsHtml}`;
+      var actionMessage = `Opening ${urlsHtml}`;
+
+      const messageObject = {
+        'content': actionMessage,
+        'type': 'info',
+        'timer': 10000
+      }
+
+      addMessageToLog({...messageObject, content: message}, Config.MessageLog);
+      const messageId = showActionMessage(document.body, messageObject);
+
+      let results = await Config.Storage.getMultiple(openResources)
+
+      const contentTypes = results.map(r => r.type);
+      const iris = openResources;
+
+      await spawnDokieli(
+        document,
+        results,
+        contentTypes,
+        iris,
+        spawnOptions
+      );
+    } else {
+      open = openResources[0];
+      open = domSanitize(open);
+      open = decodeURIComponent(open);
+
+      // Keep init alive on failure so the rest of the boot sequence still runs
+      try {
+        await openResource(open);
+      } catch (e) {
+        console.warn('dokieli: could not open resource', open, e);
+      }
+    }
+
+    if (paramGraphView.length && paramGraphView[0].toLowerCase() == 'true') {
+      showVisualisationGraph(Config.DocumentURL, getDocument(null, documentOptions), '#graph-view');
+    }
+
+    // stripUrlSearchHash();
+  }
+
+  if (paramDiff.length > 1) {
+    // Access-controlled resources need the restored session; auth runs in parallel with init
+    if (Config.AuthReady) {
+      try { await Config.AuthReady } catch {}
+    }
+
+    const diffResources = paramDiff.slice(0, 2).map((url) => domSanitize(sanitizeIRI(url)));
+    const anchors = diffResources.map((url) => `<a href="${url}" rel="noopener" target="_blank">${url}</a>`);
+
+    const messageObject = {
+      'content': `Comparing ${anchors[0]} with ${anchors[1]}`,
+      'type': 'info',
+      'timer': 3000
+    }
+
+    addMessageToLog(messageObject, Config.MessageLog);
+    showActionMessage(document.body, messageObject);
+
+    try {
+      const [fromContent, toContent] = await Promise.all(
+        diffResources.map((url) => Config.Storage.get(url, { 'Accept': 'text/html' }).then((response) => {
+          if (response.ok === false) {
+            throw new Error(`Failed to fetch ${url} (${response.status})`);
+          }
+          return response.text();
+        }))
+      );
+
+      const shown = showResourceReviewChanges(toContent, fromContent, null, {
+        mode: 'diff-resources',
+        message: `Comparing ${anchors[0]} with ${anchors[1]}`
+      });
+
+      if (!shown) {
+        const noDiffMessage = {
+          'content': `No differences found between ${anchors[0]} and ${anchors[1]}`,
+          'type': 'info',
+          'timer': 5000
+        }
+        addMessageToLog(noDiffMessage, Config.MessageLog);
+        showActionMessage(document.body, noDiffMessage);
+      }
+    } catch (e) {
+      console.warn('dokieli: could not compare resources', diffResources, e);
+      const errorMessage = {
+        'content': `Unable to compare ${anchors[0]} with ${anchors[1]}`,
+        'type': 'error',
+        'timer': 5000
+      }
+      addMessageToLog(errorMessage, Config.MessageLog);
+      showActionMessage(document.body, errorMessage);
+    }
+  }
+
+  if (paramGraphView.length && paramGraphView[0].toLowerCase() == 'true' && paramOpen.length == 0) {
+    showVisualisationGraph(Config.DocumentURL, getDocument(null, documentOptions), '#graph-view');
+  }
+
+  var urls = paramGraph.map(url => {
+    url = sanitizeIRI(url);
+    // var iri = decodeURIComponent(g);
+
+    //TODO: Need a way to handle potential proxy use eg. https://dokie.li/?graph=https://dokie.li/proxy?uri=https://example.org/
+    //XXX: if iri startsWith https://dokie.li/proxy? then the rest gets chopped.
+    // var docURI = iri.split(/[?#]/)[0];
+
+    //XXX: fugly
+    // var docURI = iri.split(/[#]/)[0];
+    // iri = iri.split('=').pop();
+
+    return stripFragmentFromString(url);
+  });
+  // console.log(urls);
+
+  if (urls.length) {
+    // var options = {'license': 'https://creativecommons.org/publicdomain/zero/1.0/', 'filter': { 'subjects': [docURI, iri] }, 'title': iri };
+    var options = {'subjectURI': urls[0], 'license': 'https://creativecommons.org/publicdomain/zero/1.0/', 'title': urls[0] };
+
+    // showGraphResources([docURI], '#graph-view', options);
+    // console.log(options);
+
+    var anchors = urls.map(url => `<a href="${url}" rel="noopener" target="_blank">${url}</a>`).join(', ');
+
+    var message = `Loading graph(s) ${anchors}`;
+    var actionMessage = `<span class="progress">${Icon[".fas.fa-circle-notch.fa-spin.fa-fw"]} Loading graph(s) ${anchors}</span>`;
+
+    const messageObject = {
+      'content': actionMessage,
+      'type': 'info',
+      'timer': 3000
+    }
+
+    addMessageToLog({...messageObject, content: message}, Config.MessageLog);
+    showActionMessage(document.body, messageObject);
+
+    showGraph(urls, '#graph-view', options);
+
+    // stripUrlSearchHash();
+  }
+
+
+  if (paramLogin.length) {
+    let loginValue = paramLogin[0];
+
+    // Query form (?login=https://example.org/profile#me): the browser splits
+    // at the first #, leaving the WebID's own fragment as the page hash.
+    const hash = window.location.hash;
+    if (hash.length > 1 && !hash.includes('=') && !loginValue.includes('#')) {
+      loginValue += hash;
+    }
+
+    // Wait for session restore so an existing sign-in isn't clobbered; the
+    // login value is only a hint of who to authenticate as.
+    const onAuthReady = () => processLoginInvocation(loginValue);
+    if (Config['AuthReady']) {
+      onAuthReady();
+    }
+    else {
+      document.addEventListener('dokieli:auth-ready', onAuthReady, { once: true });
+    }
+  }
+
+  if (paramAuthor.length && paramAuthor[0] == 'true') {
+    Config.Editor.mode = 'author';
+    Config.Editor.toggleEditor('author')
+    stripUrlSearchHash(['author']);
+  }
+  else if (paramSocial.length && paramSocial[0] == 'true') {
+    Config.Editor.mode = 'social';
+    Config.Editor.toggleEditor('social')
+    stripUrlSearchHash(['social']);
+  }
+
+  //XXX: This else if works but current document needs to be processed for Config.Resource. See also config.js init and whether non text/html is ever the case (e.g., dokieli in SVG?)
+  // else if (Config.Resource[Config.DocumentURL].contentType == 'text/html') {
+    var node = selectArticleNode(document);
+    var hasContent = hasNonWhitespaceText(node);
+
+    const paramTemplate = Config['DocumentModes']['template'][0];
+    const templates = {
+      'article': createNewDocument,
+      'slideshow': createNewSlideshow,
+      'cv': createNewCV,
+      'specification': createNewSpecification,
+      'questionnaire': createNewQuestionnaire
+    };
+
+    if (templates[paramTemplate] && !paramOpen.length) {
+      templates[paramTemplate]();
+    }
+    else if (!hasContent && !Config.EditorEnabled) {
+      showNewDocument();
+      Config.Editor.toggleEditor('author');
+      Config.DocumentAction = 'new';
+    }
+  // }
+}
+
+export function initSlideshow(options) {
+  options = options || {};
+  options.progress = options.progress !== false;
+
+  //TODO: .shower can be anywhere?
+  //TODO: check for rdf:type bibo:Slideshow or schema:PresentationDigitalDocument
+  if (!getDocumentContentNode(document).classList.contains('shower')) return;
+
+  //TODO: Check if .bibo:Slide, and if there is no .slide, add .slide
+
+  // PM may mount slides asynchronously (Yjs/IDB binding); poll briefly.
+  let attempts = 0;
+  const tryStart = () => {
+    if (document.querySelectorAll('.shower .slide').length > 0) {
+      Slideshow.stop();
+      Slideshow.start({ focusEditor: options.focusEditor === true });
+      initSlideshowInteraction();
+      return;
+    }
+    if (++attempts < 40) setTimeout(tryStart, 50);
+  };
+  tryStart();
+}
+
+function initIcons() {
+  Config['IconBase64'] = Config['IconBase64'] || {};
+  Config.IconBase64['.fas.fa-user-secret'] = generateDataURI('image/svg+xml', 'base64', Icon['.fas.fa-user-secret']);
+  Config.IconBase64['.fas.fa-globe'] = generateDataURI('image/svg+xml', 'base64', Icon['.fas.fa-globe']);
+  Config.IconBase64['.fas.fa-people-group'] = generateDataURI('image/svg+xml', 'base64', Icon['.fas.fa-people-group']);
+}
+
+//TODO: Review grapoi
+function processPotentialAction(resourceInfo) {
+  resourceInfo = resourceInfo || Config.Resource[Config.DocumentURL];
+  var g = resourceInfo.graph;
+
+  // console.log(g.dataset.toCanonical());
+  let actions = g.node(rdf.namedNode(Config.DocumentURL)).out(ns.schema.potentialAction).values;
+
+  actions.forEach(action => {
+    var documentOrigin = (document.location.origin === "null") ? "file://" : document.location.origin;
+    var originPathname = documentOrigin + document.location.pathname;
+    // console.log(originPathname)
+    // console.log(action.startsWith(originPathname + '#'))
+    if (action.startsWith(originPathname)) {
+      document.addEventListener('click', (e) => {
+        var fragment = action.substr(action.lastIndexOf('#'));
+        // console.log(fragment)
+        if (fragment) {
+          var selector = '[about="' + fragment  + '"][typeof="schema:ViewAction"], [href="' + fragment  + '"][typeof="schema:ViewAction"], [resource="' + fragment  + '"][typeof="schema:ViewAction"]';
+          // console.log(selector)
+          // var element = document.querySelectorAll(selector);
+          var element = e.target.closest(selector);
+          // console.log(element)
+          if (element) {
+            e.preventDefault();
+            e.stopPropagation();
+
+            var so = g.node(rdf.namedNode(action)).out(ns.schema.object).values;
+            if (so.length) {
+              selector = '#' + element.closest('[id]').id;
+
+              var svgGraph = document.querySelector(selector + ' svg');
+              if (svgGraph) {
+                svgGraph.nextSibling.parentNode.removeChild(svgGraph.nextSibling);
+                svgGraph.parentNode.removeChild(svgGraph);
+              }
+              else {
+                // serializeGraph(g, { 'contentType': 'text/turtle' })
+                //   .then(data => {
+                    var options = {};
+                    options['subjectURI'] = so[0];
+                    options['contentType'] = 'text/turtle';
+                    showVisualisationGraph(options.subjectURI, g, selector, options);
+                  // });
+              }
+            }
+          }
+        }
+      });
+    }
+  });
+}
+
+function processActivateAction() {
+  document.addEventListener('click', (e) => {
+    if (e.target.closest('[about="#document-menu"][typeof="schema:ActivateAction"], [href="#document-menu"][typeof="schema:ActivateAction"], [resource="#document-menu"][typeof="schema:ActivateAction"]')) {
+      e.preventDefault();
+      e.stopPropagation();
+
+      showDocumentMenu(e);
+    }
+  });
+}
+
+
+function initPrint() {
+  window.addEventListener('beforeprint', () => {
+    document.querySelectorAll('a[href^="http"]').forEach(a => {
+      if (a.textContent.trim() === a.href) {
+        a.classList.add('do-print-a-href-hide');
+      }
+    });
+  });
+}
+
+export async function initEncryptedDocument() {
+  const encryptedScript = document.getElementById('dokieli-e2ee');
+  if (!encryptedScript) {
+    // Per-document state: a newly loaded document without an encrypted payload starts unencrypted regardless of the previous document's toggle
+    Config.User.Keys.Encryption.Document = false;
+    Config.User.Keys.Encryption.DocumentEncrypt = false;
+    return;
+  }
+
+  if (isUnlocked()) {
+    await decryptArticleInPlace();
+    return;
+  }
+
+  // Auth restore runs in parallel with init; wait for it so the session state below is settled
+  if (Config.AuthReady) {
+    try { await Config.AuthReady } catch {}
+  }
+
+  if (isUnlocked()) {
+    await decryptArticleInPlace();
+    return;
+  }
+
+  const keystoreExists = await hasKeystore();
+
+  // Without a session or a local keystore there is no way to reach any keys; sign in comes before the passphrase prompt
+  if (!keystoreExists && !Config.Session?.isActive) {
+    const { showUserIdentityInput } = await import('./auth.js');
+    showUserIdentityInput();
+    return;
+  }
+
+  // Only prompt for a passphrase when there are keys to unlock; otherwise offer setup
+  const { showEncryptionUnlock, showEncryptionSetup } = await import('./dialog.js');
+  keystoreExists ? showEncryptionUnlock() : showEncryptionSetup();
+}
+
+export async function decryptArticleInPlace() {
+  const encryptedScript = document.getElementById('dokieli-e2ee');
+  if (!encryptedScript) return;
+
+  if (!isUnlocked()) return;
+
+  const jwe = encryptedScript.textContent.trim();
+  const plaintext = await decryptWithSession(jwe);
+
+  const payload = JSON.parse(plaintext);
+  const { title, body } = payload;
+
+  const article = encryptedScript.closest('[data-encrypted]') || encryptedScript.parentElement;
+
+  // Document scope: restore hidden head metadata and the original body, replacing the placeholder shell but leaving dokieli's runtime nodes alone
+  if (payload.scope === 'document') {
+    if (payload.head) {
+      const stored = document.createElement('template');
+      stored.innerHTML = payload.head;
+      const present = new Set([...document.head.children].map(n => n.outerHTML));
+      [...stored.content.children].forEach(node => {
+        if (node.matches('link[rel="manifest"]') || present.has(node.outerHTML)) return;
+        document.head.appendChild(node);
+      });
+    }
+    const shell = article.closest('main') || article;
+    const tmpl = document.createElement('template');
+    tmpl.innerHTML = body;
+    shell.replaceWith(tmpl.content);
+  }
+  else {
+    article.removeAttribute('data-encrypted');
+    article.setHTMLUnsafe(body);
+  }
+  if (title) document.title = title;
+
+  Config.User.Keys.Encryption.Enabled = true;
+  Config.User.Keys.Encryption.KeyId = getSessionKid();
+  Config.User.Keys.Encryption.Document = true;
+  Config.User.Keys.Encryption.DocumentEncrypt = true;
+}
+
+// function initMath(config) {
+//   if (!Config.MathAvailable) { return; }
+
+//   config = config || {
+//     skipTags: ["script","noscript","style","textarea","pre","code", "math"],
+//     ignoreClass: "equation",
+//     MathML: {
+//       useMathMLspacing: true
+//     },
+//     tex2jax: {
+//       inlineMath: [["$","$"],["\\(","\\)"]],
+//       processEscapes: true
+//     },
+//     asciimath2jax: {
+//       delimiters: [['$','$'], ['`','`']]
+//     }
+//   }
+
+//   window.MathJax.Hub.Config(config);
+
+//   window.MathJax.Hub.Register.StartupHook("End Jax",function () {
+//     var BROWSER = window.MathJax.Hub.Browser;
+//     var jax = "SVG";
+//     if (BROWSER.isMSIE && BROWSER.hasMathPlayer) jax = "NativeMML";
+//     if (BROWSER.isFirefox) jax = "NativeMML";
+//     if (BROWSER.isSafari && BROWSER.versionAtLeast("5.0")) jax = "NativeMML";
+
+//     window.MathJax.Hub.setRenderer(jax);
+//   });
+// }

@@ -1,0 +1,1935 @@
+/*!
+Copyright 2012-2026 Sarven Capadisli <https://csarven.ca/>
+Copyright 2023-2026 Virginia Balseiro <https://virginiabalseiro.com/>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+import { toggleMark, setBlockType } from "prosemirror-commands"
+import { wrapInList, liftListItem } from "prosemirror-schema-list"
+import { DOMSerializer, DOMParser, Slice } from "prosemirror-model"
+import { TextSelection, NodeSelection } from "prosemirror-state"
+import { schema, allowedEmptyAttributes } from "./../../schema/base.js"
+import { formHandlerLanguage, formHandlerA, formHandlerAnnotate, formHandlerBlockquote, formHandlerImg, formHandlerQ, formHandlerCitation, formHandlerRequirement, formHandlerSemantics } from "./handlers.js"
+import { ToolbarView, annotateFormControls, advancedFieldsHTML, formFooterHTML } from "../toolbar.js"
+import { createRDFaHTMLRequirement, getCitationOptionsHTML, getLanguageOptionsHTML, getRequirementLevelOptionsHTML, getRequirementSubjectOptionsHTML } from "../../../doc.js"
+import Config from "../../../config.js";
+import { Icon } from "../../../ui/icons.js";
+import { fragmentFromString } from "../../../utils/html.js";
+import { searchSourceStreams } from "../../../services.js";
+import { registerBlobAsset } from "../../utils/imageAssets.js";
+import { i18n } from "../../../i18n.js"
+import { htmlEncode, sanitizeInsertAdjacentHTML } from "../../../utils/sanitization.js";
+import { buttonIcons, getButtonHTML } from "../../../ui/buttons.js";
+import { toggleMarkdownMode } from "../../../dialog.js";
+
+const ns = Config.ns;
+
+export class AuthorToolbar extends ToolbarView {
+  constructor(mode, buttons, editorView) {
+    super(mode, buttons, editorView)
+    this.editorView = editorView;
+
+    // Clicking an existing link in edit mode opens the hyperlink form so the
+    // author can see and edit its URL (links aren't followable while editing).
+    this.handleLinkClick = this.handleLinkClick.bind(this);
+    this.editorView?.dom.addEventListener('click', this.handleLinkClick);
+  }
+
+  handleLinkClick(e) {
+    const view = this.editorView;
+    if (!view || !view.editable || e.button !== 0 || e.metaKey || e.ctrlKey) return;
+    if (!e.target.closest('a')) return;
+    const coords = view.posAtCoords({ left: e.clientX, top: e.clientY });
+    if (!coords) return;
+    const range = getMarkRange(view.state, coords.pos, schema.marks.a);
+    if (!range) return;
+    e.preventDefault();
+    view.dispatch(view.state.tr.setSelection(TextSelection.create(view.state.doc, range.from, range.to)));
+    view.focus();
+    if (!this.dom.querySelector('#editor-form-a')?.classList.contains('editor-form-active')) {
+      this.dom.querySelector('#editor-button-a')?.click();
+    }
+  }
+
+  //TODO: Create formValidationHandlers to handle `input` and `invalid` event handlers. Move oninput/oninvalid out of form's inline HTML
+  getFormEventListeners() {
+    return {
+      lang: [ { event: 'submit', callback: this.formHandlerLanguage }, { event: 'click', callback: (e) => this.formClickHandler(e, 'lang') } ],
+      a: [ { event: 'submit', callback: this.formHandlerA }, { event: 'click', callback: (e) => this.formClickHandler(e, 'a') } ],
+      q: [ { event: 'submit', callback: this.formHandlerQ }, { event: 'click', callback: (e) => this.formClickHandler(e, 'q') } ],
+      blockquote: [ { event: 'submit', callback: this.formHandlerBlockquote }, { event: 'click', callback: (e) => this.formClickHandler(e, 'blockquote') } ],
+      img: [ { event: 'submit', callback: this.formHandlerImg }, { event: 'click', callback: (e) => this.formClickHandler(e, 'img') } ],
+      semantics: [ { event: 'submit', callback: (e) => this.formHandlerSemantics(e, 'semantics') }, { event: 'click', callback: (e) => this.formClickHandler(e, 'semantics') } ],
+      citation: [ { event: 'submit', callback: (e) => this.formHandlerCitation(e, 'citation') }, { event: 'click', callback: (e) => this.formClickHandler(e, 'citation') } ],
+      requirement: [ { event: 'submit', callback: (e) => this.formHandlerRequirement(e, 'requirement') }, { event: 'click', callback: (e) => this.formClickHandler(e, 'requirement') } ],
+      note: [ { event: 'submit', callback: (e) => this.formHandlerAnnotate(e, 'note') }, { event: 'click', callback: (e) => this.formClickHandler(e, 'note') } ],
+    }
+  }
+
+  getFormHandlers() {
+    return [
+      { name: 'formHandlerLanguage', fn: formHandlerLanguage },
+      { name: 'formHandlerA', fn: formHandlerA },
+      { name: 'formHandlerQ', fn: formHandlerQ },
+      { name: 'formHandlerBlockquote', fn: formHandlerBlockquote },
+      { name: 'formHandlerImg', fn: formHandlerImg },
+      { name: 'formHandlerCitation', fn: formHandlerCitation },
+      { name: 'formHandlerRequirement', fn: formHandlerRequirement },
+      // { name: 'formHandlerSparkline', fn: formHandlerSparkline },
+      { name: 'formHandlerSemantics', fn: formHandlerSemantics },
+      { name: 'formHandlerAnnotate', fn: formHandlerAnnotate },
+    ];
+  }
+
+  getToolbarCommands() {
+    const toolbarCommands = {
+      p: setBlockType(schema.nodes.p),
+      h1: toggleHeading(schema, 1),
+      h2: toggleHeading(schema, 2),
+      h3: toggleHeading(schema, 3),
+      h4: toggleHeading(schema, 4),
+      h5: toggleHeading(schema, 5),
+      em: toggleMark(schema.marks.em),
+      strong: toggleMark(schema.marks.strong),
+      ul: toggleList(schema, 'ul'),
+      ol: toggleList(schema, 'ol'),
+      // blockquote: setBlockType(schema.nodes.blockquote),
+      // q: toggleMark(schema.marks.q),
+      pre: setBlockType(schema.nodes.pre),
+      code: this.insertCodeInline(schema),
+      'align-left': setTextAlign('left'),
+      'align-center': setTextAlign('center'),
+      'align-right': setTextAlign('right'),
+      // math: toggleMark(schema.marks.math), //prosemirror-math
+      // citation: citeForm(),
+      // semantics: semanticsForm()
+    }
+
+    return toolbarCommands;
+  }
+
+  getFormLegends() {
+    return {
+      note: i18n.t('editor.toolbar.note.form.legend.textContent'),
+      requirement: i18n.t('editor.toolbar.requirement.form.legend.textContent'),
+      lang: i18n.t('editor.toolbar.set-lang.form.legend.textContent'),
+      a: i18n.t('editor.toolbar.a.form.legend.textContent'),
+      blockquote: i18n.t('editor.toolbar.blockquote.form.legend.textContent'),
+      q: i18n.t('editor.toolbar.q.form.legend.textContent'),
+      img: i18n.t('editor.toolbar.img.form.legend.textContent'),
+      citation: i18n.t('editor.toolbar.citation.form.legend.textContent'),
+      semantics: i18n.t('editor.toolbar.semantics.form.legend.textContent'),
+    }
+  }
+
+  // TODO: this function returns only the textarea placeholders, but many popups in the author toolbar need more than one field. revisit.
+  getFormPlaceholders() {
+    return {
+      note: i18n.t('editor.toolbar.note.form.textarea.placeholder'),
+      citation: i18n.t('editor.toolbar.citation.form.textarea.placeholder'),
+    }
+  }
+
+  getToolbarPopups() {
+    const toolbarPopups = {
+      lang: (options) => `
+        <fieldset>
+          <legend data-i18n="editor.toolbar.set-lang.form.legend">${options.legend}</legend>
+          <label data-i18n="language.label" for="set-lang">${i18n.t('language.label.textContent')}</label>
+          <select class="editor-form-select" id="set-lang" name="set-lang">${getLanguageOptionsHTML()}</select>
+          ${formFooterHTML({ action: 'save', advanced: false })}
+        </fieldset>
+      `,
+
+      a: (options) => `
+        <fieldset>
+          <legend><span data-i18n="editor.toolbar.a.form.legend">${options.legend}</span> <span class="editor-form-required-note"><span class="required">*</span> <span data-i18n="info.required">${i18n.t('info.required.textContent')}</span></span></legend>
+          <label class="editor-form-visually-hidden" for="a-href">URL</label> <span class="editor-form-required-field"><input class="editor-form-input" data-i18n="editor.toolbar.form.url.input" dir="ltr" id="a-href" name="a-href" pattern="https?://.+" placeholder="${i18n.t('editor.toolbar.form.url.input.placeholder')}" required="" type="url" value="" /><span class="required" aria-hidden="true">*</span></span>
+          ${advancedFieldsHTML(`
+          <label data-i18n="editor.toolbar.a.form.a-title.label" for="a-title">${i18n.t('editor.toolbar.a.form.a-title.label.textContent')}</label> <input class="editor-form-input" data-i18n="editor.toolbar.a.form.a-title.input" dir="auto" id="a-title" name="a-title" placeholder="${i18n.t('editor.toolbar.a.form.a-title.input.placeholder')}" type="text" />
+          `)}
+          ${formFooterHTML({ action: 'save' })}
+        </fieldset>
+      `,
+
+      blockquote: (options) => `
+        <fieldset>
+          <legend data-i18n="editor.toolbar.blockquote.form.legend">${options.legend}</legend>
+          <label for="blockquote-cite">URL</label> <input class="editor-form-input" data-i18n="editor.toolbar.form.url.input" dir="ltr" id="blockquote-cite" name="blockquote-cite" pattern="https?://.+" placeholder="${i18n.t('editor.toolbar.form.url.input.placeholder')}" type="url" value="" />
+          ${formFooterHTML({ action: 'save', advanced: false })}
+        </fieldset>
+      `,
+
+      q: (options) => `
+        <fieldset>
+          <legend data-i18n="editor.toolbar.q.form.legend">${options.legend}</legend>
+          <label for="q-cite">URL</label> <input class="editor-form-input" data-i18n="editor.toolbar.form.url.input" dir="ltr" id="q-cite" name="q-cite" pattern="https?://.+" placeholder="${i18n.t('editor.toolbar.form.url.input.placeholder')}" type="url" value="" />
+          ${formFooterHTML({ action: 'save', advanced: false })}
+        </fieldset>
+      `,
+
+      // TODO: draggable area in this widget
+      //TODO: browse storage
+      img: (options) => `
+        <fieldset>
+          <legend data-i18n="editor.toolbar.img.form.legend">${options.legend}</legend>
+          <figure class="img-preview"></figure>
+          <label data-i18n="editor.toolbar.img.form.img-file.label" for="img-file">${i18n.t('editor.toolbar.img.form.img-file.label.textContent')}</label> <input class="editor-form-input" id="img-file" name="img-file" type="file" />
+          <label class="editor-form-visually-hidden" for="img-src">URL</label> <input class="editor-form-input" dir="ltr" id="img-src" name="img-src" placeholder="${i18n.t('editor.toolbar.form.url.input.placeholder')}" type="text" value="" />
+          ${advancedFieldsHTML(`
+          <label data-i18n="editor.toolbar.img.form.img-alt.label" for="img-alt">${i18n.t('editor.toolbar.img.form.img-alt.label.textContent')}</label> <input class="editor-form-input" data-i18n="editor.toolbar.img.form.img-alt.input" dir="auto" id="img-alt" name="img-alt" placeholder="${i18n.t('editor.toolbar.img.form.img-alt.input.placeholder')}" type="text" value="" />
+          <label data-i18n="editor.toolbar.img.form.img-figcaption" for="img-figcaption">${i18n.t('editor.toolbar.img.form.img-figcaption.label.textContent')}</label> <input class="editor-form-input" data-i18n="editor.toolbar.img.form.img-figcaption.input" id="img-figcaption" name="img-figcaption" placeholder="${i18n.t('editor.toolbar.img.form.img-alt.label.textContent')}" type="text" value="" />
+          `)}
+          ${formFooterHTML({ action: 'save' })}
+        </fieldset>
+      `,
+
+      note: (options) => annotateFormControls(options), // FIXME: this actually belongs in the other one
+
+      citation: (options) => `
+        <fieldset>
+          <legend data-i18n="editor.toolbar.citation.form.legend">${options.legend}</legend>
+          <div class="info"></div>
+          <label data-i18n="editor.toolbar.citation.form.specref-search.label" for="citation-specref-search">${i18n.t('editor.toolbar.citation.form.specref-search.label.textContent')} ${Config.Button.Info.SearchSources}</label> <input class="editor-form-input" data-i18n="editor.toolbar.citation.form.specref-search.input" id="citation-specref-search" name="citation-specref-search" placeholder="${i18n.t('editor.toolbar.citation.form.specref-search.input.placeholder')}" type="text" value="" />
+          <span class="editor-form-search-row">
+          <input data-i18n="editor.toolbar.form.search.button" id="citation-specref-search-submit" name="citation-specref-search-submit" type="submit" value="${i18n.t('editor.toolbar.form.search.button.value')}" />
+          <button class="editor-form-icon-toggle editor-form-sources-toggle" type="button" aria-expanded="false" aria-label="Choose data sources" title="Choose data sources">${Icon['.fas.fa-caret-down']}</button>
+          </span>
+          <ul class="editor-form-sources" hidden="">
+            <li><input checked="" id="citation-search-source-specref" name="citation-search-source" type="checkbox" value="specref" /> <label for="citation-search-source-specref">Specref</label></li>
+            <li><input checked="" id="citation-search-source-wikidata" name="citation-search-source" type="checkbox" value="wikidata" /> <label for="citation-search-source-wikidata">Wikidata</label></li>
+            <li><input checked="" id="citation-search-source-openlibrary" name="citation-search-source" type="checkbox" value="openlibrary" /> <label for="citation-search-source-openlibrary">Open Library</label></li>
+            <li><input checked="" id="citation-search-source-doi" name="citation-search-source" type="checkbox" value="doi" /> <label for="citation-search-source-doi">DOI</label></li>
+            <li><input checked="" id="citation-search-source-orcid" name="citation-search-source" type="checkbox" value="orcid" /> <label for="citation-search-source-orcid">ORCID</label></li>
+          </ul>
+          <div class="specref-search-results"></div>
+          <label class="editor-form-visually-hidden" for="citation-url">URL</label>
+          <input class="editor-form-input" data-i18n="editor.toolbar.form.url.input" dir="ltr" id="citation-url" name="citation-url" pattern="https?://.+" placeholder="${i18n.t('editor.toolbar.form.url.input.placeholder')}" type="url" value="" />
+          <span class="editor-form-radio-row">
+          <input id="ref-footnote" name="citation-ref-type" type="radio" value="ref-footnote" /> <label data-i18n="editor.toolbar.citation.form.ref-footnote.form.label" for="ref-footnote">${i18n.t('editor.toolbar.citation.form.ref-footnote.label.textContent')}</label>
+          <input id="ref-reference" name="citation-ref-type" type="radio" value="ref-reference" /> <label data-i18n="editor.toolbar.citation.form.ref-reference.label" for="ref-reference">${i18n.t('editor.toolbar.citation.form.ref-reference.label.textContent')}</label>
+          </span>
+          <label data-i18n="editor.toolbar.citation.form.citation-reason.label" for="citation-reason">${i18n.t('editor.toolbar.citation.form.citation-reason.label.textContent')}</label>
+          <select class="editor-form-select" id="citation-reason" name="citation-reason">${getCitationOptionsHTML({ 'selected': '' })}</select>
+          ${advancedFieldsHTML(`
+          <label data-i18n="editor.toolbar.note.form.label" for="citation-content">${i18n.t('editor.toolbar.note.form.label.textContent')}</label>
+          <textarea class="editor-form-textarea" cols="20" data-i18n="editor.toolbar.${options.button}.form.textarea" dir="auto" id="citation-content" name="citation-content" rows="3" placeholder="${options.placeholder}"></textarea>
+          <label data-i18n="language.label" for="citation-language">${i18n.t('language.label.textContent')}</label>
+          <select class="editor-form-select" id="citation-language" name="citation-language">${getLanguageOptionsHTML()}</select>
+          `)}
+          ${formFooterHTML({ action: 'save' })}
+        </fieldset>
+      `,
+
+      requirement: (options) => `
+        <fieldset>
+          <legend data-i18n="editor.toolbar.requirement.form.legend">${options.legend}</legend>
+          <dl id="requirement-preview">
+            <dt data-i18n="editor.toolbar.requirement.form.preview.dt">${i18n.t('editor.toolbar.requirement.form.preview.dt.textContent')}</dt>
+            <dd><samp id="requirement-preview-samp"></samp></dd>
+          </dl>
+          <label data-i18n="editor.toolbar.requirement.form.subject.dt" for="requirement-subject">${i18n.t('editor.toolbar.requirement.form.subject.dt.textContent')}</label>
+          <select class="editor-form-select" id="requirement-subject" name="requirement-subject">${getRequirementSubjectOptionsHTML(options)}</select>
+          <label data-i18n="editor.toolbar.requirement.form.level.dt" for="requirement-level">${i18n.t('editor.toolbar.requirement.form.level.dt.textContent')}</label>
+          <select class="editor-form-select" id="requirement-level" name="requirement-level">${getRequirementLevelOptionsHTML(options)}</select>
+          ${formFooterHTML({ action: 'save', advanced: false })}
+        </fieldset>
+      `,
+
+          // <label for="requirement-consensus">Consensus source</label>
+          // <input class="editor-form-input" data-i18n="editor.toolbar.form.url.input" id="requirement-consensus" name="requirement-consensus" pattern="https?://.+" placeholder="${i18n.t('editor.toolbar.form.url.input.placeholder')}" )})" type="url" value="" />
+          // <label data-i18n="language.label" for="requirement-language">${i18n.t('language.label.textContent')}</label>
+          // <select class="editor-form-select" id="requirement-language" name="requirement-language">${getLanguageOptionsHTML()}</select>
+
+      semantics: (options) => `
+        <fieldset>
+          <legend data-i18n="editor.toolbar.semantics.form.legend">${options.legend}</legend>
+          <label for="semantics-about">about</label> <input class="editor-form-input" dir="ltr" id="semantics-about" name="semantics-about" placeholder="Enter URL, e.g., https://example.net/foo#bar" type="url" value="" />
+          <label for="semantics-resource">resource</label> <input class="editor-form-input" dir="ltr" id="semantics-resource" name="semantics-resource" placeholder="Enter URL, e.g., https://example.net/foo#bar" type="url" value="" />
+          <label for="semantics-typeof">typeof</label> <input class="editor-form-input" dir="ltr" id="semantics-typeof" name="semantics-typeof" placeholder="Enter URL, e.g., https://example.net/foo#Baz" type="url" value="" />
+          ${advancedFieldsHTML(`
+          <label for="semantics-rel">rel</label> <input class="editor-form-input" id="semantics-rel" name="semantics-rel" placeholder="schema:url" type="url" value="" />
+          <label for="semantics-property">property</label> <input class="editor-form-input" name="semantics-property" id="semantics-property" placeholder="schema:name" type="url" value="" />
+          <label for="semantics-href">href</label> <input class="editor-form-input" dir="ltr" id="semantics-href" name="semantics-href" placeholder="Enter URL, e.g., https://example.net/foo" type="url" value="" />
+          <label for="semantics-content">content</label> <input class="editor-form-input" id="semantics-content" name="semantics-content" placeholder="Enter content, e.g., 'Baz'" type="url" value="" />
+          <label for="semantics-lang">lang</label> <input class="editor-form-input" name="semantics-lang" id="semantics-lang" placeholder="Enter language code, e.g., en" type="url" value="" />
+          <label for="semantics-datatype">datatype</label> <input class="editor-form-input" name="semantics-datatype" id="semantics-datatype" placeholder="Enter URL, e.g., https://example.net/qux" type="url" value="" />
+          `)}
+          ${formFooterHTML({ action: 'save' })}
+        </fieldset>
+      `
+
+/*
+TODO:
+      sparkline: (optins) => `
+        '<input type="text" name="sparkline-search" value="" id="sparkline-search" class="editor-form-input" placeholder="Enter search terms" />',
+        '<input type="hidden" name="sparkline-selection-dataset" value="" id="sparkline-selection-dataset" />',
+        '<input type="hidden" name="sparkline-selection-refarea" value="" id="sparkline-selection-refarea" />'
+        ${getButtonHTML('submit', 'editor-form-submit', 'Save', 'Save', { type: 'submit' })}
+        ${getButtonHTML('cancel', 'editor-form-cancel', 'Cancel', 'Cancel', { type: 'button' })}
+        `;
+      */
+    }
+
+    return toolbarPopups;
+  }
+
+  getSubmenuButtons() {
+    return ['p', 'h1', 'h2', 'h3', 'h4', 'img', 'ul', 'ol', 'blockquote', 'q', 'pre', 'code', 'align-left', 'align-center', 'align-right', 'semantics', 'citation', 'requirement', 'note', 'lang'];
+  }
+
+  getModeToggle() {
+    return { label: 'Back to Reading', icon: '.fas.fa-goal-net', targetMode: 'social' };
+  }
+
+  afterButtons() {
+    super.afterButtons();
+
+    // Remove any existing toggle (e.g. after reinit) before recreating.
+    document.getElementById('editor-area-toggle')?.remove();
+
+    const toggleEl = document.createElement('div');
+    toggleEl.id = 'editor-area-toggle';
+    toggleEl.className = 'do';
+
+    const group = document.createElement('ul');
+
+    let buttonWysiwym = fragmentFromString(`<li>${getButtonHTML({ key: 'dialog.mode-wysiwym.button', button: 'cursor', buttonClass: 'mode-wysiwym' })}</li>`);
+    let buttonMarkdown = fragmentFromString(`<li>${getButtonHTML({ key: 'dialog.mode-markdown.button', button: 'markdown', buttonClass: 'mode-markdown' })}</li>`);
+
+    group.appendChild(buttonWysiwym);
+    group.appendChild(buttonMarkdown);
+    toggleEl.appendChild(group);
+    document.body.appendChild(toggleEl);
+
+    buttonWysiwym = document.querySelector('#editor-area-toggle .mode-wysiwym');
+    buttonMarkdown = document.querySelector('#editor-area-toggle .mode-markdown');
+    
+    buttonWysiwym.setAttribute('aria-pressed', 'true');
+    buttonMarkdown.setAttribute('aria-pressed', 'false');
+    buttonWysiwym.disabled = true;
+
+    toggleEl.addEventListener('mousedown', (e) => e.preventDefault());
+    toggleEl.addEventListener('click', (e) => {
+      const button = e.target.closest('.mode-wysiwym');
+      if (button && button.getAttribute('aria-pressed') === 'false') {
+        e.preventDefault();
+        e.stopPropagation();
+        toggleMarkdownMode(e);
+      }
+    });
+
+    toggleEl.addEventListener('mousedown', (e) => e.preventDefault());
+    toggleEl.addEventListener('click', (e) => {
+      const button = e.target.closest('.mode-markdown');
+      if (button && button.getAttribute('aria-pressed') === 'false') {
+        e.preventDefault();
+        e.stopPropagation();
+        toggleMarkdownMode(e);
+      }
+    });
+  }
+
+  // Option text is out of CSS's reach, so the compact bar's "P"/"H1" labels swap here.
+  updateCompactPresentation() {
+    if (!this.blocktypeSelect) return;
+    Array.from(this.blocktypeSelect.options).forEach(option => {
+      option.textContent = this.isCompactLayout ? option.dataset.shortLabel : option.dataset.label;
+    });
+  }
+
+  getDropdownMenus() {
+    return {
+      align: {
+        icon: buttonIcons['align-center']?.icon,
+        label: 'Align',
+        title: i18n.t('button.align-center.title'),
+        items: [
+          { icon: buttonIcons['align-left']?.icon,   label: i18n.t('button.align-left.textContent'),   action: () => { this.dom.querySelector('#editor-button-align-left')?.click(); } },
+          { icon: buttonIcons['align-center']?.icon, label: i18n.t('button.align-center.textContent'), action: () => { this.dom.querySelector('#editor-button-align-center')?.click(); } },
+          { icon: buttonIcons['align-right']?.icon,  label: i18n.t('button.align-right.textContent'),  action: () => { this.dom.querySelector('#editor-button-align-right')?.click(); } },
+        ],
+      },
+      plus: {
+        label: "+",
+        title: "Insert",
+        items: [
+          {
+            icon: buttonIcons["img"]?.icon,
+            label: "Image",
+            action: () => {
+              this.dom.querySelector("#editor-button-img")?.click();
+            },
+          },
+          {
+            icon: buttonIcons["table"]?.icon,
+            label: "Table",
+            action: () => {
+              Config.Editor.slashMenu?.showForm("table");
+            },
+          },
+          { icon: buttonIcons['ul']?.icon,         label: 'Bullet List',   action: () => { this.dom.querySelector('#editor-button-ul')?.click(); } },
+          { icon: buttonIcons['ol']?.icon,         label: 'Numbered List', action: () => { this.dom.querySelector('#editor-button-ol')?.click(); } },
+          {
+            icon: buttonIcons["blockquote"]?.icon,
+            label: "Blockquote",
+            action: () => {
+              this.dom.querySelector("#editor-button-blockquote")?.click();
+            },
+          },
+          {
+            icon: buttonIcons["q"]?.icon,
+            label: "Inline Quote",
+            action: () => {
+              this.dom.querySelector("#editor-button-q")?.click();
+            },
+          },
+          {
+            icon: buttonIcons["pre"]?.icon,
+            label: "Code Block",
+            action: () => {
+              this.dom.querySelector("#editor-button-pre")?.click();
+            },
+          },
+          {
+            icon: buttonIcons["code"]?.icon,
+            label: "Inline Code",
+            action: () => {
+              this.dom.querySelector("#editor-button-code")?.click();
+            },
+          },
+        ],
+      },
+      meta: {
+        icon: Icon['.fas.fa-magic'],
+        label: "⋯",
+        title: "More options",
+        sectionLabel: "Structure and Semantics",
+        items: [
+          {
+            icon: buttonIcons["semantics"]?.icon,
+            label: "Define Semantics",
+            description:
+              "Add attributes to describe the meaning of the selection.",
+            action: () => {
+              this.dom.querySelector("#editor-button-semantics")?.click();
+            },
+          },
+          {
+            icon: buttonIcons["citation"]?.icon,
+            label: "Add Citation",
+            description: "Add an inline citation for the selected text.",
+            action: () => {
+              this.dom.querySelector("#editor-button-citation")?.click();
+            },
+          },
+          {
+            icon: buttonIcons["note"]?.icon,
+            label: "Note",
+            description: "Add an internal note or footnote.",
+            action: () => {
+              this.dom.querySelector("#editor-button-note")?.click();
+            },
+          },
+          {
+            icon: buttonIcons["lang"]?.icon,
+            label: "Set Language",
+            description: "Set the language of the selection.",
+            action: () => {
+              this.dom.querySelector("#editor-button-lang")?.click();
+            },
+          },
+          {
+            icon: buttonIcons["requirement"]?.icon,
+            label: "Add Requirement",
+            description: "Link the selection to a technical requirement.",
+            action: () => {
+              this.dom.querySelector("#editor-button-requirement")?.click();
+            },
+          },
+        ],
+      },
+    };
+  }
+
+  beforeButtons() {
+    const li = document.createElement('li');
+    li.className = 'editor-blocktype-menu';
+
+    this.blocktypeSelect = document.createElement('select');
+    this.blocktypeSelect.className = 'editor-blocktype-select';
+    this.blocktypeSelect.id = 'editor-blocktype-selector';
+    this.blocktypeSelect.setAttribute('title', 'Block type');
+    this.blocktypeSelect.setAttribute('aria-label', 'Block type');
+
+    [
+      { label: 'Paragraph', short: 'P', value: 'p' },
+      { label: 'Heading 1', short: 'H1', value: 'h1' },
+      { label: 'Heading 2', short: 'H2', value: 'h2' },
+      { label: 'Heading 3', short: 'H3', value: 'h3' },
+      { label: 'Heading 4', short: 'H4', value: 'h4' },
+      { label: 'Heading 5', short: 'H5', value: 'h5' },
+    ].forEach(({ label, short, value }) => {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = label;
+      option.dataset.label = label;
+      option.dataset.shortLabel = short;
+      this.blocktypeSelect.appendChild(option);
+    });
+
+    // Save the PM selection before the select steals focus and collapses it.
+    let _savedSelection = null;
+    // Firefox: change/input fire with the stale value; capture the picked one at the popup-internal mousedown.
+    let _intendedValue = null;
+    const validValues = new Set(
+      Array.from(this.blocktypeSelect.options).map(o => o.value)
+    );
+    this.blocktypeSelect.addEventListener('mousedown', () => {
+      _savedSelection = this.editorView?.state?.selection ?? null;
+      if (document.activeElement === this.blocktypeSelect) {
+        const v = this.blocktypeSelect.value;
+        if (validValues.has(v)) _intendedValue = v;
+      }
+    });
+    this.blocktypeSelect.addEventListener('change', (e) => {
+      const savedSelection = _savedSelection;
+      _savedSelection = null;
+      const value = _intendedValue ?? e.target.value;
+      _intendedValue = null;
+      const command = this.toolbarCommands[value];
+      if (command && this.editorView) {
+        e.target.blur();
+        let state = this.editorView.state;
+        if (savedSelection) {
+          this.editorView.dispatch(state.tr.setSelection(savedSelection));
+          state = this.editorView.state;
+        }
+        command(state, this.editorView.dispatch, this.editorView);
+        this.editorView.focus();
+      }
+    });
+
+    li.appendChild(this.blocktypeSelect);
+    this.ul.appendChild(li);
+  }
+
+  // Called when there is a state change, e.g., added something to the DOM or selection change.
+  update(view) {
+    this.selectionUpdate(view);
+    // When the toolbar's own form is focused (e.g. the user is filling in the
+    // hyperlink or semantics popup), the DOM selection is expectedly collapsed.
+    // A stray editor update — e.g. a Yjs awareness transaction dispatched on
+    // editor focusout in collab mode — must not be treated as "selection lost"
+    // and close the form.
+    if (this.dom.contains(document.activeElement)) return;
+    if (this.pointerDownInToolbar && this.dom.querySelector('.editor-form.editor-form-active')) return;
+    const selection = window.getSelection();
+    const isSelection = selection && !selection.isCollapsed;
+    const isNodeSelection = view?.state?.selection instanceof NodeSelection;
+    if (!isSelection && !isNodeSelection) {
+      if (this.dom.classList.contains('editor-form-active')) {
+        this.cleanupToolbar();
+      }
+      return;
+    }
+    if (this.blocktypeSelect && view) {
+      this.blocktypeSelect.value = this.getBlockTypeKey(view.state);
+      this.updateBlockTypeOptions(view.state);
+    }
+  }
+
+  getBlockTypeKey(state) {
+    const { $from } = state.selection;
+    let depth = $from.depth;
+    while (depth > 0 && !$from.node(depth).isTextblock) depth--;
+    const node = $from.node(depth);
+    if (node.type === schema.nodes.heading) {
+      const level = node.attrs.level;
+      if (level >= 1 && level <= 5) return `h${level}`;
+    }
+    return 'p';
+  }
+
+  // One h1 per document, and no jump past the preceding heading's level.
+  updateBlockTypeOptions(state) {
+    const { $from } = state.selection;
+    let depth = $from.depth;
+    while (depth > 0 && !$from.node(depth).isTextblock) depth--;
+    const node = $from.node(depth);
+    const blockStart = depth > 0 ? $from.before(depth) : 0;
+    const currentLevel = node.type === schema.nodes.heading ? node.attrs.level : null;
+
+    let precedingLevel = 0;
+    let hasOtherH1 = false;
+
+    state.doc.descendants((child, pos) => {
+      if (child.type !== schema.nodes.heading) return;
+      if (pos === blockStart) return false;
+      if (pos < blockStart) precedingLevel = child.attrs.level;
+      if (child.attrs.level === 1) hasOtherH1 = true;
+      return false;
+    });
+
+    Array.from(this.blocktypeSelect.options).forEach(option => {
+      const level = Number(/^h([1-6])$/.exec(option.value)?.[1]);
+      if (!level) return;
+      option.disabled = level === currentLevel ? false
+        : level === 1 ? hasOtherH1
+        : level > precedingLevel + 1;
+    });
+  }
+
+  updateToolbarVisibility(e) {
+    // Firefox blurs the editor on pointerdown over popup chrome, so update() sees activeElement as body.
+    this.pointerDownInToolbar = this.dom.contains(e.target);
+    // document.addEventListener('click', (e) => {
+      // FIXME
+      // console.log(this.editorView, this.mode)
+    // An open popup counts even if the toolbar lost its own class, else it can never be dismissed.
+    const toolbarOpen = this.dom.classList.contains('editor-form-active') || this.dom.querySelector('.editor-form.editor-form-active');
+    if (toolbarOpen && !e.target.closest('.do') && e.target.closest('input[type]')?.type !== 'file' &&  !this.editorView.dom.contains(e.target)) {
+      // Click outside editor and not on functionality-related items
+        this.cleanupToolbar();
+    }
+    // })
+  }
+
+  insertCodeInline(schema) {
+    return function (state, dispatch) {
+      const { from, to } = state.selection;
+      const text = state.doc.textBetween(from, to, " ");
+      
+      // Create a new code_inline node with the selected text
+      const node = schema.nodes.code.create(null, schema.text(text));
+  
+      if (dispatch) {
+        dispatch(state.tr.replaceRangeWith(from, to, node).scrollIntoView());
+      }
+  
+      return true;
+    };
+  }
+
+  insertImage(attrs) {
+    return (state, dispatch) => {
+      const { schema, tr } = state;
+
+      // TODO: find a way to pass all the attributes in the attributes object without the need for a property with a copy
+      const imageNode = schema.nodes.img.create({ originalAttributes: attrs });
+      // console.log(attrs, imageNode)
+  
+      tr.replaceSelectionWith(imageNode);
+  
+      dispatch(tr);
+      return true;
+    };
+  }
+
+  clearSelection() {
+    const { state, dispatch } = this.editorView;
+    const { tr } = state;
+    const pos = state.selection.from; 
+
+    dispatch(tr.setSelection(TextSelection.create(state.doc, pos)));
+  }
+
+  getTextQuoteSelector() {
+    const view = this.editorView;
+    //ProseMirror state.selection
+    const { selection , doc } = view.state;
+    const { from, to } = selection;
+    //TODO: Use Config.ContextLength
+    const contextLength = Config.ContextLength;
+
+    var exact = doc.textBetween(from, to); // consider \n
+    const textNode = view.domAtPos(from).node;
+    // console.log(textNode)
+    const selectedParentElement = textNode.parentNode;
+    // console.log(selectedParentElement)
+
+    // var selectionState = MediumEditor.selection.exportSelection(selectedParentElement, this.document);
+    var prefixStart = Math.max(0, from - Config.ContextLength);
+    // console.log('pS ' + prefixStart);
+    // var prefix = selectedParentElement.textContent.substr(prefixStart, start - prefixStart);
+    let prefix = doc.textBetween(prefixStart, from)  // consider \n
+    // console.log('-' + prefix + '-');
+    prefix = htmlEncode(prefix);
+    
+    var suffixEnd = Math.min(selectedParentElement.textContent.length, to + Config.ContextLength);
+    // console.log('sE ' + suffixEnd);
+    let suffix =  doc.textBetween(to, suffixEnd)  // consider \n
+    // console.log('-' + suffix + '-');
+    suffix = htmlEncode(suffix);
+
+    return {
+      type: 'TextQuoteSelector',
+      exact,
+      prefix,
+      suffix
+    }
+  }
+  
+
+  getSelectionAsHTML() {
+    const state = this.editorView.state;
+    const tr = state.tr;
+
+    const { selection, doc } = tr;
+    if (!(selection instanceof TextSelection) || selection.empty) return;
+
+    const { from, to } = selection;
+    const selectedSlice = doc.slice(from, to);
+    const serializer = DOMSerializer.fromSchema(doc.type.schema);
+    const fragment = serializer.serializeFragment(selectedSlice.content);
+    const selectedContent = new XMLSerializer().serializeToString(fragment);
+    return selectedContent;
+  }
+
+
+nodeToHTML(node, schema) {
+  const serializer = DOMSerializer.fromSchema(schema);
+  const fragment = serializer.serializeFragment(node.content);
+  const div = document.createElement('div');
+  div.appendChild(fragment);
+  return div.getHTML();
+}
+
+
+  replaceSelectionWithFragment(fragment) {
+    // console.log(fragment)
+    const { state, dispatch } = this.editorView;
+    const { selection, schema } = state;
+    // console.log(selection)
+    // parseSlice(fragment, { preserveWhitespace: true })
+    let node = DOMParser.fromSchema(schema).parseSlice(fragment);
+    const selText = state.doc.textBetween(selection.from, selection.to, " ");
+    let tr = state.tr.replaceSelection(node);
+    // console.log(tr)
+    dispatch(tr);
+  }
+
+  replaceSelectionWithNodeFromFragment(fragment) {
+    // console.log(fragment)
+    const { state, dispatch } = this.editorView;
+    const { selection, schema } = state;
+    // parseSlice(fragment, { preserveWhitespace: true })
+    let node = DOMParser.fromSchema(schema).parse(fragment);
+    const selText = state.doc.textBetween(selection.from, selection.to, " ");
+    let tr = state.tr.replaceSelectionWith(node);
+    // console.log(tr)
+    dispatch(tr);
+  }
+
+  // Like replaceSelectionWithFragment, but inserts the fragment as a closed slice so
+  // wrapper nodes survive. parseSlice returns an open slice, which flattens a single
+  // inline wrapper (e.g. the <span class="ref"> around a note/citation mark + sup)
+  // into the surrounding paragraph.
+  replaceSelectionWithInlineFragment(fragment) {
+    const { state, dispatch } = this.editorView;
+    const slice = DOMParser.fromSchema(state.schema).parseSlice(fragment);
+    dispatch(state.tr.replaceSelection(new Slice(slice.content, 0, 0)));
+  }
+
+  //Equivalent to insertAdjacentHTML('beforend') / appendChild?
+  insertFragmentInNode(fragment) {
+    const { state, dispatch } = this.editorView;
+    const { selection } = state;
+
+    const endPos = getClosestSectionNodeEndPos(this.editorView)
+
+    let node = DOMParser.fromSchema(schema).parse(fragment);
+
+// console.log(node)
+
+    let tr = state.tr.insert(endPos, node);
+
+    dispatch(tr);
+  }
+
+  // Insert a new slide after the last section.slide in the document (at article level)
+  insertSlideAtEnd(fragment) {
+    const { state, dispatch } = this.editorView;
+
+    let lastSlideEndPos = null;
+
+    state.doc.descendants((node, pos) => {
+      if (node.type.name === 'section') {
+        const attrs = node.attrs.originalAttributes || {};
+        if (attrs.class && attrs.class.split(' ').includes('slide')) {
+          lastSlideEndPos = pos + node.nodeSize;
+        }
+      }
+    });
+
+    if (lastSlideEndPos === null) return;
+
+    const node = DOMParser.fromSchema(schema).parse(fragment);
+    const tr = state.tr.insert(lastSlideEndPos, node);
+    dispatch(tr);
+  }
+
+  insertSlideAfter(targetId, fragment) {
+    const target = this.findSlideById(targetId);
+    if (!target) return this.insertSlideAtEnd(fragment);
+    const { state, dispatch } = this.editorView;
+    const insertAt = target.pos + target.node.nodeSize;
+    const node = DOMParser.fromSchema(schema).parse(fragment);
+    dispatch(state.tr.insert(insertAt, node));
+  }
+
+  findSlideById(id) {
+    const { state } = this.editorView;
+    let found = null;
+    state.doc.descendants((node, pos) => {
+      if (found) return false;
+      if (node.type.name !== 'section') return;
+      const attrs = node.attrs.originalAttributes || {};
+      if (attrs.id === id) found = { node, pos };
+    });
+    return found;
+  }
+
+  deleteSlideById(id) {
+    const { state, dispatch } = this.editorView;
+    const target = this.findSlideById(id);
+    if (!target) return;
+    dispatch(state.tr.delete(target.pos, target.pos + target.node.nodeSize));
+  }
+
+  findNodeById(id) {
+    const { state } = this.editorView;
+    let found = null;
+    state.doc.descendants((node, pos) => {
+      if (found) return false;
+      if ((node.attrs.originalAttributes || {}).id === id) found = { node, pos };
+    });
+    return found;
+  }
+
+  findNodeBySelector(selector) {
+    const { state } = this.editorView;
+    let found = null;
+
+    const match = (node) => {
+      const attrs = node.attrs.originalAttributes || {};
+      if (selector.startsWith('#')) {
+        return attrs.id === selector.slice(1);
+      }
+      if (selector.startsWith('.')) {
+        const classes = (attrs.class || '').split(/\s+/);
+        return classes.includes(selector.slice(1));
+      }
+      // tag/type selector
+      return node.type.name === selector;
+    };
+
+    state.doc.descendants((node, pos) => {
+      if (found) return false;
+      if (match(node)) found = { node, pos };
+    });
+    return found;
+  }
+
+  findFirstChildOfType(parentSelector, childType) {
+    const parent = this.findNodeBySelector(parentSelector);
+    if (!parent) return null;
+    const childTypes = Array.isArray(childType) ? childType : [childType];
+    let found = null;
+    parent.node.descendants((node, pos) => {
+      if (found) return false;
+      if (childTypes.includes(node.type.name)) found = { node, pos: parent.pos + 1 + pos };
+    });
+    return found;
+  }
+
+  insertFragmentAtEndOfChild(parentSelector, childType, fragment) {
+    const { state, dispatch } = this.editorView;
+    const target = this.findFirstChildOfType(parentSelector, childType);
+    if (!target) return;
+    const node = DOMParser.fromSchema(schema).parse(fragment);
+    const insertAt = target.pos + 1 + target.node.content.size;
+    dispatch(state.tr.insert(insertAt, node));
+  }
+
+  setOriginalAttributeOnDescendants(parentSelector, childType, attrName, attrValue) {
+    const { state, dispatch } = this.editorView;
+    const parent = this.findNodeBySelector(parentSelector);
+    if (!parent) return;
+    const updates = [];
+    parent.node.descendants((node, pos) => {
+      if (node.type.name !== childType) return;
+      if (node.attrs.originalAttributes?.[attrName]) return;
+      updates.push({ pos: parent.pos + 1 + pos, attrs: { ...node.attrs, originalAttributes: { ...node.attrs.originalAttributes, [attrName]: attrValue } } });
+    });
+    if (!updates.length) return;
+    let tr = state.tr;
+    updates.forEach(({ pos, attrs }) => { tr = tr.setNodeMarkup(pos, null, attrs); });
+    dispatch(tr);
+  }
+
+  // Insert a fragment at the end of the node with the given selector (targeted, not cursor-relative).
+  insertFragmentAtEndOf(targetSelector, fragment) {
+    const { state, dispatch } = this.editorView;
+    const target = this.findNodeBySelector(targetSelector);
+    if (!target) return;
+    const node = DOMParser.fromSchema(schema).parse(fragment);
+    const insertAt = target.pos + 1 + target.node.content.size;
+    dispatch(state.tr.insert(insertAt, node));
+  }
+
+  deleteNodeById(id) {
+    const { state, dispatch } = this.editorView;
+    const target = this.findNodeById(id);
+    if (!target) return;
+    dispatch(state.tr.delete(target.pos, target.pos + target.node.nodeSize));
+  }
+
+  // Insert a fragment immediately before the node with the given id (targeted, not cursor-relative).
+  insertFragmentBeforeNodeById(id, fragment) {
+    const { state, dispatch } = this.editorView;
+    const target = this.findNodeById(id);
+    if (!target) return false;
+    const node = DOMParser.fromSchema(schema).parse(fragment);
+    dispatch(state.tr.insert(target.pos, node));
+    return true;
+  }
+
+  // Insert a fragment immediately before the first node matching the selector.
+  insertFragmentBeforeNode(selector, fragment) {
+    const { state, dispatch } = this.editorView;
+    const target = this.findNodeBySelector(selector);
+    if (!target) return false;
+    const node = DOMParser.fromSchema(schema).parse(fragment);
+    dispatch(state.tr.insert(target.pos, node));
+    return true;
+  }
+
+  // Insert a fragment at the end of the document.
+  insertFragmentAtEndOfDoc(fragment) {
+    const { state, dispatch } = this.editorView;
+    const node = DOMParser.fromSchema(schema).parse(fragment);
+    dispatch(state.tr.insert(state.doc.content.size, node));
+    return true;
+  }
+
+  // Insert a fragment at the start of the first node matching the selector.
+  insertFragmentAtStartOf(selector, fragment) {
+    const { state, dispatch } = this.editorView;
+    const target = this.findNodeBySelector(selector);
+    if (!target) return false;
+    const node = DOMParser.fromSchema(schema).parse(fragment);
+    dispatch(state.tr.insert(target.pos + 1, node));
+    return true;
+  }
+
+  moveSlide(fromId, toId, before = true) {
+    if (fromId === toId) return;
+    const { state, dispatch } = this.editorView;
+    const from = this.findSlideById(fromId);
+    const to = this.findSlideById(toId);
+    if (!from || !to) return;
+
+    let tr = state.tr.delete(from.pos, from.pos + from.node.nodeSize);
+    let insertAt = before ? to.pos : to.pos + to.node.nodeSize;
+    // If source was before target, target shifted up by fromSize after delete.
+    if (from.pos < to.pos) insertAt -= from.node.nodeSize;
+    tr = tr.insert(insertAt, from.node);
+    dispatch(tr);
+  }
+  updateMarkWithAttributes(schema, markType, attrs) {
+    return (state, dispatch) => {
+// console.log(state, dispatch)
+
+      const safeAttributes = Object.fromEntries(
+        Object.entries(attrs).filter(
+          ([key, value]) => value.length || allowedEmptyAttributes.includes(key)
+        )
+      );
+      const { tr, selection } = this.editorView.state;
+      const { $from, $to } = selection;
+      const mark = schema.marks[markType];
+
+      // const result = toggleMark(schema.marks[markType])(this.editorView.state,dispatch)
+      // console.log(result)
+      // console.log(tr.before.eq(state.doc))
+
+      if (!mark) return false;
+  
+      const hasMark = isMarkActive(state, schema.marks[markType]);
+
+      if (hasMark) {
+        tr.removeMark($from.pos, $to.pos, mark);
+        // if (dispatch) dispatch(tr);
+      }
+// console.log(attrs)
+      tr.addMark($from.pos, $to.pos, mark.create({originalAttributes: attrs}));
+
+      if (dispatch) dispatch(tr);
+      return true;
+    }
+  }
+
+  clearToolbarButton(button) {
+    const btnNode = this.dom.querySelector(`#${'editor-button-' + button}`);
+
+    if (this.toolbarPopups[button]) {
+      //Clean up all or any that's active.
+      btnNode.classList.remove('editor-button-active');
+    }
+    // else {
+      //Checks if the other buttons are connected to an applied node/mark, then make active.
+      this.updateButtonState(schema, btnNode, button, this.editorView);
+    // }
+  }
+
+  clearToolbarForm(toolbarForm) {
+    toolbarForm.classList.remove('editor-form-active');
+    toolbarForm.removeAttribute('style');
+    toolbarForm.reset();
+    this.editorView.focus();
+  }
+
+  // populateForms takes form node and editorView.state
+  populateFormImg(button, node, state) {
+    const fileInput = node.querySelector('[name="img-file"]');
+    const altInput = node.querySelector('[name="img-alt"]');
+    let srcInput = node.querySelector('[name="img-src"]');
+
+    // TODO: prepopulate alt from selection
+    var selectedText = state.doc.textBetween(state.selection.from, state.selection.to, "\n");
+
+    try {
+      const selectedURL = new URL(selectedText);
+      srcInput.value = selectedText;
+    }
+    catch(e) {
+      altInput.value = selectedText;
+    }
+
+    fileInput.addEventListener("change", async (e) => {
+      const preview = node.querySelector('.img-preview');
+
+      await updateImagePreview(e, fileInput, preview);
+
+      const previewImageNode = preview.querySelector('img[src]');
+
+      if (previewImageNode) {
+        srcInput = node.querySelector('[name="img-src"]');
+        srcInput.value = previewImageNode.src;
+        const file = fileInput.files?.[0];
+        if (file && previewImageNode.src.startsWith('blob:')) {
+          registerBlobAsset(previewImageNode.src, file);
+        }
+      }
+    });
+  }
+
+  populateFormRequirement(button, node, state) {
+    // clear previous errors - TODO maybe this should happen elsewhere
+    const previousErrors = node.querySelectorAll('.error');
+    if (previousErrors.length) {
+      previousErrors.forEach(error => error.remove());
+      node.querySelector('.editor-form-submit').disabled = false;
+      node.querySelector('#requirement-subject').disabled = false;
+      node.querySelector('#requirement-level').disabled = false;
+    }
+
+    var selectedTextContent = state.doc.textBetween(state.selection.from, state.selection.to, "\n");
+
+    var requirementSubjectURI, requirementSubjectLabel, requirementLevelURI, requirementLevelLabel;
+    var prevRequirementSubjectLabel, prevRequirementLevelLabel;
+
+    const requirementSubject = document.querySelector('#requirement-subject');
+    const requirementLevel = document.querySelector('#requirement-level');
+
+    // The form is rendered at toolbar construction; the available product
+    // classes can change during the session, so refresh the subject options.
+    const currentSubject = requirementSubject.value;
+    requirementSubject.innerHTML = getRequirementSubjectOptionsHTML(currentSubject ? { selected: currentSubject } : {});
+
+    //Build error
+    const legend = node.querySelector('legend');
+
+    const requirementSubjectOptions = [...requirementSubject.querySelectorAll('option')];
+    const requirementLevelOptions = [...requirementLevel.querySelectorAll('option')];
+
+    const hasRequirementSubjectMatch = requirementSubjectOptions.some(option => selectedTextContent.toLowerCase().includes(option.textContent.trim().toLowerCase()));
+    const hasRequirementLevelMatch = requirementLevelOptions.some(option => selectedTextContent.toLowerCase().includes(option.textContent.trim().toLowerCase()));
+
+    const errorList = [];
+
+    if (!hasRequirementSubjectMatch || !hasRequirementLevelMatch) {
+      const classesOfProducts = requirementSubjectOptions.map(option => `<a href="${option.value}">${option.textContent}</a>`);
+      const requirementLevels = requirementLevelOptions.map(option => `<a href="${option.value}">${option.textContent}</a>`);
+
+      if (!requirementSubjectOptions.length) {
+        errorList.push(`This specification does not define any product classes yet, so the requirement's subject cannot be set. Add the Conformance section's Classes of Products, define at least one product class, and mention it in the text.`);
+      }
+      else if (!hasRequirementSubjectMatch) {
+        errorList.push(`Selected text does not include a product class, i.e., the requirement's subject, such as ${classesOfProducts.join(', ')}. Choose one from the Requirement Subject list, or edit the text to mention one and reselect it.`);
+      }
+
+      if (!hasRequirementLevelMatch) {
+        errorList.push(`Selected text does not include a normative keyword, i.e., the requirement's level, such as ${requirementLevels.sort(() => Math.random() - 0.5).slice(0, 3).join(', ')}, etc. Choose one from the Requirement Level list, or edit the text to include one and reselect it.`);
+      }
+    }
+
+    // The subject select is unusable only when the document defines no product
+    // classes; an unmatched selection is resolved by choosing from the list.
+    requirementSubject.disabled = !requirementSubjectOptions.length;
+    requirementLevel.disabled = false;
+
+    // Unmatched selects lead with a placeholder so picking a value fires change.
+    requirementLevel.querySelector('option[value=""]')?.remove();
+    if (!hasRequirementSubjectMatch && requirementSubjectOptions.length && !requirementSubject.querySelector('option[value=""]')) {
+      requirementSubject.insertAdjacentHTML('afterbegin', '<option selected="selected" value="">Choose a requirement subject</option>');
+    }
+    if (!hasRequirementLevelMatch) {
+      requirementLevel.insertAdjacentHTML('afterbegin', '<option selected="selected" value="">Choose a requirement level</option>');
+    }
+
+    // Save enables once every unmatched piece is resolved by a manual choice.
+    const unresolved = new Set();
+    if (!hasRequirementSubjectMatch) unresolved.add('subject');
+    if (!hasRequirementLevelMatch) unresolved.add('level');
+    const resolve = (piece) => {
+      unresolved.delete(piece);
+      if (!unresolved.size) node.querySelector('.editor-form-submit').disabled = false;
+    };
+
+    if (errorList.length) {
+      let errorListItems = [];
+      errorList.forEach((errorMessage) => {
+        errorListItems.push(`<li>${errorMessage}</li>`);
+      })
+      sanitizeInsertAdjacentHTML(legend, 'afterend', `<ul class="error">${errorListItems.join('')}</ul>`);
+      node.querySelector('.editor-form-submit').disabled = true;
+    }
+
+    if (requirementSubject) {
+      requirementSubjectOptions.forEach(option => {
+        var optionTextContent = option.textContent.trim();
+        if (selectedTextContent.toLowerCase().includes(optionTextContent.toLowerCase())) {
+          option.selected = true;
+          requirementSubjectLabel = optionTextContent;
+          requirementSubjectURI = option.value;
+          prevRequirementSubjectLabel = requirementSubjectLabel;
+        }
+      });
+
+      requirementSubject.addEventListener('change', e => {
+        resolve('subject');
+        renderPreview();
+      });
+    }
+
+
+    if (requirementLevel) {
+      requirementLevel.querySelectorAll('option').forEach(option => {
+        var optionTextContent = option.textContent.trim();
+        if (selectedTextContent.toLowerCase().includes(optionTextContent.toLowerCase())) {
+          option.selected = true;
+          requirementLevelLabel = optionTextContent;
+          requirementLevelURI = option.value;
+          prevRequirementLevelLabel = requirementLevelLabel;
+        }
+      });
+
+      requirementLevel.addEventListener('change', e => {
+        resolve('level');
+        renderPreview();
+      });
+    }
+
+    //XXX: If the selection already includes a link with relation cito:citesAsSourceDocument or spec:basedOnConsensus, use that to populate #requirement-consensus. Is this the best way:
+    const requirementConsensus = document.querySelector('#requirement-consensus');
+    if (requirementConsensus) {
+      state.doc.nodesBetween(state.selection.from, state.selection.to, node => {
+        node.marks.forEach(mark => {
+          // console.log(mark)
+          if (mark.type.name === 'a' && ['cito:citesAsSourceDocument','spec:basedOnConsensus'].includes(mark.attrs.originalAttributes.rel)) {
+            requirementConsensus.value = mark.attrs.originalAttributes.href;
+          }
+        });
+      });
+    }
+
+    let selectedLanguage = '';
+    const requirementLanguage = document.querySelector('#requirement-language');
+
+    if (requirementLanguage) {
+      requirementLanguage.addEventListener('change', e => {
+        selectedLanguage = e.target.value;
+
+        var requirementCurrentNode = node.querySelector('#requirement-preview-samp [rel="spec:requirement"]');
+
+        requirementCurrentNode.setAttribute('lang', selectedLanguage);
+        requirementCurrentNode.setAttribute('xml:lang', selectedLanguage);
+      });
+    }
+
+    const { $from, $to } = state.selection;
+
+    let depth = $from.depth;
+    while (depth >= 0 && $from.node(depth) !== $to.node(depth)) {
+      depth--;
+    }
+
+    const ancestorNode = $from.node(depth); 
+
+    const wrapper = document.createElement('div');
+    ancestorNode.content.forEach(child => {
+      wrapper.appendChild(DOMSerializer.fromSchema(schema).serializeNode(child));
+    });
+
+    const selectedHtmlString = wrapper.getHTML();
+
+    // The preview is what gets inserted on Save; rebuild it from the current
+    // select values (initial matches or manual choices).
+    const renderPreview = () => {
+      var r = {};
+      r.subject = requirementSubject.value || undefined;
+      r.level = requirementLevel.value || undefined;
+      // prev labels locate the text to replace in the original selection, so
+      // they stay the text-matched labels; the chosen value supplies the new
+      // span (e.g. "MUST" in the text becomes the RECOMMENDED span).
+      r.prevSubjectLabel = prevRequirementSubjectLabel;
+      r.prevLevelLabel = prevRequirementLevelLabel;
+      r.selectedTextContent = selectedTextContent;
+      r.lang = selectedLanguage;
+      r.basedOnConsensus = requirementConsensus;
+      r.selectedHtmlString = selectedHtmlString;
+
+      var html = createRDFaHTMLRequirement(r, 'requirement');
+      document.querySelector('#requirement-preview-samp').replaceChildren(fragmentFromString(html));
+    };
+
+    renderPreview();
+  }
+
+  populateFormCitation(button, node, state) {
+    // const { selection } = state;
+    // const { from, to } = selection;
+    const citationSpecRefSearch = document.querySelector('#citation-specref-search');
+    // console.log(citationSpecRefSearch);
+  
+    const citationUrl = document.querySelector('#citation-url');
+    // console.log(citationUrl);
+  
+    citationSpecRefSearch.focus();
+    citationSpecRefSearch.value = state.doc.textBetween(state.selection.from, state.selection.to, "\n");
+  
+    var specrefSearchResults = document.querySelector('.specref-search-results');
+  
+    if (specrefSearchResults) {
+      specrefSearchResults.replaceChildren();
+    }
+
+    // console.log(specrefSearchResults);
+  
+    var specref = document.querySelector('#citation-specref-search-submit');
+    // console.log(specref);
+
+    // Wire once; populateFormCitation runs on every open
+    if (!specref.dataset.searchWired) {
+      specref.dataset.searchWired = 'true';
+      let searchGeneration = 0;
+      const sourceLabels = { specref: 'Specref', wikidata: 'Wikidata', openlibrary: 'Open Library', doi: 'DOI', orcid: 'ORCID' };
+
+      specref.addEventListener('click', async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+
+        // Discard responses from a superseded search
+        const generation = ++searchGeneration;
+        const keyword = document.querySelector('#citation-specref-search').value.trim();
+        const sources = [...document.querySelectorAll('#editor-form-citation input[name="citation-search-source"]:checked')].map(i => i.value);
+
+        const container = document.querySelector('.specref-search-results');
+        if (!container) return;
+
+        const results = [];
+        container.replaceChildren(fragmentFromString(`<span class="progress">${Icon['.fas.fa-circle-notch.fa-spin.fa-fw']}</span>`));
+        container.onchange = (e) => {
+          const checked = e.target.closest('input[type="radio"]');
+          if (checked) {
+            // Unique names make each radio tabbable; uncheck the rest here
+            container.querySelectorAll('input[type="radio"]').forEach(r => { if (r !== checked) r.checked = false; });
+            document.querySelector('#citation-url').value = results[checked.value].uri;
+          }
+        };
+
+        const appendItems = (source, items) => {
+          if (generation !== searchGeneration || !items.length) return;
+
+          let list = container.querySelector('dl[data-source="' + source + '"] ul');
+          if (!list) {
+            const dl = fragmentFromString('<dl data-source="' + source + '"><dt>' + (sourceLabels[source] || source) + '</dt><dd><ul></ul></dd></dl>');
+            container.insertBefore(dl, container.querySelector('.progress'));
+            list = container.querySelector('dl[data-source="' + source + '"] ul');
+          }
+
+          items.forEach((result) => {
+            const index = results.push(result) - 1;
+            const description = result.description ? ' ' + htmlEncode(result.description) : '';
+            list.appendChild(fragmentFromString('<li><input name="search-sources-item-' + index + '" id="search-sources-item-' + index + '" type="radio" value="' + index + '" /> <label for="search-sources-item-' + index + '"><a href="' + htmlEncode(result.uri) + '" rel="noopener" target="_blank">' + htmlEncode(result.label) + '</a>' + description + '</label></li>'));
+          });
+        };
+
+        const streams = searchSourceStreams(keyword, { sources });
+        await Promise.allSettled(streams.map(stream => stream.promise.then(items => appendItems(stream.source, items))));
+
+        if (generation !== searchGeneration) return;
+        container.querySelector('.progress')?.remove();
+
+        if (!results.length) {
+          container.replaceChildren(fragmentFromString('<p class="search-results-empty">No results for \u201c' + htmlEncode(keyword.replace(/^"(.*)"$/, '$1')) + '\u201d.</p>'));
+        }
+      });
+    }
+
+    citationUrl.focus();
+
+    document.querySelector('.editor-form input[name="citation-ref-type"]').checked = true;
+  }
+
+
+  //TODO function getTransactionHistory()
+
+  getPopulateForms() {
+    return {
+      a: this.populateFormA,
+      img: this.populateFormImg,
+      citation: this.populateFormCitation,
+      requirement: this.populateFormRequirement,
+    }
+  }
+
+  // Prefill the hyperlink form with the link mark touching the selection, so an
+  // existing link's URL/title is shown (and editable) rather than blank.
+  populateFormA(button, node, state) {
+    const hrefInput = node.querySelector('#a-href');
+    const titleInput = node.querySelector('#a-title');
+    if (!hrefInput) return;
+    const markType = schema.marks.a;
+    const { from, to, $from } = state.selection;
+    let mark = markType.isInSet($from.marks());
+    if (!mark) {
+      state.doc.nodesBetween(from, to, n => {
+        if (!mark) mark = markType.isInSet(n.marks);
+      });
+    }
+    const attrs = mark?.attrs?.originalAttributes || {};
+    hrefInput.value = attrs.href || '';
+    if (titleInput) titleInput.value = attrs.title || '';
+  }
+
+  updateButtonState(schema, buttonNode, button, editorView) {
+    const alignMatch = button.match(/^align-(left|center|right)$/);
+    if (alignMatch) {
+      const want = alignMatch[1];
+      const { $from } = editorView.state.selection;
+      let current = null;
+      for (let depth = $from.depth; depth > 0; depth--) {
+        const n = $from.node(depth);
+        if (ALIGNABLE_BLOCK_TYPES.has(n.type.name)) {
+          current = currentTextAlign(n.attrs.originalAttributes?.class);
+          break;
+        }
+      }
+      buttonNode.classList.toggle('editor-button-active', current === want);
+      return;
+    }
+
+    const nodeType = getSchemaTypeFromButton(schema, button);
+    let isActive;
+
+    if (nodeType) {
+      if (nodeType.type === "mark") {
+        isActive = isMarkActive(editorView.state, nodeType.schema);
+      }
+      else if (nodeType.type === "node") {
+        isActive = isNodeActive(editorView.state, nodeType.schema, { level: nodeType.level });
+      }
+    }
+
+    if (isActive !== undefined) {
+      if (isActive) {
+        buttonNode.classList.add('editor-button-active');
+      }
+      else {
+        buttonNode.classList.remove('editor-button-active');
+      }
+    }
+  }
+}
+
+// Range [from, to] of the contiguous run of `markType` covering `pos`, or null.
+function getMarkRange(state, pos, markType) {
+  const $pos = state.doc.resolve(pos);
+  const parent = $pos.parent;
+  const start = parent.childAfter($pos.parentOffset);
+  if (!start.node) return null;
+  const mark = markType.isInSet(start.node.marks);
+  if (!mark) return null;
+  let startIndex = $pos.index();
+  let startPos = $pos.start() + start.offset;
+  let endIndex = startIndex + 1;
+  let endPos = startPos + start.node.nodeSize;
+  while (startIndex > 0 && mark.isInSet(parent.child(startIndex - 1).marks)) {
+    startIndex -= 1;
+    startPos -= parent.child(startIndex).nodeSize;
+  }
+  while (endIndex < parent.childCount && mark.isInSet(parent.child(endIndex).marks)) {
+    endPos += parent.child(endIndex).nodeSize;
+    endIndex += 1;
+  }
+  return { from: startPos, to: endPos };
+}
+
+//Checks whether a given a mark schema is applied / active to the current selection.
+function isMarkActive(state, type) {
+  const { from, $from, to, empty } = state.selection;
+  if (empty) {
+    return type.isInSet(state.storedMarks || $from.marks());
+  }
+  else {
+    return state.doc.rangeHasMark(from, to, type);
+  }
+}
+
+//Checks whether a given a node schema is applied / active to the current selection.
+function isNodeActive(state, type, attrs = {}) {
+  const { selection } = state;
+  const { $from, to, node } = selection;
+
+  if (node) {
+    return node.type === type && Object.entries(attrs).every(([key, value]) => node.attrs[key] === value);
+  }
+
+  const parent = $from.parent;
+
+  return (
+    to <= $from.end() &&
+    parent.type === type &&
+    Object.entries(attrs).every(([key, value]) => parent.attrs[key] === value)
+  );
+}
+
+//Given a button action (string), e.g., h1-h6, a, section, ul, returns the associated schema. If there is no associated schema, returns null.
+function getSchemaTypeFromButton(schema, button) {
+  if (!schema || !button) return null;
+
+  const headingMatch = button.match(/^h([1-6])$/);
+  if (headingMatch) {
+    return { 
+      type: "node",
+      schema: schema.nodes.heading,
+      level: parseInt(headingMatch[1], 10) 
+    };
+  }
+
+  if (schema.marks[button]) {
+    return { type: "mark", schema: schema.marks[button] };
+  }
+
+  if (schema.nodes[button]) {
+    return { type: "node", schema: schema.nodes[button] };
+  }
+
+  return null;
+}
+
+const ALIGNABLE_BLOCK_TYPES = new Set([
+  'p', 'heading', 'blockquote', 'figure', 'figcaption', 'pre',
+  'li', 'dt', 'dd', 'summary', 'td', 'th'
+]);
+
+const ALIGN_VALUES = ['left', 'center', 'right'];
+const ALIGN_CLASS_PREFIX = 'align-';
+
+function stripAlignClass(classAttr) {
+  return (classAttr || '')
+    .split(/\s+/)
+    .filter(c => c && !(c.startsWith(ALIGN_CLASS_PREFIX) && ALIGN_VALUES.includes(c.slice(ALIGN_CLASS_PREFIX.length))))
+    .join(' ')
+    .trim();
+}
+
+function currentTextAlign(classAttr) {
+  const found = (classAttr || '').split(/\s+/).find(c => c.startsWith(ALIGN_CLASS_PREFIX) && ALIGN_VALUES.includes(c.slice(ALIGN_CLASS_PREFIX.length)));
+  return found ? found.slice(ALIGN_CLASS_PREFIX.length) : null;
+}
+
+function setTextAlign(value) {
+  return (state, dispatch) => {
+    const { $from } = state.selection;
+    let node = null;
+    let pos = null;
+    for (let depth = $from.depth; depth > 0; depth--) {
+      const n = $from.node(depth);
+      if (ALIGNABLE_BLOCK_TYPES.has(n.type.name)) {
+        node = n;
+        pos = $from.before(depth);
+        break;
+      }
+    }
+    if (!node) return false;
+    if (!dispatch) return true;
+
+    const prev = node.attrs.originalAttributes || {};
+    const nextOriginal = { ...prev };
+    const cleaned = stripAlignClass(prev.class);
+    const isSame = currentTextAlign(prev.class) === value;
+    if (isSame) {
+      if (cleaned) nextOriginal.class = cleaned;
+      else delete nextOriginal.class;
+    } else {
+      nextOriginal.class = cleaned ? `${cleaned} ${ALIGN_CLASS_PREFIX}${value}` : `${ALIGN_CLASS_PREFIX}${value}`;
+    }
+
+    const tr = state.tr.setNodeMarkup(pos, null, { ...node.attrs, originalAttributes: nextOriginal });
+    dispatch(tr.scrollIntoView());
+    return true;
+  };
+}
+
+//Heading is a schema (as opposed to h1-h6). This is an intermediary step to find out how to apply setBlockType (which level of heading). If heading is applied, it either toggles to new heading or to paragraph.
+function toggleHeading(schema, level) {
+  return (state, dispatch) => {
+    const { nodes } = schema;
+    const { $from } = state.selection;
+    const nodeType = nodes.heading;
+    let depth = $from.depth;
+    while (depth > 0 && !$from.node(depth).isTextblock) depth--;
+    const node = $from.node(depth);
+
+    if (!node.isTextblock) return false;
+
+    if (node.type === nodeType && node.attrs.level === level) {
+      return setBlockType(nodes.p)(state, dispatch);
+    }
+
+    // Slide templates seed an empty <h2 property="schema:name"> placeholder immediately before the body content. If the user types into the body and toggles it to a heading at the same level, merge into the empty placeholder with any attributes
+    let emptyPrev = null;
+    let emptyPrevStart = null;
+    const parentDepth = depth - 1;
+    if (parentDepth >= 0) {
+      const index = $from.index(parentDepth);
+      if (index > 0) {
+        const prev = $from.node(parentDepth).child(index - 1);
+        if (
+          prev.type === nodeType &&
+          prev.attrs.level === level &&
+          prev.content.size === 0
+        ) {
+          emptyPrev = prev;
+          emptyPrevStart = $from.before(depth) - prev.nodeSize;
+        }
+      }
+    }
+
+    const carriedAttrs = emptyPrev?.attrs.originalAttributes?.property
+      ? { property: emptyPrev.attrs.originalAttributes.property }
+      : {};
+    const originalAttributes = {
+      ...(node.attrs.originalAttributes || {}),
+      ...carriedAttrs,
+    };
+
+    if (dispatch) {
+      const tr = state.tr;
+      if (emptyPrev !== null) {
+        tr.delete(emptyPrevStart, emptyPrevStart + emptyPrev.nodeSize);
+      }
+      const blockStart = tr.mapping.map($from.before(depth));
+      const blockEnd = blockStart + node.nodeSize;
+      tr.setBlockType(blockStart, blockEnd, nodeType, { level, originalAttributes });
+      dispatch(tr.scrollIntoView());
+    }
+    return true;
+  };
+}
+
+/*
+TODO: Heading sectioning
+
+          switch(this.action) {
+              case 'h2': case 'h3': case 'h4': case 'h5': case 'h6':
+                //XXX: Which heading level are we at?
+                var parentSectionHeading = '';
+                for (var i = 0; i < parentSection.childNodes.length; i++) {
+                  parentSectionHeading = parentSection.childNodes[i].nodeName.toLowerCase();
+                  if(Config.EditorOptions.headings.indexOf(parentSectionHeading) > 0) {
+// console.log(parentSectionHeading);
+                    break;
+                  }
+                }
+                var pSH = parseInt(parentSectionHeading.slice(-1));
+
+                //XXX: Which heading level is the action?
+                var cSH = parseInt(this.action.slice(-1));
+// console.log("parentH: " + pSH);
+// console.log("currentH: " + cSH);
+// console.log(cSH-pSH);
+
+                var closePreviousSections = '';
+                // if (cSH > pSH) {}
+                for (i = 0; i <= (pSH-cSH); i++) {
+                  console.log("i: " + i);
+                  closePreviousSections += '</div></section>';
+                }
+// console.log(closePreviousSections);
+// console.log(this.base.selection);
+
+                var selection = window.getSelection();
+// console.log(this.base.selection);
+// console.log(selection);
+
+                if (selection.rangeCount) {
+                  // FIXME: Seem ununsed. Remove later. 
+                  // range = selection.getRangeAt(0);
+                  // parent = selectedParentElement;
+
+// console.log(range);
+                  //Section
+                  var sectionId = generateAttributeId(null, this.base.selection);
+                  var section = document.createElement('section');
+                  section.id = sectionId;
+                  section.setAttribute('rel', 'schema:hasPart');
+                  section.setAttribute('resource', '#' + sectionId);
+// console.log(section);
+
+
+                  //Heading
+                  var heading = document.createElement(tagNames[0]);
+                  heading.setAttribute('property', 'schema:name');
+                  heading.setHTMLUnsafe(domSanitize(this.base.selection));
+// console.log(heading);
+// console.log(selection);
+
+
+                  var divDescription = parentSection.getElementsByTagName('div')[0];
+// console.log(divDescription);
+// console.log(divDescription.childNodes);
+// console.log(divDescription.length);
+// console.log(selectedParentElement);
+// console.log(selectedParentElement.childNodes);
+// console.log(selectedParentElement.lastChild);
+// console.log(selectedParentElement.lastChild.length);
+
+                  r = selection.getRangeAt(0);
+// console.log(r);
+// console.log(r.startContainer);
+// console.log(r.startOffset);
+// console.log(r.endOffset);
+                  //Remaining nodes
+                  var r = document.createRange();
+                  r.setStart(selection.focusNode, selection.focusOffset);
+                  r.setEnd(selectedParentElement.lastChild, selectedParentElement.lastChild.length);
+// console.log(r.commonAncestorContainer.nodeType);
+
+// console.log(r.startContainer);
+// console.log(r.endContainer);
+// console.log(selection.anchorNode);
+// selection.removeAllRanges(); //XXX: is this doing anything?
+// selection.addRange(r);
+
+// console.log(selection.anchorNode);
+                  var fragment = r.extractContents();
+// console.log(fragment);
+// console.log(selection);
+// console.log(r);
+// console.log(r.startContainer);
+// console.log(r.startOffset);
+// console.log(r.endOffset);
+                  if (fragment.firstChild.nodeType === 3) {
+                    //TODO: trim only if there is one child which is a textnode:  // fragment.firstChild.nodeValue = fragment.firstChild.nodeValue.trim();
+
+// console.log(fragment);
+                    var sPE = selectedParentElement.nodeName.toLowerCase();
+                    switch(sPE) {
+                      case "p": default:
+                        var xSPE = document.createElement(sPE);
+                        xSPE.appendChild(fragment.cloneNode(true));
+                        fragment = fragmentFromString(xSPE.outerHTML);
+                        break;
+                      //TODO: Other cases?
+                    }
+                  }
+// console.log(fragment);
+// console.log(selection);
+
+                  r = selection.getRangeAt(0);
+// console.log(r);
+// console.log(r.startContainer);
+// console.log(r.startOffset);
+// console.log(r.endOffset);
+
+                  //Description
+                  var div = document.createElement('div');
+                  div.setAttribute('property', 'schema:description');
+                  div.appendChild(fragment.cloneNode(true));
+
+                  //Put it together
+                  section.appendChild(heading);
+                  section.appendChild(div);
+// console.log(range.startContainer);
+
+                  var selectionUpdated = document.createElement('div');
+                  selectionUpdated.appendChild(section);
+                  selectionUpdated = selectionUpdated.getHTML();
+// console.log(selectionUpdated);
+
+
+                  //Sub-section
+                  if (cSH-pSH > 0) {
+                    MediumEditor.util.insertHTMLCommand(this.base.selectedDocument, selectionUpdated);
+                  }
+                  else {
+// console.log(selection);
+// console.log(parentSection);
+                    MediumEditor.selection.selectNode(parentSection, document);
+                    r = selection.getRangeAt(0);
+// console.log(r);
+// console.log(r.startOffset);
+// console.log(r.endOffset);
+
+
+                    //This selection is based off previous operations; handling remaining Nodes after the selection. So, this is not accurate per se.. the range might be accurate.
+                    selection = window.getSelection();
+// console.log(selection);
+                    r = selection.getRangeAt(0);
+// console.log(r);
+// console.log(r.startOffset);
+// console.log(r.endOffset);
+
+
+                    r = document.createRange();
+                    r.setStartAfter(parentSection);
+// console.log(r);
+                    r.setEndAfter(parentSection);
+// console.log(r);
+                    r.collapse(true);
+                    selection.removeAllRanges();
+                    selection.addRange(r);
+// console.log(selection);
+                    var foo = document.createElement('div');
+                    foo.appendChild(parentSection);
+                    parentSection = foo.getHTML();
+// console.log(parentSection + selectionUpdated);
+                    MediumEditor.util.insertHTMLCommand(this.base.selectedDocument, parentSection + selectionUpdated);
+                  }
+                }
+
+*/
+
+
+function togglePreCodeWrap(schema) {
+  return (state, dispatch) => {
+    const { nodes } = schema;
+    const { $from } = state.selection;
+    const nodeType = nodes.pre;
+
+    // state.selection -> break it up on newlines
+
+    // iterate over each license
+  
+
+    // wrapIn(code) --> Array
+
+    // return wrapIn(pre)
+    
+    // if ($from.node().type === nodeType) {
+    //   return wrapIn(nodes.p)(state, dispatch);
+    // }
+    // else {
+    //   return wrapIn(nodeType)(state, dispatch);
+    // }
+  };
+}
+
+function findParentList($from, schema) {
+  let parentList = null;
+  let parentListPos = $from.pos;
+  let depth = $from.depth;
+
+  while (depth > 0) {
+    const node = $from.node(depth);
+    if (node.type === schema.nodes.ul || node.type === schema.nodes.ol) {
+      parentList = node;
+      parentListPos = $from.before(depth);
+      break;
+    }
+    depth--;
+  }
+
+  return parentList ? { parentList, parentListPos } : null;
+}
+
+// Switch between paragraph and listTypes: ol, ul
+function toggleList(schema, listType) {
+  return (state, dispatch) => {
+    const { nodes } = schema;
+    const nodeType = nodes[listType];
+    const { $from } = state.selection;
+
+    const grandparent = $from.node(-1);
+
+    if (grandparent && grandparent.type === nodes.li) {
+      const parentListInfo = findParentList($from, schema);
+
+      if (parentListInfo) {
+        const { parentList, parentListPos } = parentListInfo;
+
+        if (parentList.type === nodeType) {
+          return liftListItem(nodes.li)(state, dispatch);
+        } else {
+          return changeListType(state, dispatch, nodeType, parentListPos);
+        }
+      }
+    }
+
+    return wrapInList(nodeType)(state, dispatch);
+  };
+}
+
+function changeListType(state, dispatch, newListType, parentListPos) {
+  const { tr } = state;
+  const { schema } = state;
+
+  tr.setNodeMarkup(parentListPos, newListType);
+
+  if (dispatch) {
+    dispatch(tr);
+  }
+
+  return true;
+}
+
+
+const fileTypes = [
+  "image/apng",
+  "image/bmp",
+  "image/gif",
+  "image/jpeg",
+  "image/pjpeg",
+  "image/png",
+  "image/svg+xml",
+  "image/tiff",
+  "image/webp",
+  "image/x-icon",
+];
+
+function validFileType(file) {
+  return fileTypes.includes(file.type);
+}
+
+async function updateImagePreview(e, input, preview) {
+  while (preview.firstChild) {
+    preview.removeChild(preview.firstChild);
+  }
+
+  const curFiles = input.files;
+
+  if (curFiles.length === 0) {
+    const para = document.createElement("p");
+    para.textContent = "No files currently selected for upload.";
+    preview.appendChild(para);
+  }
+  else {
+    const list = document.createElement("ol");
+    preview.appendChild(list);
+
+    for (const file of curFiles) {
+      const listItem = document.createElement("li");
+      const para = document.createElement("p");
+
+      if (validFileType(file)) {
+        const image = document.createElement("img");
+        image.src = URL.createObjectURL(file);
+        image.alt = image.title = file.name;
+
+        const dimensions = await getImageDimensions(image.src)
+          image.width = dimensions.width;
+          image.height = dimensions.height;
+
+        para.textContent = `
+          File name: ${file.name}.
+          Size: ${returnFileSize(file.size)}.
+          Dimensions: ${image.width}x${image.height}px.`;
+
+        listItem.appendChild(image);
+        listItem.appendChild(para);
+        list.appendChild(listItem);
+      }
+      else {
+        para.textContent = `File name ${file.name}: Not a valid file type. Update your selection.`;
+        listItem.appendChild(para);
+      }
+
+      list.appendChild(listItem);
+    }
+  }
+}
+
+function returnFileSize(number) {
+  if (number < 1e3) {
+    return `${number} bytes`;
+  }
+  else if (number >= 1e3 && number < 1e6) {
+    return `${(number / 1e3).toFixed(1)} KB`;
+  }
+  else {
+    return `${(number / 1e6).toFixed(1)} MB`;
+  }
+}
+
+async function getImageDimensions(blobUrl) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+
+    img.onload = function () {
+      resolve({
+        width: img.naturalWidth,
+        height: img.naturalHeight
+      });
+    };
+
+    img.onerror = function () {
+      reject(new Error('Error loading image'));
+    };
+  
+    img.src = blobUrl;
+  })
+}
+
+//XXX: I don't know what to do with this thing yet - VB
+// Position just after the selection's nearest section/container ancestor (resembles `beforeend`).
+// Walks ancestor depths so it never calls ResolvedPos.before() at the top level (which throws).
+function getClosestSectionNodeEndPos(view) {
+  const $pos = view.state.doc.resolve(view.state.selection.from);
+
+  for (let depth = $pos.depth; depth > 0; depth--) {
+    const node = $pos.node(depth);
+    const name = node.type.name.toLowerCase();
+    if (name === 'section' || ['div', 'article', 'main', 'body'].includes(name)) {
+      return $pos.before(depth) + node.nodeSize;
+    }
+  }
+
+  // No container ancestor (e.g. selection resolves at the top level): append at document end.
+  return view.state.doc.content.size;
+}

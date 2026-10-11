@@ -1,0 +1,8220 @@
+/*!
+Copyright 2012-2026 Sarven Capadisli <https://csarven.ca/>
+Copyright 2023-2026 Virginia Balseiro <https://virginiabalseiro.com/>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+import rdf from 'rdf-ext';
+import LinkHeader from "http-link-header";
+import { i18n } from './i18n.js';
+import { getButtonHTML, updateButtons, setMenuButtonDisabled } from './ui/buttons.js';
+import { addMessageToLog, buildResourceView, copyRelativeResources, createFeedXML, createImmutableResource, createMutableResource, createNoteDataHTML, encryptArticlePayload, getAccessModeOptionsHTML, getBaseURLSelection, getDocument, getFeedFormatSelection, getLanguageOptionsHTML, getLicenseOptionsHTML, getResourceInfo, getSavePayload, isMarkdownTarget, rewriteBaseURL, setCopyToClipboard, setDocumentRelation, showActionMessage, showRobustLinksDecoration, showTimeMap, updateMutableResource, buildReferences, getDocumentConceptDefinitionsHTML, insertDocumentLevelHTML, insertTestCoverageToTable, diffRequirements, removeReferences, getStorageSelfDescription, getContactInformation, getPersistencePolicy, getODRLPolicies, updateResourceInfos, updateSupplementalInfo, initCurrentStylesheet, setDate, showFragment, initCopyToClipboard, setDocumentURL, getAgentHTML, getAnnotationInboxLocationHTML } from './doc.js';
+import { removeNodesWithIds, createHTML, getFormValues } from './utils/html.js';
+import { createAnnotation } from '@dokieli/web-annotation';
+import { accessModeAllowed, accessModePossiblyAllowed, isPublicRead } from './access.js';
+import { encryptContent } from './crypto.js';
+import { setupIconToggleTitles, syncNotifyInboxDefault } from './editor/toolbar/toolbar.js';
+import { requestOriginConsent } from './consent.js';
+import { domSanitize, sanitizeInsertAdjacentHTML, sanitizeIRI, sanitizeObject, htmlEncode, sanitizeIRIs } from './utils/sanitization.js';
+import { escapeRDFLiteral, generateAttributeId, getDefaultDocumentBasename } from './util.js';
+import { setAcceptRDFTypes } from './fetcher.js';
+import { forceTrailingSlash, generateDataURI, getBaseURL, isHttpOrHttpsProtocol, isFileProtocol, stripFragmentFromString, getFragmentFromString, getURLLastPath, currentLocation, getUrlParams } from './uri.js';
+import { getAgentInbox, getAgentName, getGraphAuthors, getGraphContributors, getGraphEditors, getGraphImage, getGraphLabelOrIRI, getGraphPerformers, getGraphTypes, getLinkRelation, getLinkRelationFromHead, getResourceGraph, getUserContacts, getUserLabelOrIRI, serializeData, getSubjectInfo, getRDFSerializer, getGraphCreators } from './graph.js';
+import { agentsWithMode, hasControl, planGrant, planOwnerControl, planRevoke, Public } from '@dokieli/web-access-control';
+import { applyACLPlan, cachedACLContext, expandAccessMode, getACLContext, setPublicRead } from './wac.js';
+import { notifyInbox, sendNotifications, showContactsActivities, initializeNotifications, registerEncryptionUnlockHandler, processPendingEncryptedNotes, clearPendingEncryptedQueues } from './activity.js';
+import Config from './config.js';
+const ns = Config.ns;
+import { Icon } from './ui/icons.js';
+import { updateDeviceStorageProfile, getDeviceStorageItem, clearMessageLog } from './storage.js';
+import { enableAutoSave, disableAutoSave, enableRemoteSync, disableRemoteSync, showResourceReviewChanges, autoSave, markLocalSnapshotPublished } from './sync.js';
+import { formatHTMLString } from './utils/normalization.js';
+import { showVisualisationGraph } from './viz.js';
+import { exportAsDocument, maybeAskPreferredLanguage, updateUILanguage } from './actions.js';
+import { parseMarkdown, htmlToMarkdown, fragmentFromString, removeSelectorFromNode, selectArticleNode, getNodeWithoutClasses } from "./utils/html.js";
+import { showUserSigninSignout } from './auth.js';
+import { renderMenuTabs, initMenuTabsEvents, renderDocumentDo, renderDocumentTools, renderDocumentViews, renderDocumentTheme, renderLanguageSelector, renderAutoSave, renderAboutDokieli, renderWebServicesConsent } from './ui/menu.js';
+import { initSlideshow } from './init.js';
+import { initCV } from './ui/templates/cv.js';
+import { initSpecification } from './ui/templates/specification.js';
+import { initQuestionnaire } from './ui/templates/questionnaire.js';
+import * as Slideshow from './ui/templates/slideshow.js';
+import { lazyImport } from './utils/lazy.js';
+import { csvStringToJson, jsonToHtmlTableString } from './csv.js';
+import { restoreYjsContent, addYjsVersion, getYjsVersions, getYjsVersionsFromIDB, getCurrentVersionKey, onYjsVersionsChanged } from "./editor/editor.js";
+import { rewriteBlobImagesToRelative, uploadBlobAssets, clearBlobAssets, hasUploadTarget, resolveAuthenticatedImages } from "./editor/utils/imageAssets.js";
+import { createKeystore, unlockKeystore, isUnlocked, getSessionKid, getSessionPublicKey, hasKeystore, publishPublicKeyToProfile, getAgentEncryptionKey, exportKeyDocument, exportKeyDocuments, exportKeyPair, importKeyDocuments, importPrivateKeyPEM, verifyPassphrase, hasAnyKeys, listKeys, KEY_AGREEMENT, ASSERTION } from './keystore.js';
+
+const versionItemCache = new Map();
+let editHistoryAside = null;
+let unobserveEditHistory = () => {};
+let lastRestoredKey = null;
+window.addEventListener('dokieli:version-restored', (e) => { lastRestoredKey = e.detail?.key ?? null; });
+window.addEventListener('dokieli:editor-mode-changed', () => updateSlideshowControls());
+
+let signingSetupOpening = false;
+let documentDoClickInitialized = false;
+let documentMenuClickInitialized = false;
+let autoSaveChangeInitialized = false;
+
+export function initDocumentMenu(options = {}) {
+  if (Config.HideInPageMenu) return;
+
+  options = { loading: true, ...options };
+
+  const loadingState = `
+  <button aria-disabled="true" class="show do-menu do-loading"  title="Loading…" aria-label="Loading…">
+    <svg aria-hidden="true" viewBox="0 0 448 512" xmlns="http://www.w3.org/2000/svg">
+      <rect x="0" y="60" width="448" height="72" rx="16" />
+      <rect x="0" y="220" width="448" height="72" rx="16" />
+      <rect x="0" y="380" width="448" height="72" rx="16" />
+    </svg>
+  </button>
+  `;
+
+  const menuButton = options.loading ? loadingState : Config.Button.Menu.OpenMenu;
+
+  document.body.prepend(fragmentFromString(`<div class="do" id="document-menu" dir="${Config.User.UI.LanguageDir}" lang="${Config.User.UI.Language}" xml:lang="${Config.User.UI.Language}">${menuButton}<div><section id="user-info"></section></div></div>`));
+
+  const menuNode = document.getElementById('document-menu');
+
+  let docReady = false;
+  let authReady = false;
+
+  function enableMenu() {
+    if (docReady && authReady) {
+      menuNode.setHTMLUnsafe(domSanitize(`${Config.Button.Menu.OpenMenu}<div><section id="user-info"></section></div>`));
+    }
+  }
+
+  document.addEventListener('dokieli:ready', () => {
+    docReady = true;
+    enableMenu();
+    handleEntryRoutes();
+    handleFileLaunch();
+  }, { once: true });
+
+  document.addEventListener('dokieli:auth-ready', () => {
+    authReady = true;
+    enableMenu();
+  }, { once: true });
+  
+  if (documentMenuClickInitialized) return;
+  documentMenuClickInitialized = true;
+
+  document.addEventListener('click', (e) => {
+    var button = e.target.closest('button');
+    if (button?.closest('.do-menu')) {
+      if (button.classList.contains('show') && !button.classList.contains('do-loading')) {
+        showDocumentMenu(e);
+      }
+      else if (button?.classList.contains('hide')) {
+        hideDocumentMenu(e);
+      }
+    }
+  });
+  
+}
+
+// App shortcut and share_target entry points. Reads the URL fragment first, then the query
+// (e.g. /?notifications and share_target's ?url=/?text=), matching getUrlParams' precedence.
+// open=<url> resource opening is owned by initDocumentMode, so only a bare open (dialog) is routed here.
+function handleEntryRoutes() {
+  const params = new URLSearchParams(window.location.search);
+  const routeKeys = ['open', 'notifications', 'url', 'text', 'title'];
+
+  const wantsNotifications = getUrlParams('notifications').length > 0;
+  const wantsOpenDialog = params.has('open') && !params.get('open');
+  const sharedText = params.get('text') || '';
+  const sharedURL = params.get('url') || sharedText.match(/https?:\/\/\S+/)?.[0];
+
+  // open=<url> is handled by initDocumentMode; leave it and its #open= state untouched to avoid a second open
+  if (!wantsNotifications && !wantsOpenDialog && !sharedURL) return;
+
+  routeKeys.forEach(k => params.delete(k));
+  const query = params.toString();
+  // Drops the fragment too, clearing a #notifications trigger so a reload does not re-fire it
+  history.replaceState(null, '', window.location.pathname + (query ? '?' + query : ''));
+
+  if (wantsNotifications) {
+    showNotifications();
+    return;
+  }
+
+  if (sharedURL) {
+    try {
+      const u = new URL(sharedURL);
+      if (u.protocol === 'http:' || u.protocol === 'https:') {
+        openResource(u.href);
+        return;
+      }
+    } catch {}
+  }
+
+  if (wantsOpenDialog) {
+    openDocument();
+  }
+}
+
+export function showDocumentMenu(e) {
+  if (e) {
+    e.preventDefault();
+    e.stopPropagation();
+  }
+
+  var dMenu = document.querySelector('#document-menu.do');
+
+  if (!dMenu) {
+    initDocumentMenu();
+    showDocumentMenu();
+    return;
+  }
+
+  var dMenuButton = dMenu.querySelector('button');
+  var dUserInfo = dMenu.querySelector('#user-info');
+  var dInfo = dMenu.querySelector('div');
+
+  dMenuButton.parentNode.replaceChild(fragmentFromString(Config.Button.Menu.CloseMenu), dMenuButton);
+  dMenu.classList.add('on');
+
+  showUserSigninSignout(dUserInfo);
+  ensureMenuTabs(dInfo);
+
+  const tabActions = dInfo.querySelector('#menu-actions');
+  const tabTools = dInfo.querySelector('#menu-tools');
+  const tabSettings = dInfo.querySelector('#menu-settings');
+
+  showDocumentDo(tabActions);
+  showDocumentTools(tabTools);
+  showViews(tabTools);
+  showLanguages(tabSettings);
+  showAutoSave(tabSettings);
+  showWebServicesConsent(tabSettings);
+  showKeysSettings(tabSettings);
+  showInstallApp(tabSettings);
+  showAboutDokieli(dInfo);
+
+  // var body = getDocumentContentNode(document);
+
+  var options = { 'reuse': true };
+  if (document.location.protocol.startsWith('http')) {
+    options['followLinkRelationTypes'] = ['describedby'];
+  }
+
+  const hasResourceInfo = Config.DocumentURL in Config.Resource && 'state' in Config.Resource[Config.DocumentURL];
+  updateResourceInfos(Config.DocumentURL, null, null, { ...options, skipRDFParse: hasResourceInfo });
+}
+
+export function hideDocumentMenu(e) {
+  // document.removeEventListener('click', eventLeaveDocumentMenu);
+
+  var dMenu = document.querySelector('#document-menu.do');
+  if (!dMenu) return;
+  var dMenuButton = dMenu.querySelector('button');
+  if (dMenuButton) {
+    dMenuButton.parentNode.replaceChild(fragmentFromString(Config.Button.Menu.OpenMenu), dMenuButton);
+  }
+
+  dMenu.classList.remove('on');
+  // var sections = dMenu.querySelectorAll('section');
+  // for (var i = 0; i < sections.length; i++) {
+  //   if(sections[i].id != 'user-info' && !sections[i].querySelector('button.signin-user')) {
+  //     sections[i].parentNode.removeChild(sections[i]);
+  //   }
+  // };
+  // var buttonSigninUser = dMenu.querySelector('button.signin-user');
+  // if(buttonSigninUser) {
+  //   dMenu.querySelector('button.signin-user').disabled = false;
+  // }
+
+  // Re-enable menu buttons whose dialogs are torn down below
+  dMenu.querySelectorAll('button[disabled]').forEach(b => { b.disabled = false; });
+  removeNodesWithIds(Config.DocumentDoItems);
+}
+
+export function eventEscapeDocumentMenu(e) {
+  if (e.keyCode == 27) { // Escape
+    hideDocumentMenu(e);
+  }
+}
+
+export function eventLeaveDocumentMenu(e) {
+  if (!e.target.closest('.do.on')) {
+    hideDocumentMenu(e);
+  }
+}
+
+function showWebServicesConsent(node) {
+  if (document.getElementById('web-services-consent')) { return; }
+
+  sanitizeInsertAdjacentHTML(node, 'beforeend', renderWebServicesConsent());
+}
+
+function ensureMenuTabs(node) {
+  if (node.querySelector('#document-menu-tabs')) { return; }
+
+  sanitizeInsertAdjacentHTML(node, 'beforeend', renderMenuTabs());
+
+  initMenuTabsEvents(node.querySelector('#document-menu-tabs'));
+}
+
+function showLanguages(node) {
+  if (document.getElementById('ui-language')) {
+    return;
+  }
+
+  sanitizeInsertAdjacentHTML(node, 'afterbegin', renderLanguageSelector());
+
+  document.addEventListener('change', (e) => {
+    const select = e.target.closest('#ui-language-select');
+    if (!select) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    updateUILanguage(select.value);
+    maybeAskPreferredLanguage(select.value);
+  });
+}
+
+export async function showAutoSave(node) {
+  if (document.getElementById('document-autosave')) { return; }
+
+  const storageObject = await getDeviceStorageItem(Config.DocumentURL);
+
+  if (document.getElementById('document-autosave')) { return; }
+
+  const hasAccessModeWrite = accessModePossiblyAllowed(Config.DocumentURL, 'write');
+  const disabled = Config.DocumentURL.startsWith('blob:');
+  let checked = !disabled;
+
+  if (storageObject?.autoSave !== undefined) {
+    checked = storageObject.autoSave;
+  }
+
+  checked = checked && hasAccessModeWrite;
+
+  sanitizeInsertAdjacentHTML(node, 'beforeend', renderAutoSave({ checked, disabled }));
+
+  if (disabled) {
+    return;
+  }
+
+  if (autoSaveChangeInitialized) return;
+  autoSaveChangeInitialized = true;
+
+  document.addEventListener('change', async (e) => {
+    if (e.target.matches('#autosave-remote')) {
+      if (e.target.checked) {
+        await enableRemoteSync();
+      }
+      else {
+        await disableRemoteSync();
+      }
+    }
+  });
+}
+
+// With a kid only that key is written, so setting up a new key backs up just the key it created
+async function downloadKeyBackup(kid) {
+  const docs = kid ? [await exportKeyDocument(kid)] : await exportKeyDocuments();
+  const data = docs.length === 1 ? docs[0] : docs;
+  const filename = docs.length === 1 ? encodeURIComponent(docs[0].publicKeyJwk.kid) + '.json' : 'dokieli-keys-all.json';
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/ld+json' });
+  downloadBlobAsFile(blob, filename);
+  return docs.length;
+}
+
+function setKeyMessage(node, icon, text) {
+  node.setHTMLUnsafe(domSanitize(Icon[icon] + ' ' + text));
+}
+
+function appendKeyLocation(info, keyConfig) {
+  if (keyConfig.KeystoreURL && !keyConfig.StorageSyncFailed) {
+    sanitizeInsertAdjacentHTML(info, 'beforeend',
+      `<p data-i18n="encryption-setup.saved-at">${i18n.t('encryption-setup.saved-at.textContent')} <a href="${keyConfig.KeystoreURL}" rel="noopener" target="_blank">${keyConfig.KeystoreURL}</a></p>`);
+  }
+  else if (!keyConfig.KeystoreURL) {
+    sanitizeInsertAdjacentHTML(info, 'beforeend',
+      `<p data-i18n="encryption-setup.saved-locally">${i18n.t('encryption-setup.saved-locally.textContent')}</p>`);
+  }
+}
+
+// On success the prompt to download is spent, so it gives way to the outcome
+async function runKeyDownload(info, button, kid) {
+  const status = document.createElement('p');
+  try {
+    await downloadKeyBackup(kid);
+    status.setAttribute('class', 'success');
+    status.textContent = i18n.t('menu.encryption.download-ready.textContent');
+    info.querySelector('p[data-i18n="encryption-setup.download-description"]')?.remove();
+  }
+  catch (err) {
+    status.setAttribute('class', 'error');
+    status.textContent = i18n.t('menu.encryption.download-failed.textContent') + ' ' + err.message;
+  }
+  button.parentNode.replaceWith(status);
+}
+
+function setKeyStatus(node, text, kind = 'success') {
+  const p = document.createElement('p');
+  p.setAttribute('class', kind);
+  p.textContent = text;
+  node.replaceChildren(p);
+  return p;
+}
+
+// Shown wherever keys are expected but missing, so a downloaded file is a way back
+function appendKeyImportOffer(node) {
+  if (node.querySelector('button.open-key-import')) return;
+  sanitizeInsertAdjacentHTML(node, 'beforeend',
+    `<p><button class="open-key-import" data-i18n="key-import.open-button" type="button">${i18n.t('key-import.open-button.textContent')}</button></p>`);
+  node.querySelector('button.open-key-import').addEventListener('click', () => showKeyImport());
+}
+
+function reportKeyError(node, messageKey, error) {
+  console.warn('dokieli: key operation failed', error);
+  // Missing keys are recoverable, so warn rather than error
+  setKeyStatus(node, i18n.t(messageKey) + ' ' + error.message, error.code === 'no-keys' ? 'warning' : 'error');
+  if (error.code === 'no-keys') appendKeyImportOffer(node);
+}
+
+function showInstallApp(node) {
+  document.getElementById('install-app')?.remove();
+  if (!Config.InstallPrompt) return;
+
+  const html = `
+  <section aria-labelledby="install-app-label" id="install-app">
+    <h2 data-i18n="menu.install-app.h2" id="install-app-label">${i18n.t('menu.install-app.h2.textContent')}</h2>
+    <p data-i18n="menu.install-app.description">${i18n.t('menu.install-app.description.textContent')}</p>
+    ${getButtonHTML({ key: "menu.install-app.button", button: "download", buttonClass: "install-app" })}
+  </section>
+  `;
+
+  sanitizeInsertAdjacentHTML(node, 'beforeend', html);
+
+  node.querySelector('button.install-app').addEventListener('click', async () => {
+    const prompt = Config.InstallPrompt;
+    if (!prompt) return;
+    prompt.prompt();
+    await prompt.userChoice;
+    Config.InstallPrompt = null;
+    document.getElementById('install-app')?.remove();
+  });
+}
+
+function showKeysSettings(node) {
+  if (document.getElementById('document-keys')) { return; }
+
+  const html = `
+  <section aria-labelledby="document-keys-label" id="document-keys" rel="schema:hasPart" resource="#document-keys">
+    <h2 data-i18n="menu.keys.h2" id="document-keys-label" property="schema:name">${i18n.t('menu.keys.h2.textContent')}</h2>
+    <p data-i18n="menu.keys.description">${i18n.t('menu.keys.description.textContent')}</p>
+    <div id="document-keys-encryption">
+      <h3 data-i18n="menu.keys.encryption.h3">${i18n.t('menu.keys.encryption.h3.textContent')}</h3>
+      <p data-i18n="menu.keys.encryption.description">${i18n.t('menu.keys.encryption.description.textContent')}</p>
+      ${getButtonHTML({ key: "menu.encryption.setup-button", button: "lock-open", buttonClass: "setup-encryption-keys" })}
+      <span class="response-message"></span>
+    </div>
+    <div id="document-keys-signing">
+      <h3 data-i18n="menu.keys.signing.h3">${i18n.t('menu.keys.signing.h3.textContent')}</h3>
+      <p data-i18n="menu.keys.signing.description">${i18n.t('menu.keys.signing.description.textContent')}</p>
+      ${getButtonHTML({ key: "menu.signing.setup-button", button: "lock-open", buttonClass: "setup-signing-keys" })}
+      <span class="response-message"></span>
+    </div>
+    <div id="document-keys-actions">
+      ${getButtonHTML({ key: "menu.keys.download-button", button: "download", buttonClass: "download-keys" })}
+      ${getButtonHTML({ key: "menu.keys.import-button", button: "upload", buttonClass: "import-keys" })}
+    </div>
+  </section>
+  `;
+
+  sanitizeInsertAdjacentHTML(node, 'beforeend', html);
+
+  const keysSection = node.querySelector('#document-keys');
+
+  keysSection.querySelector('button.download-keys').addEventListener('click', () => showKeyExport());
+  keysSection.querySelector('button.import-keys').addEventListener('click', () => showKeyImport());
+
+  // The button says what is actually available: set up, unlock, or nothing left to do
+  const refreshKeyButton = async (purpose, sectionId, buttonClass) => {
+    const section = keysSection.querySelector(sectionId);
+    const button = section.querySelector(buttonClass);
+    const label = button.querySelector('span');
+    if (!label) return;
+
+    if (isUnlocked(purpose)) {
+      label.textContent = i18n.t(purpose === ASSERTION ? 'menu.signing.ready-button.textContent' : 'menu.encryption.ready-button.textContent');
+      button.disabled = true;
+      return;
+    }
+    if (await hasKeystore(purpose)) {
+      label.textContent = i18n.t('menu.keys.unlock-button.textContent');
+    }
+  };
+
+  refreshKeyButton(KEY_AGREEMENT, '#document-keys-encryption', 'button.setup-encryption-keys')
+    .catch(e => console.warn('dokieli: could not read encryption key state', e));
+  refreshKeyButton(ASSERTION, '#document-keys-signing', 'button.setup-signing-keys')
+    .catch(e => console.warn('dokieli: could not read signing key state', e));
+
+  keysSection.querySelector('button.setup-encryption-keys').addEventListener('click', async () => {
+    const message = keysSection.querySelector('#document-keys-encryption .response-message');
+
+    if (isUnlocked()) {
+      try {
+        await publishPublicKeyToProfile();
+      }
+      catch (err) {
+        console.warn('dokieli: public key profile publication failed; encryption still works locally', err);
+      }
+      const key = Config.Session?.isActive ? 'menu.encryption.ready.textContent' : 'menu.encryption.ready-signin.textContent';
+      message.setHTMLUnsafe(domSanitize(Icon[".fas.fa-check-circle.fa-fw"] + ' ' + i18n.t(key)));
+      return;
+    }
+
+    const exists = await hasKeystore();
+    exists ? showEncryptionUnlock() : showEncryptionSetup();
+  });
+
+  keysSection.querySelector('button.setup-signing-keys').addEventListener('click', async () => {
+    const message = keysSection.querySelector('#document-keys-signing .response-message');
+
+    if (isUnlocked(ASSERTION)) {
+      try {
+        await publishPublicKeyToProfile(ASSERTION);
+      }
+      catch (err) {
+        console.warn('dokieli: signing key profile publication failed; signing still works locally', err);
+      }
+      const key = Config.Session?.isActive ? 'menu.signing.ready.textContent' : 'menu.signing.ready-signin.textContent';
+      message.setHTMLUnsafe(domSanitize(Icon[".fas.fa-check-circle.fa-fw"] + ' ' + i18n.t(key)));
+      return;
+    }
+
+    // Unlock covers every purpose at once
+    if (await hasKeystore(ASSERTION)) {
+      showEncryptionUnlock();
+      return;
+    }
+
+    showSigningSetup();
+  });
+}
+
+function showDocumentTools(node) {
+  if (document.getElementById('document-tools')) { return; }
+
+  sanitizeInsertAdjacentHTML(node, 'beforeend', renderDocumentTools());
+}
+
+function refreshEncryptToggle() {
+  const value = Config.User?.Keys?.Encryption?.DocumentEncrypt;
+  const button = document.querySelector('#document-menu button.encrypt-enable, #document-menu button.encrypt-disable');
+  if (!button?.parentNode) return;
+  const expectedClass = value ? 'encrypt-disable' : 'encrypt-enable';
+  if (!button.classList.contains(expectedClass)) {
+    button.outerHTML = value ? Config.Button.Menu.EncryptDisable : Config.Button.Menu.EncryptEnable;
+  }
+  updateButtons(['#document-menu .encrypt-enable', '#document-menu .encrypt-disable']);
+}
+
+function showDocumentDo(node) {
+  if (document.getElementById('document-do')) { refreshEncryptToggle(); return; }
+
+  sanitizeInsertAdjacentHTML(node, 'beforeend', renderDocumentDo());
+
+  initDocumentDoEvents();
+}
+
+export function initDocumentDoEvents() {
+  if (documentDoClickInitialized) return;
+  documentDoClickInitialized = true;
+
+  document.addEventListener('click', e => {
+    if (e.target.closest('.resource-share')) {
+      shareResource(e);
+    }
+
+    if (e.target.closest('.resource-permissions')) {
+      showResourcePermissions(e);
+    }
+
+    if (e.target.closest('.resource-reply')) {
+      replyToResource(e);
+    }
+
+    var b;
+
+    b = e.target.closest('button.editor-disable');
+
+    if (b && b.isConnected) {
+      b.outerHTML = Config.Button.Menu.EditEnable;
+      hideDocumentMenu();
+      Config.Editor.toggleEditor('social');
+
+      disableAutoSave(Config.DocumentURL, {'method': 'IndexedDB', saveSnapshot: true });
+    }
+    else {
+      b = e.target.closest('button.editor-enable');
+      if (b && b.isConnected) {
+        b.outerHTML = Config.Button.Menu.EditDisable;
+        hideDocumentMenu();
+        Config.Editor.toggleEditor('author');
+
+        enableAutoSave(Config.DocumentURL, {'method': 'IndexedDB'});
+      }
+    }
+
+    const setDocumentEncrypt = async (value) => {
+      Config.User.Keys.Encryption.DocumentEncrypt = value;
+      refreshEncryptToggle();
+      if (value) {
+        await ensureEncryptedDocumentACL().catch(e => console.warn('dokieli: could not restrict access on encrypted document', e));
+      }
+
+      // The stored copy should match the toggle, so write it now rather than waiting for a save
+      const documentURL = Config.DocumentURL;
+      if (navigator.onLine && Config.DocumentAction !== 'new' && isHttpOrHttpsProtocol(documentURL) && accessModePossiblyAllowed(documentURL, 'write')) {
+        try {
+          await updateMutableResource(documentURL);
+          await markLocalSnapshotPublished(documentURL);
+        }
+        catch (e) {
+          // The toggle was optimistic; the stored copy is still the other way
+          console.warn('dokieli: could not save the document after changing encryption', e);
+          Config.User.Keys.Encryption.DocumentEncrypt = !value;
+          refreshEncryptToggle();
+        }
+      }
+    };
+
+    b = e.target.closest('button.encrypt-enable');
+    if (b && b.isConnected) {
+      if (isUnlocked()) {
+        setDocumentEncrypt(true);
+      }
+      else {
+        hasKeystore().then(exists => {
+          exists
+            ? showEncryptionUnlock(() => setDocumentEncrypt(true))
+            : showEncryptionSetup(() => setDocumentEncrypt(true));
+        });
+      }
+    }
+    else {
+      b = e.target.closest('button.encrypt-disable');
+      if (b && b.isConnected) {
+        setDocumentEncrypt(false);
+      }
+    }
+
+    if (e.target.closest('.resource-notifications')) {
+      showNotifications(e);
+    }
+
+    if (e.target.closest('.resource-new')) {
+      showNewDocument(e);
+    }
+
+    if (e.target.closest('.resource-new-slide')) {
+      addSlide(e);
+    }
+
+    if (e.target.closest('.resource-open')) {
+      openDocument(e);
+    }
+
+    if (e.target.closest('.resource-source')) {
+      viewSource(e);
+    }
+
+    if (e.target.closest('.resource-native-style')) {
+      initCurrentStylesheet({ target: { textContent: '' } });
+    }
+
+    if (e.target.closest('.resource-edit-custom-style')) {
+      editCustomStylesheet(e);
+    }
+
+    const stylesheetBtn = e.target.closest('#document-views button:not([class~="resource-visualise"]):not([class~="resource-edit-custom-style"]):not([class~="resource-native-style"])');
+    if (stylesheetBtn) {
+      initCurrentStylesheet(e);
+    }
+
+    if (e.target.closest('.resource-markdown')) {
+      toggleMarkdownMode(e);
+    }
+
+    if (e.target.closest('.embed-data-meta')) {
+      showEmbedData(e);
+    }
+
+    if (e.target.closest('.resource-save')){
+      exitSingleBeforeSerialize();
+      resourceSave(e);
+    }
+
+    if (e.target.closest('.resource-save-as')) {
+      exitSingleBeforeSerialize();
+      saveAsDocument(e);
+    }
+
+    if (e.target.closest('.resource-memento')) {
+      mementoDocument(e);
+    }
+
+    if (e.target.closest('.create-version') ||
+        e.target.closest('.create-immutable')) {
+      exitSingleBeforeSerialize();
+      resourceSave(e);
+    }
+
+    if (e.target.closest('.edit-history')) {
+      showEditHistory();
+    }
+
+    if (e.target.closest('.export-as-html')) {
+      exitSingleBeforeSerialize();
+
+      const documentOptions = {
+        ...Config.DOMProcessing,
+        format: true,
+        sanitize: true,
+        normalize: true
+      };
+
+      var options = {
+        subjectURI: Config.DocumentURL,
+        mediaType: 'text/html',
+        filenameExtension: '.html'
+      }
+      exportAsDocument(getDocument(null, documentOptions), options);
+    }
+
+    if (e.target.closest('.robustify-links')){
+      showRobustLinks(e);
+    }
+
+    if (e.target.closest('.snapshot-internet-archive')){
+      // snapshotAtEndpoint(e, Config.DocumentURL, 'https://pragma.archivelab.org/', '', {'contentType': 'application/json'});
+      snapshotAtEndpoint(e, Config.DocumentURL, 'https://web.archive.org/save/', '', {'Accept': '*/*', 'showActionMessage': true });
+    }
+
+    if (e.target.closest('.generate-feed')) {
+      generateFeed(e);
+    }
+
+    if (e.target.closest('.resource-print')) {
+      exitSingleBeforeSerialize();
+      window.print();
+      return false;
+    }
+
+    if (e.target.closest('.resource-delete')){
+      resourceDelete(e, Config.DocumentURL);
+    }
+
+    if (e.target.closest('.message-log')) {
+      showMessageLog(e);
+    }
+
+    if (e.target.closest('.document-info')) {
+      showDocumentInfo(e);
+    }
+  });
+}
+
+export function showViews(node) {
+  if(document.querySelector('#document-views')) { return; }
+
+  const stylesheets = Array.from(document.querySelectorAll('head link[rel~="stylesheet"][title]:not([href$="dokieli.css"])'))
+    .map(link => ({ view: link.getAttribute('title'), alternate: !!link.closest('[rel~="alternate"]') }));
+
+  sanitizeInsertAdjacentHTML(node, 'beforeend', renderDocumentViews({ stylesheets }) + renderDocumentTheme());
+
+  // var viewButtons = document.querySelectorAll('#document-views button:not([class~="resource-visualise"])');
+  // for (let i = 0; i < viewButtons.length; i++) {
+  //   viewButtons[i].removeEventListener('click', initCurrentStylesheet);
+  //   viewButtons[i].addEventListener('click', initCurrentStylesheet);
+  // }
+
+  if(Config.GraphViewerAvailable) {
+    document.addEventListener('click', (e) => {
+      const button = e.target.closest('.resource-visualise');
+
+      if (button) {
+        if(document.querySelector('#graph-view')) { return; }
+
+        button.disabled = true;
+
+        var buttonClose = getButtonHTML({ key: 'dialog.graph-view.close.button', button: 'close', buttonClass: 'close', iconSize: 'fa-2x' });
+
+        document.body.appendChild(fragmentFromString(`
+          <aside aria-labelledby="graph-view-label" class="do on" dir="${Config.User.UI.LanguageDir}" id="graph-view" lang="${Config.User.UI.Language}" rel="schema:hasPart" resource="#graph-view" xml:lang="${Config.User.UI.Language}">
+            <h2 data-i18n="dialog.graph-view.h2" id="graph-view-label" property="schema:name">${i18n.t('dialog.graph-view.h2.textContent')} ${Config.Button.Info.GraphView}</h2>
+            ${buttonClose}
+            <div class="info"></div>
+            <div id="viz-tooltip"></div>
+          </aside>
+        `));
+
+        showVisualisationGraph(Config.DocumentURL, undefined, '#graph-view');
+      }
+    });
+
+    document.addEventListener('click', (e) => {
+      const button = e.target.closest('#graph-view button.close');
+      if (button) {
+        var rv = document.querySelector('#document-views .resource-visualise');
+        if (rv) {
+          rv.disabled = false;
+        }
+      }
+    });
+  }
+}
+
+
+function showAboutDokieli(node) {
+  if (document.querySelector('#about-dokieli')) { return; }
+
+  sanitizeInsertAdjacentHTML(node, 'beforeend', renderAboutDokieli());
+}
+
+export function showNotifications() {
+  hideDocumentMenu();
+
+  var aside = document.getElementById('document-notifications');
+
+  if(!aside) {
+    aside = initializeNotifications();
+  }
+  aside.classList.add('on');
+
+  registerEncryptionUnlockHandler(async () => {
+    if (!document.getElementById('encryption-unlock') && await hasKeystore()) {
+      showEncryptionUnlock();
+    }
+  });
+
+  showContactsActivities();
+}
+
+// currentLocation() drops the fragment that carries an opened document's URL
+export function showResourcePermissions(listenerEvent, iri) {
+  if (document.querySelector('#resource-permissions.do.on')) { return; }
+
+  iri = iri || Config.DocumentURL || currentLocation();
+  const documentURL = stripFragmentFromString(iri);
+
+  var buttonClose = getButtonHTML({ key: 'dialog.resource-permissions.close.button', button: 'close', buttonClass: 'close', iconSize: 'fa-2x' });
+
+  var permissionsHTML = `
+    <aside aria-labelledby="resource-permissions-label" class="do on" dir="${Config.User.UI.LanguageDir}" id="resource-permissions" lang="${Config.User.UI.Language}" xml:lang="${Config.User.UI.Language}">
+      <h2 data-i18n="dialog.resource-permissions.h2" id="resource-permissions-label" property="schema:name">${i18n.t('dialog.resource-permissions.h2.textContent')}</h2>
+
+      ${buttonClose}
+
+      <div class="info"></div>
+    </aside>
+  `;
+
+  document.body.appendChild(fragmentFromString(permissionsHTML));
+
+  var button = listenerEvent.target.closest('button');
+  if (button) {
+    button.disabled = true;
+  }
+
+  document.querySelector('#resource-permissions button.close').addEventListener('click', () => {
+    document.getElementById('resource-permissions').remove();
+    if (button) {
+      button.disabled = false;
+    }
+  });
+
+  var hasAccessModeControl = accessModeAllowed(documentURL, 'control');
+  if (hasAccessModeControl) {
+    var info = document.querySelector('#resource-permissions > .info');
+
+    var shareResourcePermissions = `
+      <div id="share-resource-permissions" rel="schema:hasPart" resource="#share-resource-permissions">
+        <span class="progress" data-i18n="dialog.share-resource-permissions.progress">${Icon[".fas.fa-circle-notch.fa-spin.fa-fw"]} ${i18n.t('dialog.share-resource-permissions.progress.textContent')}</span>
+
+        <ul class="permissions">
+        </ul>
+
+        <div class="autocomplete">
+          <label data-i18n="dialog.share-resource-search-contacts.label" for="share-resource-search-contacts">${i18n.t('dialog.share-resource-search-contacts.label.textContent')}</label>
+          <input data-i18n="dialog.share-resource-search-contacts.input" id="share-resource-search-contacts" name="share-resource-search-contacts" placeholder="${i18n.t('dialog.share-resource-search-contacts.input.placeholder')}" type="text" value="" />
+          <ul class="suggestions">
+          </ul>
+        </div>
+
+        <button data-i18n="dialog.resource-permissions.update.button" disabled="disabled" id="resource-permissions-update" type="button">${i18n.t('dialog.resource-permissions.update.button.textContent')}</button>
+
+        <div class="response-message"></div>
+      </div>`;
+    sanitizeInsertAdjacentHTML(info, 'afterend', shareResourcePermissions);
+
+    var accessPermissionsNode = document.getElementById('share-resource-permissions');
+    var accessPermissionFetchingIndicator = accessPermissionsNode.querySelector('.progress');
+
+    getACLContext(documentURL)
+      .catch(e => {
+        accessPermissionsNode.removeChild(accessPermissionFetchingIndicator);
+
+        sanitizeInsertAdjacentHTML(info, 'beforeend', '<p class="warning">' + i18n.t(e?.name === 'ACLNotDeterminedError' ? 'dialog.resource-permissions.no-access-control.textContent' : 'dialog.resource-permissions.acl-unavailable.textContent') + ' <code>' + (e?.message || String(e)) + '</code></p>');
+        console.warn('dokieli: cannot read the effective ACL resource for ' + documentURL, e);
+      })
+      .then(ctx => {
+        if (!ctx) { return; }
+
+        accessPermissionsNode.removeChild(accessPermissionFetchingIndicator);
+
+        const subjectsWithAccess = {};
+        ctx.authorizations.forEach(authorization => {
+          ['agent', 'agentClass', 'agentGroup'].forEach(subjectType => {
+            authorization[subjectType].forEach(accessSubject => {
+              if (!isHttpOrHttpsProtocol(accessSubject)) return;
+              subjectsWithAccess[accessSubject] = subjectsWithAccess[accessSubject] || { 'subjectType': subjectType, 'mode': [] };
+              authorization.mode.forEach(mode => {
+                const modeIRI = ns.acl[mode].value;
+                if (!subjectsWithAccess[accessSubject].mode.includes(modeIRI)) {
+                  subjectsWithAccess[accessSubject].mode.push(modeIRI);
+                }
+              });
+            });
+          });
+        });
+
+
+        // Access can change without keys, but not the ciphertext
+        if (Config.User.Keys?.Encryption?.Enabled && Config.User.Keys?.Encryption?.DocumentEncrypt && !isUnlocked()) {
+          sanitizeInsertAdjacentHTML(info, 'beforeend', '<p class="warning">' + i18n.t('dialog.resource-permissions.keys-locked.textContent') + '</p>');
+        }
+
+        // Changes are batched: each costs an ACL write and a re-encryption
+        const pendingModes = new Map();
+        const notifySubjects = new Set();
+        const updateButton = document.getElementById('resource-permissions-update');
+        const responseMessage = accessPermissionsNode.querySelector('.response-message');
+
+        var refreshUpdateButton = function () {
+          const dirty = pendingModes.size > 0 || notifySubjects.size > 0;
+          updateButton.disabled = !dirty;
+        };
+
+        var accessLabel = function (mode) {
+          const name = mode === ns.acl.Control.value ? 'control' : mode === ns.acl.Write.value ? 'write' : mode === ns.acl.Read.value ? 'read' : null;
+          return name
+            ? i18n.t(`dialog.share-resource.select-access-mode.acl-${name}.option.textContent`)
+            : i18n.t('dialog.share-resource.select-access-mode.no-access.option.textContent');
+        };
+
+        var currentModeOf = function (accessSubject) {
+          if (pendingModes.has(accessSubject)) return pendingModes.get(accessSubject);
+          const modes = subjectsWithAccess[accessSubject]?.mode || [];
+          return (modes.includes(ns.acl.Control.value) && ns.acl.Control.value) ||
+            (modes.includes(ns.acl.Write.value) && ns.acl.Write.value) ||
+            (modes.includes(ns.acl.Read.value) && ns.acl.Read.value) || '';
+        };
+
+        // No notify for the owner, groups, or the public
+        var addNotifyToggle = function (li, accessSubject) {
+          if (accessSubject === Config.User.IRI || subjectsWithAccess[accessSubject]?.subjectType !== 'agent') return;
+
+          const id = 'resource-permissions-notify-' + encodeURIComponent(accessSubject);
+          sanitizeInsertAdjacentHTML(li, 'beforeend',
+            `<span class="notify"><input id="${id}" type="checkbox" value="${accessSubject}" /><label data-i18n="dialog.resource-permissions.notify.label" for="${id}">${i18n.t('dialog.resource-permissions.notify.label.textContent')}</label></span>`);
+
+          li.querySelector('[id="' + id + '"]').addEventListener('change', e => {
+            e.target.checked ? notifySubjects.add(accessSubject) : notifySubjects.delete(accessSubject);
+            refreshUpdateButton();
+          });
+        };
+
+        // Read access without a published key still cannot open an encrypted document
+        var markMissingKey = function (li, accessSubject) {
+          if (!(Config.User.Keys?.Encryption?.Enabled && Config.User.Keys?.Encryption?.DocumentEncrypt)) return;
+          if (accessSubject === ns.foaf.Agent.value || subjectsWithAccess[accessSubject]?.subjectType !== 'agent') return;
+
+          getAgentEncryptionKey(accessSubject).then(found => {
+            if (found || !li.isConnected) return;
+            sanitizeInsertAdjacentHTML(li, 'beforeend',
+              '<span class="warning">' + Icon[".fas.fa-triangle-exclamation"] + ' ' + i18n.t('dialog.share-resource-encryption-no-key.textContent') + '</span>');
+          });
+        };
+
+        var notifyNote = function (accessSubject) {
+          return i18n.t('dialog.resource-permissions.notify.note.textContent', {
+            actor: Config.User.Name || Config.User.IRI,
+            url: iri,
+            access: accessLabel(currentModeOf(accessSubject))
+          });
+        };
+
+        var applyUpdates = async function () {
+          updateButton.disabled = true;
+          responseMessage.replaceChildren();
+          sanitizeInsertAdjacentHTML(updateButton, 'afterend', `<span class="progress">${Icon[".fas.fa-circle-notch.fa-spin.fa-fw"]}</span>`);
+
+          const failed = [];
+
+          for (const [accessSubject, mode] of pendingModes) {
+            try {
+              await updateAuthorization(documentURL, mode, accessSubject, subjectsWithAccess[accessSubject]?.subjectType || 'agent');
+            }
+            catch (error) {
+              console.warn('dokieli: could not set access for ' + accessSubject, error);
+              failed.push(accessSubject);
+            }
+          }
+
+          await getACLContext(documentURL).catch(error => { console.warn('dokieli: could not re-read the ACL', error); });
+
+          // Recipients come from the ACL at save time, so re-save to update the ciphertext
+          if (Config.User.Keys?.Encryption?.Enabled && Config.User.Keys?.Encryption?.DocumentEncrypt) {
+            await updateMutableResource(documentURL).then(() => markLocalSnapshotPublished(documentURL)).catch(error => { console.warn('dokieli: could not re-encrypt the document', error); });
+          }
+
+          // A previous round's marker would be found first and re-stamped, leaving the new spinner orphaned
+          accessPermissionsNode.querySelectorAll('.progress[data-to]').forEach(n => n.remove());
+
+          // sendNotifications reports per contact in the DOM and never settles, so it is not awaited
+          for (const accessSubject of notifySubjects) {
+            sendNotifications([accessSubject], notifyNote(accessSubject), iri, accessPermissionsNode);
+          }
+
+          for (const [accessSubject, mode] of pendingModes) {
+            if (failed.includes(accessSubject)) continue;
+            subjectsWithAccess[accessSubject] = subjectsWithAccess[accessSubject] || { subjectType: 'agent', mode: [] };
+            subjectsWithAccess[accessSubject].mode = mode ? [mode] : [];
+          }
+
+          pendingModes.clear();
+          notifySubjects.clear();
+          accessPermissionsNode.querySelectorAll('.notify input:checked').forEach(i => { i.checked = false; });
+          removeProgressIndicator(updateButton);
+          refreshUpdateButton();
+
+          sanitizeInsertAdjacentHTML(responseMessage, 'beforeend', '<p>' + i18n.t(failed.length ? 'dialog.resource-permissions.update-failed.textContent' : 'dialog.resource-permissions.update-done.textContent') + '</p>');
+        };
+
+        updateButton.addEventListener('click', () => { applyUpdates(); });
+
+        const input = document.getElementById('share-resource-search-contacts');
+        const suggestions = document.querySelector('#share-resource-permissions .suggestions');
+
+        input.addEventListener('focus', (e) => {
+          if (!e.target.value.length) {
+            showSuggestions(getFilteredContacts());
+          }
+        });
+
+        input.addEventListener('input', (e) => {
+          const query = e.target.value.trim().toLowerCase();
+          showSuggestions(getFilteredContacts(query));
+        });
+
+        input.addEventListener('keydown', (e) => {
+          const items = [...suggestions.children];
+          if (!items.length) return;
+
+          const current = items.findIndex(li => li.classList.contains('active'));
+
+          if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+            e.preventDefault();
+            const next = e.key === 'ArrowDown'
+              ? (current + 1) % items.length
+              : (current <= 0 ? items.length - 1 : current - 1);
+            items.forEach(li => li.classList.remove('active'));
+            items[next].classList.add('active');
+            items[next].scrollIntoView({ block: 'nearest' });
+          }
+          else if (e.key === 'Enter') {
+            e.preventDefault();
+            (items[current] || items[0]).click();
+          }
+          else if (e.key === 'Escape') {
+            suggestions.replaceChildren();
+          }
+        });
+
+        // Only the Share dialog used to load contacts
+        var loadContacts = function () {
+          if (!Config.User?.IRI || Object.keys(Config.User.Contacts || {}).length) return Promise.resolve();
+
+          return getUserContacts(Config.User.IRI)
+            .then(contacts => Promise.all((contacts || []).map(contact =>
+              getSubjectInfo(contact)
+                .then(subject => {
+                  if (!subject?.IRI) return;
+                  Config.User.Contacts = Config.User.Contacts || {};
+                  Config.User.Contacts[contact] = subject;
+                })
+                .catch(() => {}))))
+            .then(() => updateDeviceStorageProfile(Config.User))
+            .catch(error => { console.warn('dokieli: could not read contacts', error); });
+        };
+
+        loadContacts().then(() => {
+          if (document.activeElement === input) showSuggestions(getFilteredContacts(input.value.trim().toLowerCase()));
+        });
+
+        var getFilteredContacts = function(query = '') {
+          const contacts = Object.keys(Config.User.Contacts);
+          const subjectsWithAccessKeys = new Set(Object.keys(subjectsWithAccess));
+
+          return contacts.filter(contact => {
+            const matchesQuery = (
+              !query.length ||
+              contact.toLowerCase().includes(query) ||
+              Config.User.Contacts[contact].Name?.toLowerCase().includes(query) ||
+              Config.User.Contacts[contact].IRI?.toLowerCase().includes(query) ||
+              Config.User.Contacts[contact].URL?.toLowerCase().includes(query)
+            );
+// console.log(matchesQuery)
+            return !subjectsWithAccessKeys.has(contact) && matchesQuery;
+          });
+        }
+
+        // Shared by the contact suggestions and the WebID entry
+        var addAccessSubject = function (iri, subjectGraph) {
+          suggestions.replaceChildren();
+          input.value = '';
+
+          // A second row would reuse the first one's id and take its select
+          if (document.getElementById('share-resource-access-subject-' + encodeURIComponent(iri))) return;
+
+          var ul = document.querySelector('#share-resource-permissions ul.permissions');
+          addAccessSubjectItem(ul, subjectGraph, iri);
+
+          var li = document.getElementById('share-resource-access-subject-' + encodeURIComponent(iri));
+          if (!li) return;
+
+          // Keeps the subject out of the suggestions
+          subjectsWithAccess[iri] = subjectsWithAccess[iri] || { mode: [ns.acl.Read.value], subjectType: 'agent' };
+
+          var options = {};
+          options['accessContext'] = 'Share';
+          options['selectedAccessMode'] = ns.acl.Read.value;
+          options['documentURL'] = documentURL;
+          options['onChange'] = function (mode) { pendingModes.set(iri, mode); refreshUpdateButton(); };
+          showAccessModeSelection(li, '', iri, 'agent', options);
+
+          addNotifyToggle(li, iri);
+          markMissingKey(li, iri);
+
+          pendingModes.set(iri, ns.acl.Read.value);
+          refreshUpdateButton();
+        };
+
+        // Any WebID can be given access, not only known contacts
+        var showWebIDSuggestion = function () {
+          var iri = sanitizeIRI(input.value.trim());
+          if (!iri || !isHttpOrHttpsProtocol(iri) || iri in subjectsWithAccess) return;
+          if (Object.keys(Config.User.Contacts || {}).includes(iri)) return;
+
+          const suggestion = document.createElement('li');
+          const img = '<img alt="" height="32" src="' + Config.IconBase64['.fas.fa-user-secret'] + '" width="32" />';
+
+          sanitizeInsertAdjacentHTML(suggestion, 'beforeend', img + '<span title="' + iri + '">' + i18n.t('dialog.share-resource-search-contacts.use-webid.textContent') + ': ' + iri + '</span>');
+
+          // An unreadable profile is still a valid access subject
+          suggestion.addEventListener('click', () => {
+            getSubjectInfo(iri)
+              .catch(() => ({}))
+              .then(subject => {
+                if (subject?.IRI) {
+                  Config.User.Contacts = Config.User.Contacts || {};
+                  Config.User.Contacts[iri] = Config.User.Contacts[iri] || subject;
+                }
+                addAccessSubject(iri, subject?.Graph);
+              });
+          });
+
+          suggestions.appendChild(suggestion);
+        };
+
+        var showSuggestions = function (filteredContacts) {
+          suggestions.replaceChildren();
+
+          filteredContacts.forEach(contact => {
+            const suggestion = document.createElement('li');
+
+            var name = Config.User.Contacts[contact].Name || contact;
+            var img = Config.User.Contacts[contact].Image;
+            if (!(img && img.length)) {
+              img = Config.IconBase64['.fas.fa-user-secret'];
+            }
+            img = '<img alt="" height="32" src="' + img + '" width="32" />';
+
+            sanitizeInsertAdjacentHTML(suggestion, 'beforeend', img + '<span title="' + contact + '">' + name + '</span>');
+
+            suggestion.addEventListener('click', () => {
+              addAccessSubject(contact, Config.User.Contacts[contact].Graph);
+            });
+
+            suggestions.appendChild(suggestion);
+          })
+
+          showWebIDSuggestion();
+        }
+
+        //Allowing only Share-related access modes.
+        var accessContext = Config.AccessContext['Share'];
+
+        const accessContextModes = Object.keys(accessContext);
+
+        var ul = document.querySelector('#share-resource-permissions ul.permissions');
+
+        var showPermissions = function(s, accessSubject) {
+          // if (accessSubject != Config.User.IRI) {
+            addAccessSubjectItem(ul, s, accessSubject);
+
+            //XXX: Relies on knowledge in addAcessSubjectItem where it inserts li with a particular id
+            var li = document.getElementById('share-resource-access-subject-' + encodeURIComponent(accessSubject));
+
+            var verifiedAccessModes = subjectsWithAccess[accessSubject]['mode'].filter(mode => accessContextModes.includes(mode));
+
+            const selectedAccessMode =
+              (verifiedAccessModes.includes(ns.acl.Control.value) && ns.acl.Control.value) ||
+              (verifiedAccessModes.includes(ns.acl.Write.value) && ns.acl.Write.value) ||
+              (verifiedAccessModes.includes(ns.acl.Read.value) && ns.acl.Read.value) ||
+              '';
+
+            var options = options || {};
+            options['accessContext'] = 'Share';
+            options['selectedAccessMode'] = selectedAccessMode;
+            options['documentURL'] = documentURL;
+            if (accessSubject === Config.User.IRI) {
+              options['disabled'] = true;
+            }
+            options['onChange'] = function (mode) { pendingModes.set(accessSubject, mode); refreshUpdateButton(); };
+
+            // console.log(options)
+            showAccessModeSelection(li, '', accessSubject, subjectsWithAccess[accessSubject]['subjectType'], options);
+
+            addNotifyToggle(li, accessSubject);
+            markMissingKey(li, accessSubject);
+          // }
+        }
+
+        Object.keys(subjectsWithAccess).forEach(accessSubject => {
+          if (accessSubject === ns.foaf.Agent.value) {
+            showPermissions(null, accessSubject);
+          }
+          else if (Config.User.Graph && accessSubject === Config.User.IRI) {
+            showPermissions(Config.User.Graph, accessSubject);
+          }
+          else {
+            //Gets some information about the accessSubject that can be displayed besides their URI.
+            getResourceGraph(accessSubject)
+              .then(result => {
+                var s;
+                var g = result?.graph;
+                if (g && g.node) {
+                  s = g.node(rdf.namedNode(accessSubject));
+                }
+                showPermissions(s, accessSubject);
+              })
+              .catch(e => {
+                showPermissions(null, accessSubject);
+              })
+          }
+        })
+    });
+  }
+}
+
+export function shareResource(listenerEvent, iri) {
+  if (document.querySelector('#share-resource.do.on')) { return; }
+
+  // Config.DocumentURL is the opened document, which differs from the window location for open= resources
+  iri = iri || Config.DocumentURL || currentLocation();
+  const documentURL = stripFragmentFromString(iri);
+
+  var button = listenerEvent.target.closest('button');
+  if (button) {
+    button.disabled = true;
+  }
+
+  var shareResourceLinkedResearch = '';
+  if (Config.User.IRI && Config.OriginalResourceInfo['rdftype'] && Config.OriginalResourceInfo.rdftype.includes(ns.schema.ScholarlyArticle.value) || Config.OriginalResourceInfo.rdftype.includes(ns.schema.Thesis.value)) {
+    shareResourceLinkedResearch = `
+      <div id="share-resource-external" rel="schema:hasPart" resource="#share-resource-external">
+        <h3 data-i18n="dialog.share-resource-linked-research.h3" property="schema:name">${i18n.t('dialog.share-resource-linked-research.h3.textContent')}</h3>
+        <input id="share-resource-linked-research" type="checkbox" value="https://linkedresearch.org/cloud" />
+        <label for="share-resource-linked-research"><a href="https://linkedresearch.org/cloud">Linked Open Research Cloud</a></label>
+      </div>`;
+  }
+
+  var buttonClose = getButtonHTML({ key: 'dialog.share-resource.close.button', button: 'close', buttonClass: 'close', iconSize: 'fa-2x' });
+
+  var shareResourceHTML = `
+    <aside aria-labelledby="share-resource-label" class="do on" dir="${Config.User.UI.LanguageDir}" dir="${Config.User.UI.LanguageDir}" id="share-resource" lang="${Config.User.UI.Language}" rel="schema:hasPart" resource="#share-resource" xml:lang="${Config.User.UI.Language}">
+      <h2 data-i18n="dialog.share.h2" id="share-resource-label" property="schema:name">${i18n.t('dialog.share.h2.textContent')} ${Config.Button.Info.Share}</h2>
+
+      ${buttonClose}
+
+      <div class="info"></div>
+
+      <div id="share-resource-share-url" rel="schema:hasPart" resource="#share-resource-share-url">
+        <h3 data-i18n="dialog.share-resource-share-url.h3" property="schema:name">${i18n.t('dialog.share-resource-share-url.h3.textContent')}</h3>
+
+        <label data-i18n="dialog.share-resource-clipboard.label" for="share-resource-clipboard">${i18n.t('dialog.share-resource-clipboard.label.textContent')}</label>
+        <input dir="ltr" id="share-resource-clipboard" name="share-resource-clipboard" readonly="readonly" type="url" value="${iri}" />
+        ${Config.Button.Clipboard}
+      </div>
+
+      ${shareResourceLinkedResearch}
+
+      <div id="share-resource-agents" rel="schema:hasPart" resource="#share-resource-agents">
+        <h3 data-i18n="dialog.share-resource-agents.h3" property="schema:name">${i18n.t('dialog.share-resource-agents.h3.textContent')}</h3>
+
+        <ul>
+          <li id="share-resource-address-book">
+          </li>
+        </ul>
+
+        <label data-i18n="dialog.share-resource-note.label" for="share-resource-note">${i18n.t('dialog.share-resource-note.label.textContent')}</label>
+        <textarea data-i18n="dialog.share-resource-note.textarea" dir="auto" id="share-resource-note" rows="3" cols="40" name="share-resource-note" placeholder="${i18n.t('dialog.share-resource-note.textarea.placeholder')}"></textarea>
+
+        <button class="share" data-i18n="dialog.share-resource-agents.button" id="share-resource-agents-button" title="${i18n.t('dialog.share-resource-agents.button.title')}" type="submit">${i18n.t('dialog.share-resource-agents.button.textContent')}</button>
+      </div>
+    </aside>
+  `;
+
+  document.body.appendChild(fragmentFromString(shareResourceHTML));
+
+  var clipboardInput = document.querySelector('#share-resource-clipboard');
+  var clipboardButton = document.querySelector('#share-resource-clipboard + button.copy-to-clipboard');
+  setCopyToClipboard(clipboardInput, clipboardButton);
+
+  clipboardInput.addEventListener('focus', e => {
+    var input = e.target.closest('input');
+    if (input) {
+      input.selectionStart = 0;
+      input.selectionEnd = input.value.length;
+    }
+  });
+
+  var li = document.getElementById('share-resource-address-book');
+  if (li && Config.User.IRI) {
+    sanitizeInsertAdjacentHTML(li, 'beforeend', Icon[".fas.fa-circle-notch.fa-spin.fa-fw"]);
+    selectContacts(li, Config.User.IRI);
+  }
+
+
+  var shareResource = document.getElementById('share-resource');
+
+  shareResource.querySelector('#share-resource-note')?.focus();
+
+  shareResource.addEventListener('click', function (e) {
+    if (e.target.closest('button.close')) {
+      listenerEvent.target.closest('button').disabled = false;
+    }
+
+    if (e.target.closest('button.share')) {
+      var tos = [];
+      //XXX: This is currently not in the UI. https://github.com/dokieli/dokieli/issues/532
+      // var resourceTo = document.querySelector('#share-resource #share-resource-to');
+      // if (resourceTo) {
+      //   resourceTo = sanitizeIRI(resourceTo.value.trim());
+      //   tos = (resourceTo.length) ? resourceTo.split(/\r\n|\r|\n/) : [];
+      // }
+
+      var note = document.querySelector('#share-resource #share-resource-note').value.trim();
+
+      var ps = document.querySelectorAll('#share-resource-contacts .progress');
+      ps.forEach(p => {
+        p.parentNode.removeChild(p);
+      });
+
+      var srlr = document.querySelector('#share-resource-linked-research:checked');
+      if(srlr) {
+        tos.push(srlr.value);
+      }
+
+      var srci = document.querySelectorAll('#share-resource-contacts input:checked');
+      if (srci.length) {
+        for(var i = 0; i < srci.length; i++) {
+          tos.push(srci[i].value);
+        }
+      }
+
+      var rm = shareResource.querySelector('.response-message');
+      if (rm) {
+        rm.parentNode.removeChild(rm);
+      }
+      sanitizeInsertAdjacentHTML(shareResource, 'beforeend', '<div class="response-message"></div>');
+
+      return shareResourceWithAgents(tos, note, iri, shareResource);
+    }
+  });
+}
+
+async function shareResourceWithAgents(tos, note, iri, shareResourceNode) {
+  // An empty selection is not a key failure
+  if (!tos.length) {
+    const rm = shareResourceNode.querySelector('.response-message');
+    if (rm) {
+      rm.setHTMLUnsafe(domSanitize('<p>' + i18n.t('dialog.share-resource-no-contacts-selected.textContent') + '</p>'));
+    }
+    return;
+  }
+
+  const documentURL = stripFragmentFromString(iri);
+  const unreachable = [];
+
+  // Sharing announces; access is settled in Permissions
+  await getACLContext(documentURL).catch(() => {});
+
+  for (const to of tos) {
+    const reasons = await unreachableReasons(documentURL, to);
+    if (!reasons.length) continue;
+
+    unreachable.push({ to, reasons });
+    const li = shareResourceNode.querySelector('[value="' + to + '"]')?.closest('li');
+    if (li && !li.querySelector('.warning')) {
+      sanitizeInsertAdjacentHTML(li, 'beforeend',
+        '<span class="warning">' + Icon[".fas.fa-triangle-exclamation"] + ' ' + reasons.join(' ') + '</span>');
+    }
+  }
+
+  if (unreachable.length) {
+    const rm = shareResourceNode.querySelector('.response-message');
+    if (rm) {
+      const listed = unreachable.map(({ to }) => '<li><a href="' + to + '" rel="noopener" target="_blank">' + to + '</a></li>').join('');
+      sanitizeInsertAdjacentHTML(rm, 'beforeend',
+        '<p class="warning">' + i18n.t('dialog.share-resource-unreachable.textContent') + '</p><ul>' + listed + '</ul>');
+    }
+  }
+
+  return sendNotifications(tos, note, iri, shareResourceNode);
+}
+
+export function selectContacts(node, url) {
+  node.setHTMLUnsafe(domSanitize('<ul id="share-resource-contacts"></ul>'));
+  var shareResourceNode = document.getElementById('share-resource-contacts');
+
+  if (Config.User.Contacts && Object.keys(Config.User.Contacts).length){
+    Object.keys(Config.User.Contacts).forEach(iri => {
+      if (Config.User.Contacts[iri].Inbox && Config.User.IRI !== iri) {
+        addShareResourceContactInput(shareResourceNode, Config.User.Contacts[iri]);
+      }
+    });
+  }
+  else {
+    updateContactsInfo(url, shareResourceNode);
+  }
+}
+
+export function updateContactsInfo(url, node, options) {
+  options = options || {};
+
+  return getUserContacts(url)
+    .then(contacts => {
+      if (contacts.length) {
+        contacts.forEach(url => {
+          getSubjectInfo(url)
+            .then(subject => {
+              Config.User['Contacts'] = Config.User['Contacts'] || {};
+              Config.User.Contacts[url] = subject;
+
+              addShareResourceContactInput(node, subject);
+
+              //TODO: This should be called only once after processing all contacts. Refactor the loop to eventually use Promise.allSettled perhaps.
+              updateDeviceStorageProfile(Config.User);
+            })
+        });
+
+        // return Promise.all(promises)
+      }
+      //TODO: This feature used to exist where user was able to enter WebIDs in a textarea (one per line? comma-separated).
+      // else {
+      //   node.setHTMLUnsafe(domSanitize('No contacts with ' + Icon[".fas.fa-inbox"] + ' inbox found in your profile, but you can enter contacts individually:'));
+      // }
+
+      return Promise.resolve();
+    });
+}
+
+export function addShareResourceContactInput(node, agent) {
+  var iri = agent?.IRI
+  var inbox = agent?.Inbox;
+
+  if (inbox && inbox.length) {
+    var id = encodeURIComponent(iri);
+    var name = agent.Name || iri;
+    var img = agent.Image;
+    if (!(img && img.length)) {
+      img = Config.IconBase64['.fas.fa-user-secret'];
+    }
+    img = '<img alt="" height="32" src="' + img + '" width="32" />';
+
+    var input = '<li><input id="share-resource-contact-' + id + '" type="checkbox" value="' + iri + '" /><label for="share-resource-contact-' + id + '">' + img + '<a dir="auto" href="' + iri + '" rel="noopener" target="_blank">' + name + '</a></label></li>';
+
+    sanitizeInsertAdjacentHTML(node, 'beforeend', input);
+    markUnreachableContact(node.querySelector('[id="share-resource-contact-' + id + '"]'), iri);
+  }
+}
+
+// Checked at render so the warning shows before Share is clicked
+async function unreachableReasons(documentURL, to) {
+  const reasons = [];
+  const ctx = cachedACLContext(documentURL);
+
+  if (ctx && !agentsWithMode(ctx, 'Read').includes(to) && !ctx.authorizations.some(a => a.mode.includes('Read') && a.agentClass.includes(Public.iri))) {
+    reasons.push(i18n.t('dialog.share-resource-no-read-access.textContent'));
+  }
+  if (Config.User.Keys?.Encryption?.Enabled && Config.User.Keys?.Encryption?.DocumentEncrypt && !(await getAgentEncryptionKey(to))) {
+    reasons.push(i18n.t('dialog.share-resource-encryption-no-key.textContent'));
+  }
+  return reasons;
+}
+
+function markUnreachableContact(input, to) {
+  if (!input) return;
+  const documentURL = Config.DocumentURL || currentLocation();
+
+  unreachableReasons(documentURL, to).then(reasons => {
+    const li = input.closest('li');
+    if (!reasons.length || !li?.isConnected || li.querySelector('.warning')) return;
+    sanitizeInsertAdjacentHTML(li, 'beforeend',
+      '<span class="warning">' + Icon[".fas.fa-triangle-exclamation"] + ' ' + reasons.join(' ') + '</span>');
+  });
+}
+
+export function updateContactsInbox(iri, s) {
+  var checkInbox = function(s) {
+    var aI = getAgentInbox(s);
+
+    if (aI) {
+      return Promise.resolve(aI);
+    }
+    else {
+      return getLinkRelationFromHead(ns.ldp.inbox.value, iri);
+    }
+  }
+
+  return checkInbox(s)
+    .then(inboxes => {
+      if (inboxes && inboxes.length) {
+        Config.User.Contacts[iri]['Inbox'] = inboxes;
+      }
+    })
+}
+
+//TODO: Revisit this function and addShareResourceContactInput to generalise.
+function addAccessSubjectItem(node, s, url) {
+  var iri = s?.term?.value || url;
+  iri = domSanitize(iri);
+
+  var id = encodeURIComponent(iri);
+  var name = Config.User?.Contacts?.[iri]?.Name || (iri == ns.foaf.Agent.value ? 'Public' : null) || (s ? getAgentName(s) || iri : iri);
+  var img = Config.User?.Contacts?.[iri]?.Image || (iri == ns.foaf.Agent.value ? Config.IconBase64['.fas.fa-globe'] : null) || (s ? getGraphImage(s) : null);
+
+  //TODO, use fa-people-group for accessGroup, unless the group has its own icon in Contacts or s
+
+  if (!(img && img.length)) {
+    img = Config.IconBase64['.fas.fa-user-secret'];
+  }
+  img = '<img alt="" height="32" src="' + img + '" width="32" />';
+
+  var input = '<li id="share-resource-access-subject-' + id + '">' + img + '<a href="' + iri + '" rel="noopener" target="_blank" title="' + iri + '">' + name + '</a></li>';
+
+  sanitizeInsertAdjacentHTML(node, 'beforeend', input);
+}
+
+function showAccessModeSelection(node, id, accessSubject, subjectType, options) {
+  id = id || generateAttributeId('select-access-mode-');
+  const documentURL = options?.documentURL || Config.DocumentURL || currentLocation();
+  let disabled = '';
+
+  options = options || {};
+  options['accessContext'] = options.accessContext || 'Share';
+  options['selectedAccessMode'] = options.selectedAccessMode || '';
+
+  if (options.disabled) {
+    disabled = ' disabled="disabled"';
+  }
+
+  // console.log(options)
+
+  const selectNode = `<select aria-label="${i18n.t('dialog.share-resource.select-access-mode.select.aria-label')}" data-i18n="dialog.share-resource.select-access-mode.select"${disabled} id="${id}">${getAccessModeOptionsHTML({'context': options.accessContext, 'selected': options.selectedAccessMode })}</select>`;
+
+  sanitizeInsertAdjacentHTML(node, 'beforeend', selectNode);
+
+  var select = document.getElementById(id);
+  select.addEventListener('change', e => {
+    var selectedMode = e.target.value;
+
+    if (Config.AccessContext[options.accessContext][selectedMode] || selectedMode == '') {
+      // Renders the select; applying the mode is the caller's job
+      if (options.onChange) {
+        options.onChange(selectedMode, accessSubject, subjectType);
+        return;
+      }
+
+      e.target.disabled = true;
+      sanitizeInsertAdjacentHTML(e.target, 'afterend', `<span class="progress">${Icon[".fas.fa-circle-notch.fa-spin.fa-fw"]}</span>`);
+
+      updateAuthorization(documentURL, selectedMode, accessSubject, subjectType)
+        .catch(error => { console.log(error); })
+        //This also ensures that we track the current resource's effective ACL resource
+        .then(() => getACLContext(documentURL).catch(error => { console.log(error); }))
+        .then(() => { removeProgressIndicator(e.target); });
+    }
+    else {
+      //TODO: Naughty
+    }
+  });
+}
+
+// Encrypted documents must not be publicly readable; retract public access and keep the owner in control. ACLs also carry what encryption cannot: write protection and metadata privacy
+export async function ensureEncryptedDocumentACL(documentURL) {
+  documentURL = documentURL || Config.DocumentURL || currentLocation();
+  if (!Config.Session?.isActive || !Config.User?.IRI) return;
+  if (!accessModeAllowed(documentURL, 'control')) return;
+
+  let ctx;
+  try {
+    ctx = await getACLContext(documentURL);
+  } catch {
+    return;
+  }
+
+  if (!hasControl(ctx, { 'type': 'agent', 'iri': Config.User.IRI })) {
+    await applyACLPlan(planOwnerControl(ctx, Config.User.IRI));
+    ctx = await getACLContext(documentURL);
+  }
+
+  const publicHasAccess = ctx.authorizations.some(authorization => authorization.agentClass.includes(Public.iri));
+  if (publicHasAccess) {
+    await applyACLPlan(planRevoke(ctx, Public));
+    await getACLContext(documentURL);
+  }
+}
+
+//TODO: Check environment variable for issuerCondition information that's enforced per dokieli instance.
+//An empty selectedMode means no access. planGrant reuses an existing Authorization for the access subject instead of adding a duplicate rule, splits a rule shared by several access subjects, and copies the container's Authorizations into a new ACL resource when the effective one is inherited. https://solid.github.io/web-access-control-spec/#authorization-rule
+function updateAuthorization(documentURL, selectedMode, accessSubject, subjectType) {
+  const ctx = cachedACLContext(documentURL);
+
+  if (!ctx) {
+    return Promise.reject(new Error('No ACL context for ' + documentURL));
+  }
+
+  const subject = { 'type': subjectType, 'iri': accessSubject };
+  const plan = selectedMode.length
+    ? planGrant(ctx, subject, expandAccessMode(selectedMode))
+    : planRevoke(ctx, subject);
+
+  return applyACLPlan(plan);
+}
+
+// Called more than once on some paths, so a missing indicator is not an error
+function removeProgressIndicator(node) {
+  if (!node) return;
+
+  node.disabled = false;
+  node.nextElementSibling?.classList.contains('progress') && node.nextElementSibling.remove();
+}
+
+export function replyToResource(e, iri) {
+  iri = iri || Config.DocumentURL || currentLocation()
+
+  e.target.closest('button').disabled = true
+
+  var buttonClose = getButtonHTML({ key: 'dialog.reply-to-resource.close.button', button: 'close', buttonClass: 'close', iconSize: 'fa-2x' });
+
+  document.body.appendChild(fragmentFromString(`
+    <aside aria-labelledby="reply-to-resource-label" class="do on" data-notify-scope="" dir="${Config.User.UI.LanguageDir}" id="reply-to-resource" lang="${Config.User.UI.Language}" rel="schema:hasPart" resource="#reply-to-resource" xml:lang="${Config.User.UI.Language}">
+      <h2 data-i18n="dialog.reply-to-resource.h2" id="reply-to-resource-label" property="schema:name">${i18n.t('dialog.reply-to-resource.h2.textContent')} ${Config.Button.Info.Reply}</h2>
+      ${buttonClose}
+      <div class="info"></div>
+      <div id="reply-to-resource-input">
+        <p data-i18n="dialog.reply-to-resource-input.p" data-i18n-url="${iri}">${i18n.t('dialog.reply-to-resource-input.p.innerHTML', { url: iri })}</p>
+        <ul>
+          <li>
+            <p><label data-i18n="dialog.reply-to-resource-note.label" for="reply-to-resource-note">${i18n.t('dialog.reply-to-resource-note.label.textContent')}</label></p>
+            <p><textarea cols="40" data-i18n="dialog.reply-to-resource-note.textarea" dir="auto" id="reply-to-resource-note" required="" rows="10" name="reply-to-resource-note" placeholder="${i18n.t('dialog.reply-to-resource-note.textarea.placeholder')}"></textarea></p>
+          </li>
+        </ul>
+      </div>
+    </aside>
+  `))
+
+  // TODO: ACL - can choose whether to make this reply private (to self), visible only to article author(s), visible to own contacts, public
+  // TODO: Show name and face of signed in user reply is from, or 'anon' if article can host replies
+
+  var replyToResource = document.getElementById('reply-to-resource')
+
+  var id = 'location-reply-to'
+  var action = 'write'
+  var note;
+  var noteIRI;
+
+  // Secondary fields, including the save location, live behind the same more-options toggle as the annotation popups
+  sanitizeInsertAdjacentHTML(replyToResource, 'beforeend', `<div class="editor-form-advanced" hidden="">
+    <label data-i18n="language.label" for="reply-to-resource-language">${i18n.t('language.label.textContent')}</label> <select class="editor-form-select" id="reply-to-resource-language" name="reply-to-resource-language">${getLanguageOptionsHTML()}</select>
+    <label data-i18n="license.label" for="reply-to-resource-license">${i18n.t('license.label.textContent')}</label> <select class="editor-form-select" id="reply-to-resource-license" name="reply-to-resource-license">${getLicenseOptionsHTML()}</select>
+  </div>`)
+
+  var advancedFields = replyToResource.querySelector('.editor-form-advanced')
+
+  // The reply is a new resource; do not default to the source document's name
+  setupResourceBrowser(advancedFields, id, action, { defaultFilename: generateAttributeId() + '.html' })
+  attachBrowseStoragePopup(id, action)
+  sanitizeInsertAdjacentHTML(document.getElementById(id), 'afterbegin', `<p data-i18n="dialog.reply-to-resource.save-location-choose.p">${i18n.t('dialog.reply-to-resource.save-location-choose.p.textContent')}</p>`)
+
+  sanitizeInsertAdjacentHTML(advancedFields, 'beforeend', `<p data-i18n="dialog.reply-to-resource.save-location.p">${i18n.t('dialog.reply-to-resource.save-location.p.textContent')} <samp id="${id}-${action}"></samp></p>`)
+  sanitizeInsertAdjacentHTML(advancedFields, 'beforeend', `<span class="annotation-inbox-selection">${getAnnotationInboxLocationHTML('reply-to-resource')}</span>`)
+
+  var bli = document.getElementById(id + '-input')
+  bli.placeholder = 'https://example.org/path/to/article'
+  replyToResource.querySelector('#reply-to-resource-note').focus()
+
+  sanitizeInsertAdjacentHTML(replyToResource, 'beforeend', `<div class="editor-form-footer reply-controls">
+    <span class="editor-form-footer-controls">
+      <button class="editor-form-icon-toggle editor-form-advanced-toggle" type="button" aria-expanded="false" aria-label="More options" title="More options">${Icon['.fas.fa-plus'] || '+'}<span class="editor-form-advanced-toggle-caret">${Icon['.fas.fa-caret-down']}</span></button>
+      <span class="annotation-access">
+        <input type="checkbox" class="editor-form-access" id="reply-to-resource-access-public" name="reply-to-resource-access-public" role="switch" value="true"${isPublicRead(Config.DocumentURL) ? ' checked="checked"' : ''} aria-label="${i18n.t('annotation-access.label.textContent')}" />
+        <label class="editor-form-icon-toggle editor-form-access-label" for="reply-to-resource-access-public">${Icon['.fas.fa-eye-slash']}${Icon['.fas.fa-globe']}</label>
+      </span>
+      <span class="annotation-encrypt">
+        <input type="checkbox" class="editor-form-encrypt" id="reply-to-resource-encrypt" name="reply-to-resource-encrypt" role="switch" value="true"${isUnlocked() ? ' checked="checked"' : ''} aria-label="${i18n.t('annotation-encrypt.label.textContent')}" />
+        <label class="editor-form-icon-toggle editor-form-encrypt-label" for="reply-to-resource-encrypt">${Icon['.fas.fa-lock-open']}${Icon['.fas.fa-lock']}</label>
+      </span>
+    </span>
+    <span class="editor-form-footer-actions">
+      <button class="reply" data-i18n="dialog.reply-to-resource.submit.button" title="${i18n.t('dialog.reply-to-resource.submit.button.title')}" type="submit">${i18n.t('dialog.reply-to-resource.submit.button.textContent')}</button>
+    </span>
+  </div>`)
+
+  // Same show/hide behaviour as the annotation popups' more-options toggle
+  var advancedToggle = replyToResource.querySelector('.editor-form-advanced-toggle')
+  advancedToggle.addEventListener('click', () => {
+    var open = advancedToggle.getAttribute('aria-expanded') !== 'true'
+    advancedToggle.setAttribute('aria-expanded', String(open))
+    advancedToggle.classList.toggle('editor-form-icon-toggle-active', open)
+    advancedFields.hidden = !open
+    if (open) {
+      advancedFields.querySelector('input, select, textarea')?.focus()
+    }
+  })
+
+  setupIconToggleTitles(replyToResource)
+  syncNotifyInboxDefault(replyToResource, { reset: true })
+
+  replyToResource.addEventListener('click', e => {
+    if (e.target.closest('button.close')) {
+      setMenuButtonDisabled('.resource-reply');
+    }
+
+    if (e.target.closest('button.reply')) {
+      note = replyToResource.querySelector('#reply-to-resource-note').value.trim()
+
+      var rm = replyToResource.querySelector('.response-message')
+      if (rm) {
+        rm.remove()
+      }
+      sanitizeInsertAdjacentHTML(replyToResource, 'beforeend', '<div class="response-message"></div>')
+
+      noteIRI = document.querySelector('#reply-to-resource #' + id + '-' + action).innerText.trim();
+
+      try {
+        noteIRI = noteIRI && noteIRI.length ? new URL(noteIRI).href : noteIRI;
+      } catch (e) {
+        // keep the original value if it's not a valid URL
+      }
+
+      // TODO: this needs to be form validation instead
+      if (!note || !noteIRI) {
+        document.querySelector('#reply-to-resource .response-message')
+          .setHTMLUnsafe(domSanitize(`<p class="error" data-i18n="dialog.reply-to-resource.error.missing-note-or-location.p">${i18n.t("dialog.reply-to-resource.error.missing-note-or-location.p.textContent")}</p>`));
+        return;
+      }
+
+      sendReply();
+    }
+  })
+
+  async function sendReply() {
+    var datetime = getDateTimeISO()
+    var attributeId = generateAttributeId()
+
+    var encrypted = !!replyToResource.querySelector('.editor-form-encrypt')?.checked && isUnlocked()
+    var publicAccess = !!replyToResource.querySelector('.editor-form-access')?.checked && !encrypted
+    var notifyInboxes = Array.from(replyToResource.querySelectorAll('input[name="reply-to-resource-annotation-inbox"]:checked')).map(input => input.value)
+
+    if (encrypted) {
+      note = await encryptContent(note, [getSessionPublicKey()], getSessionKid())
+    }
+
+    var motivatedBy = "oa:replying"
+    // The reply action maps to the oa:replying motivation
+    var noteData = createAnnotation({
+      motivatedBy,
+      type: 'comment',
+      id: attributeId,
+      refId: 'r-' + attributeId,
+      datetime,
+      target: { iri, renderedVia: { iri: 'https://dokie.li/#i', name: 'dokieli' } },
+      body: { content: note },
+      creator: {
+        iri: Config.User.IRI || undefined,
+        name: Config.User.Name || undefined,
+        image: Config.User.Image || undefined,
+        url: Config.User.URL || undefined,
+        type: Config.User.Types || undefined
+      }
+    })
+    noteData.mode = 'write'
+
+    var language = document.querySelector('#reply-to-resource-language')
+    if (language && language.length) {
+      noteData["language"] = language.value.trim()
+      noteData["body"]["language"] = noteData["language"];
+    }
+
+    var license = document.querySelector('#reply-to-resource-license')
+    if (license && license.length) {
+      noteData["license"] = license.value.trim()
+      noteData["body"]["rights"] = noteData["body"]["license"] = noteData["rights"] = noteData["license"];
+    }
+
+    note = createNoteDataHTML(noteData)
+
+    var data = formatHTMLString(createHTML('', note))
+
+    Config.Storage.put(noteIRI, data)
+      .catch(error => {
+        console.error('Could not save reply:', error)
+
+        let errorKey = 'default';
+
+        switch (error.status) {
+          case 0:
+          case 405:
+            errorKey = 'unwritable-location';
+            break
+          case 401:
+            errorKey = 'unauthorized';
+            if(!Config.User.IRI){
+              errorKey = 'unauthenticated';
+            }
+            break;
+          case 403:
+            errorKey = 'forbidden';
+            break
+          case 406:
+            errorKey = 'unacceptable';
+            break
+          default:
+            break
+        }
+
+        throw new Error(i18n.t(`dialog.reply-to-resource.error.${errorKey}.p.textContent`));
+      })
+
+      .then(response => {
+        let url = sanitizeIRI(response.url);
+
+        replyToResource
+          .querySelector('.response-message')
+          .setHTMLUnsafe(domSanitize(`<p class="success" data-i18n="dialog.reply-to-resource.success.saved-at.p"><span>${i18n.t('dialog.reply-to-resource.success.saved-at.p.textContent')}</span> <a href="${url}" rel="noopener" target="_blank">${url}</a></p>`));
+
+        // Public read is not inherited from the container on every server
+        if (publicAccess) {
+          setPublicRead(noteIRI, true)
+            .catch(e => console.log('Could not make reply public:', e));
+        }
+
+        if (!notifyInboxes.length) return;
+
+        //TODO-i18n
+        let notificationStatements = '    <dl about="' + noteIRI +
+          '">\n<dt>Object type</dt><dd><a about="' +
+          noteIRI + '" typeof="oa:Annotation" href="' +
+          ns.oa.Annotation.value +
+          '">Annotation</a></dd>\n<dt>Motivation</dt><dd><a href="' +
+          Config.getPrefixURI(motivatedBy.split(':')[0]) +
+          motivatedBy.split(':')[1] + '" property="oa:motivation">' +
+          motivatedBy.split(':')[1] + '</a></dd>\n</dl>\n'
+
+        // Notify each inbox the user selected
+        return Promise.allSettled(notifyInboxes.map(inboxURL => {
+          let notificationData = {
+            "type": ['as:Announce'],
+            "inbox": inboxURL,
+            "object": noteIRI,
+            "note": Object.assign({}, noteData, { "iri": noteIRI }),
+            "target": iri,
+            "license": noteData.license,
+            "statements": notificationStatements
+          }
+
+          var responseMessage = replyToResource.querySelector('.response-message');
+
+          return notifyInbox(notificationData)
+            .then(result => {
+              var notificationSent = i18n.t('dialog.reply-to-resource.success.notification-sent.p.textContent');
+              var linkUrl = domSanitize(result?.location || inboxURL);
+              responseMessage.setHTMLUnsafe(domSanitize(responseMessage.getHTML() + `<p class="success" data-i18n="dialog.reply-to-resource.success.notification-sent.p"><span>${notificationSent}</span> <a href="${linkUrl}" rel="noopener" target="_blank">${linkUrl}</a></p>`));
+
+              addMessageToLog({ 'content': i18n.t('annotation.notify-inbox.success.textContent', { inbox: inboxURL }), 'type': 'success' }, Config.MessageLog);
+            })
+            .catch(error => {
+              console.error('Failed sending notification to ' + inboxURL + ' :', error)
+
+              var detail = [error?.status, error?.message].filter(Boolean).join(' ');
+              var failed = i18n.t('annotation.notify-inbox.failed.textContent', { inbox: inboxURL, annotation: noteIRI, error: detail });
+              responseMessage.setHTMLUnsafe(domSanitize(responseMessage.getHTML() + `<p class="error">${failed}</p>`));
+
+              addMessageToLog({ 'content': failed, 'type': 'warning' }, Config.MessageLog);
+            })
+        }));
+      })
+
+      //TODO-i18n
+      .catch(error => {
+        // Catch-all error, actually notify the user
+        var responseMessage = replyToResource.querySelector('.response-message');
+        responseMessage.setHTMLUnsafe(domSanitize(responseMessage.getHTML() + `<p class="error"><span data-i18n="dialog.reply-to-resource.error.save-error.span">${i18n.t('dialog.reply-to-resource.error.save-error.span.textContent')} </span> ${error.message}</p>`));
+      })
+  }
+}
+
+export function setupResourceBrowser(parent, id, action, options){
+  id = id || 'browser-location';
+  id = domSanitize(id);
+  action = action || 'write';
+  action = domSanitize(action);
+  options = options || {};
+  const containersOnlyAttr = options.containersOnly ? ' data-containers-only=""' : '';
+
+  const documentOptions = {
+    ...Config.DOMProcessing,
+    //sanitize: in this context, seems low risk.
+    normalize: true
+  };
+
+  var isAuthed = !!Config['Session']?.isActive;
+  var createContainerButton = ` <button data-i18n="browser.create-container.button" id="${id}-create-container-button" ${isAuthed ? '' : 'disabled="disabled"'} title="${i18n.t('browser.create-container.button.title')}">${i18n.t('browser.create-container.button.textContent')}</button>`;
+  var createContainerDiv = `<div id="${id}-create-container"></div>`;
+
+  var defaultDirUrl = '';
+  var defaultFilename = '';
+  if (action === 'write') {
+    try {
+      var src = Config.DocumentURL;
+      if (src && /^https?:\/\//.test(src)) {
+        var u = new URL(src);
+        var segments = u.pathname.split('/');
+        var last = segments.pop();
+        defaultFilename = last || '';
+        u.pathname = segments.join('/') + '/';
+        u.search = '';
+        u.hash = '';
+        defaultDirUrl = u.toString();
+      }
+    } catch {}
+    var inMarkdownMode = !!document.querySelector('[data-markdown-mode]');
+    var preferredExt = inMarkdownMode ? 'md' : 'html';
+    if (!defaultFilename) {
+      defaultFilename = getDefaultDocumentBasename(selectArticleNode(document)) + '.' + preferredExt;
+    } else if (inMarkdownMode) {
+      defaultFilename = defaultFilename.replace(/\.[^./]+$/, '') + '.md';
+    }
+
+    // New resources (e.g. replies) must not default to the source document's name
+    if (options.defaultFilename) {
+      defaultFilename = options.defaultFilename;
+    }
+  }
+
+  var gf = Config.User?.GitForge;
+  var srcIsForge = false;
+  try { srcIsForge = !!(defaultDirUrl && Config.Storage?.for?.(defaultDirUrl)?.name === 'gitforge'); } catch {}
+  if (gf?.host && gf?.login && !srcIsForge) {
+    defaultDirUrl = `https://${gf.host}/${gf.login}/`;
+  }
+
+  var filenameField = action === 'write'
+    ? ` <label data-i18n="browser.filename.label" for="${id}-filename">${i18n.t('browser.filename.label.textContent')}</label> <input dir="ltr" id="${id}-filename" name="${id}-filename" placeholder="document.html" type="text" value="${defaultFilename}" />`
+    : '';
+
+  var urlLabel = (action === 'write' && Config.User?.GitForge) ? 'URL or repo URL' : 'URL';
+  sanitizeInsertAdjacentHTML(parent, 'beforeend', `<div id="${id}"${containersOnlyAttr}><label for="${id}-input">${urlLabel}</label> <input dir="ltr" id="${id}-input" name="${id}-input" placeholder="https://example.org/path/to/" required="" type="url" value="${defaultDirUrl}" /><button data-i18n="browser.browse-location.button" id="${id}-update" ${defaultDirUrl ? '' : 'disabled="disabled"'} title="${i18n.t('browser.browse-location.button.textContent')}">${i18n.t('browser.browse-location.button.textContent')}</button>${createContainerButton}${filenameField}</div>${createContainerDiv}<div id="${id}-listing"></div>`);
+
+  // var inputBox = document.getElementById(id);
+  var createContainer = document.getElementById(id + '-create-container');
+  var createButton = document.getElementById(id + '-create-container-button');
+  var storageBox = document.getElementById(id + '-listing');
+  var input = document.getElementById(id + '-input');
+  var filenameInput = document.getElementById(id + '-filename');
+  var browseButton = document.getElementById(id + '-update');
+
+  var isValidBase = (v) => v.length > 10 && /^https?:\/\//.test(v);
+  var withTrailingSlash = (v) => v.slice(-1) === '/' ? v : v + '/';
+
+  input.addEventListener('input', () => {
+    var msgs = document.getElementById(id).querySelectorAll('.response-message');
+    for(var i = 0; i < msgs.length; i++){
+      msgs[i].parentNode.removeChild(msgs[i]);
+    }
+
+    var actionNode = document.getElementById(id + '-' + action);
+    if (isValidBase(input.value)) {
+      browseButton.removeAttribute('disabled');
+      if(actionNode){
+        actionNode.textContent = action === 'read'
+          ? input.value
+          : withTrailingSlash(input.value) + (filenameInput ? filenameInput.value : generateAttributeId());
+      }
+    }
+    else {
+      browseButton.disabled = 'disabled';
+      if(actionNode) {
+        actionNode.textContent = input.value;
+      }
+    }
+  }, false);
+
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && isValidBase(input.value)) {
+      triggerBrowse(input.value, id, action);
+    }
+  }, false);
+
+  if (filenameInput) {
+    filenameInput.addEventListener('input', () => {
+      var actionNode = document.getElementById(id + '-' + action);
+      if (actionNode && isValidBase(input.value)) {
+        actionNode.textContent = withTrailingSlash(input.value) + filenameInput.value;
+      }
+    });
+  }
+
+  browseButton.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    triggerBrowse(input.value, id, action);
+  }, false);
+
+  if (action === 'write' && isValidBase(input.value)) {
+    queueMicrotask(() => {
+      var actionNode = document.getElementById(id + '-' + action);
+      if (actionNode) {
+        actionNode.textContent = withTrailingSlash(input.value) + (filenameInput ? filenameInput.value : '');
+      }
+    });
+  }
+
+  var browserul = document.getElementById(id + '-ul');
+  if(!browserul){
+    browserul = document.createElement('ul');
+    browserul.id = id + '-ul';
+
+    storageBox.appendChild(browserul);
+  }
+
+  var baseUrl;
+
+  // TODO: Show and use storage, outbox, annotationService as opposed to first available.
+
+  if(Config.User.Storage?.length) {
+    baseUrl = forceTrailingSlash(Config.User.Storage[0]);
+  }
+  else if(Config.User.Outbox?.length) {
+    baseUrl = forceTrailingSlash(Config.User.Outbox[0]);
+  }
+  else if(Config.Resource[Config.DocumentURL]?.annotationService?.length) {
+    baseUrl = forceTrailingSlash(Config.Resource[Config.DocumentURL].annotationService[0]);
+  }
+  else if (Config.User?.GitForge?.host && Config.User?.GitForge?.login) {
+    baseUrl = `https://${Config.User.GitForge.host}/${Config.User.GitForge.login}/`;
+  }
+
+
+  if(baseUrl){
+    initBrowse(baseUrl, input, browseButton, createButton, id, action);
+  }
+  else {
+    getLinkRelation(ns.oa.annotationService.value, null, getDocument(null, documentOptions))
+      .then((storageUrl) => {
+        initBrowse(storageUrl[0], input, browseButton, createButton, id, action);
+      })
+      .catch(() => {
+        baseUrl = getBaseURL(Config.DocumentURL);
+        initBrowse(baseUrl, input, browseButton, createButton, id, action);
+
+        // if (Config['Session']?.isActive) {
+        //   //Browsing removes whatever was for create container and restarts browse on new location
+        //   browseButton.addEventListener('click', () => {
+        //     createContainer.replaceChildren();
+        //     triggerBrowse(input.value, id, action);
+        //   }, false);
+
+        //   //Clicking on create container button shows the input
+        //   createButton.addEventListener('click', (e) => {
+        //     showCreateContainer(input.value, id, action, e);
+        //   }, false);
+        // }
+      })
+  }
+}
+
+async function bundleExternalAssets(rootEl) {
+  var files = [];
+  var usedNames = new Set();
+  var ensureUnique = (name) => {
+    if (!usedNames.has(name)) { usedNames.add(name); return name; }
+    var dot = name.lastIndexOf('.');
+    var base = dot > 0 ? name.slice(0, dot) : name;
+    var ext = dot > 0 ? name.slice(dot) : '';
+    var i = 1;
+    while (usedNames.has(`${base}-${i}${ext}`)) i++;
+    var unique = `${base}-${i}${ext}`;
+    usedNames.add(unique);
+    return unique;
+  };
+
+  var imageExtRe = /\.(jpe?g|png|gif|svg|webp|avif|ico|bmp)(\?|#|$)/i;
+  var fontExtRe = /\.(woff2?|ttf|otf|eot)(\?|#|$)/i;
+  var videoExtRe = /\.(mp4|webm|ogv|mov|avi|mkv|m4v)(\?|#|$)/i;
+  var audioExtRe = /\.(mp3|ogg|oga|wav|m4a|flac|aac|opus)(\?|#|$)/i;
+  var trackExtRe = /\.(vtt|srt)(\?|#|$)/i;
+  var detectKind = (url) => {
+    if (!url) return null;
+    if (imageExtRe.test(url)) return 'image';
+    if (fontExtRe.test(url)) return 'font';
+    if (videoExtRe.test(url)) return 'video';
+    if (audioExtRe.test(url)) return 'audio';
+    if (trackExtRe.test(url)) return 'track';
+    return null;
+  };
+  var fetched = new Map();
+  var contentHashes = new Map();
+
+  var hashContent = async (content) => {
+    var data = typeof content === 'string' ? new TextEncoder().encode(content) : content;
+    var buf = await crypto.subtle.digest('SHA-256', data);
+    return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+  };
+
+  var relativePath = (fromPath, toPath) => {
+    var fromParts = fromPath.split('/');
+    var toParts = toPath.split('/');
+    fromParts.pop();
+    var i = 0;
+    while (i < fromParts.length && i < toParts.length - 1 && fromParts[i] === toParts[i]) i++;
+    var ups = fromParts.length - i;
+    return '../'.repeat(ups) + toParts.slice(i).join('/');
+  };
+
+  var processCSSUrls = async (cssContent, cssURL, cssZipPath) => {
+    var urlRegex = /url\(\s*(['"]?)([^'")\s]+)\1\s*\)/g;
+    var matches = Array.from(cssContent.matchAll(urlRegex));
+    var replacements = new Map();
+    for (var m of matches) {
+      var fullMatch = m[0];
+      var quote = m[1];
+      var rawURL = m[2];
+      if (replacements.has(fullMatch)) continue;
+      if (!rawURL || rawURL.startsWith('data:') || rawURL.startsWith('#') || rawURL.startsWith('blob:')) continue;
+      var resolved;
+      try { resolved = new URL(rawURL, cssURL).href; } catch { continue; }
+      if (!/^https?:/i.test(resolved)) continue;
+      var k = fontExtRe.test(resolved) ? 'font' : /\.css(\?|#|$)/i.test(resolved) ? 'css' : 'image';
+      var bundledName = await fetchAsset(resolved, k);
+      if (bundledName) {
+        var rel = relativePath(cssZipPath, bundledName);
+        replacements.set(fullMatch, 'url(' + quote + rel + quote + ')');
+      }
+    }
+    replacements.forEach((newVal, oldVal) => {
+      cssContent = cssContent.split(oldVal).join(newVal);
+    });
+    return cssContent;
+  };
+
+  var fetchAsset = async (rawURL, kind) => {
+    if (!rawURL || rawURL.startsWith('data:') || rawURL.startsWith('blob:') || rawURL.startsWith('#')) return null;
+    var abs;
+    try { abs = new URL(rawURL, document.baseURI).href; } catch { return null; }
+    if (!/^https?:/i.test(abs)) return null;
+    if (fetched.has(abs)) return fetched.get(abs);
+    try {
+      var res = await fetch(abs);
+      if (!res.ok) { fetched.set(abs, null); return null; }
+      var basename = (new URL(abs).pathname.split('/').pop()) || kind;
+      if (kind === 'css') {
+        var cssText = await res.text();
+        if (!/\.css$/i.test(basename)) basename += '.css';
+        var cssName = ensureUnique('media/css/' + basename);
+        fetched.set(abs, cssName);
+        var rewritten = await processCSSUrls(cssText, abs, cssName);
+        files.push({ name: cssName, content: rewritten });
+        return cssName;
+      }
+      var dir;
+      var content;
+      if (kind === 'js') {
+        content = await res.text();
+        if (!/\.js$/i.test(basename)) basename += '.js';
+        dir = 'scripts/';
+      }
+      else if (kind === 'font') {
+        var blob = await res.blob();
+        var ab = await blob.arrayBuffer();
+        content = new Uint8Array(ab);
+        if (!/\.[a-z0-9]+$/i.test(basename)) {
+          var ct = res.headers.get('content-type') || '';
+          if (/woff2/i.test(ct)) basename += '.woff2';
+          else if (/woff/i.test(ct)) basename += '.woff';
+          else if (/ttf|truetype/i.test(ct)) basename += '.ttf';
+          else if (/otf|opentype/i.test(ct)) basename += '.otf';
+          else basename += '.bin';
+        }
+        dir = 'media/fonts/';
+      }
+      else if (kind === 'video') {
+        var blob = await res.blob();
+        var ab = await blob.arrayBuffer();
+        content = new Uint8Array(ab);
+        if (!/\.[a-z0-9]+$/i.test(basename)) {
+          var ct = res.headers.get('content-type') || '';
+          if (/webm/i.test(ct)) basename += '.webm';
+          else if (/mp4/i.test(ct)) basename += '.mp4';
+          else if (/ogg/i.test(ct)) basename += '.ogv';
+          else basename += '.bin';
+        }
+        dir = 'media/video/';
+      }
+      else if (kind === 'audio') {
+        var blob = await res.blob();
+        var ab = await blob.arrayBuffer();
+        content = new Uint8Array(ab);
+        if (!/\.[a-z0-9]+$/i.test(basename)) {
+          var ct = res.headers.get('content-type') || '';
+          if (/mpeg|mp3/i.test(ct)) basename += '.mp3';
+          else if (/ogg/i.test(ct)) basename += '.ogg';
+          else if (/wav/i.test(ct)) basename += '.wav';
+          else if (/aac/i.test(ct)) basename += '.aac';
+          else if (/flac/i.test(ct)) basename += '.flac';
+          else basename += '.bin';
+        }
+        dir = 'media/audio/';
+      }
+      else if (kind === 'track') {
+        content = await res.text();
+        if (!/\.(vtt|srt)$/i.test(basename)) basename += '.vtt';
+        dir = 'media/tracks/';
+      }
+      else {
+        var blob = await res.blob();
+        var ab = await blob.arrayBuffer();
+        content = new Uint8Array(ab);
+        if (!/\.[a-z0-9]+$/i.test(basename)) {
+          var ct = res.headers.get('content-type') || blob.type || '';
+          var ext = (ct.match(/^image\/([a-z0-9+.-]+)/i)?.[1] || 'bin').toLowerCase();
+          if (ext === 'jpeg') ext = 'jpg';
+          if (ext === 'svg+xml') ext = 'svg';
+          basename += '.' + ext;
+        }
+        dir = 'media/images/';
+      }
+      var hash = await hashContent(content);
+      if (contentHashes.has(hash)) {
+        var existingName = contentHashes.get(hash);
+        fetched.set(abs, existingName);
+        return existingName;
+      }
+      var name = ensureUnique(dir + basename);
+      files.push({ name, content });
+      fetched.set(abs, name);
+      contentHashes.set(hash, name);
+      return name;
+    } catch (e) {
+      console.warn('Could not bundle ' + kind, rawURL, e);
+      fetched.set(abs, null);
+      return null;
+    }
+  };
+
+  for (var link of Array.from(rootEl.querySelectorAll('link[rel~="stylesheet"][href]'))) {
+    var name = await fetchAsset(link.getAttribute('href'), 'css');
+    if (name) link.setAttribute('href', name);
+  }
+
+  for (var script of Array.from(rootEl.querySelectorAll('script[src]'))) {
+    var name = await fetchAsset(script.getAttribute('src'), 'js');
+    if (name) script.setAttribute('src', name);
+  }
+
+  for (var img of Array.from(rootEl.querySelectorAll('img[src]'))) {
+    var name = await fetchAsset(img.getAttribute('src'), 'image');
+    if (name) img.setAttribute('src', name);
+  }
+
+  for (var el of Array.from(rootEl.querySelectorAll('img[srcset], source[srcset]'))) {
+    var srcset = el.getAttribute('srcset');
+    if (!srcset) continue;
+    var entries = srcset.split(',').map(s => s.trim()).filter(Boolean);
+    var rewritten = [];
+    var changed = false;
+    for (var entry of entries) {
+      var parts = entry.split(/\s+/);
+      var urlPart = parts[0];
+      var descriptor = parts.slice(1).join(' ');
+      var name = await fetchAsset(urlPart, 'image');
+      if (name) {
+        rewritten.push(descriptor ? `${name} ${descriptor}` : name);
+        changed = true;
+      }
+      else {
+        rewritten.push(entry);
+      }
+    }
+    if (changed) el.setAttribute('srcset', rewritten.join(', '));
+  }
+
+  for (var anchor of Array.from(rootEl.querySelectorAll('a[href]'))) {
+    var hrefAttr = anchor.getAttribute('href');
+    var k = detectKind(hrefAttr);
+    if (!k) continue;
+    var name = await fetchAsset(hrefAttr, k);
+    if (name) anchor.setAttribute('href', name);
+  }
+
+  for (var icon of Array.from(rootEl.querySelectorAll('link[rel~="icon"][href], link[rel~="apple-touch-icon"][href], link[rel~="shortcut"][href]'))) {
+    var name = await fetchAsset(icon.getAttribute('href'), 'image');
+    if (name) icon.setAttribute('href', name);
+  }
+
+  for (var video of Array.from(rootEl.querySelectorAll('video[poster]'))) {
+    var name = await fetchAsset(video.getAttribute('poster'), 'image');
+    if (name) video.setAttribute('poster', name);
+  }
+
+  for (var mediaEl of Array.from(rootEl.querySelectorAll('video[src], audio[src]'))) {
+    var mediaSrc = mediaEl.getAttribute('src');
+    var mk = mediaEl.tagName.toLowerCase() === 'video' ? 'video' : 'audio';
+    var name = await fetchAsset(mediaSrc, mk);
+    if (name) mediaEl.setAttribute('src', name);
+  }
+
+  for (var source of Array.from(rootEl.querySelectorAll('source[src]'))) {
+    var sSrc = source.getAttribute('src');
+    var sKind = detectKind(sSrc);
+    if (!sKind) {
+      var parentName = source.parentElement?.tagName?.toLowerCase();
+      sKind = parentName === 'video' ? 'video' : parentName === 'audio' ? 'audio' : 'image';
+    }
+    var name = await fetchAsset(sSrc, sKind);
+    if (name) source.setAttribute('src', name);
+  }
+
+  for (var track of Array.from(rootEl.querySelectorAll('track[src]'))) {
+    var name = await fetchAsset(track.getAttribute('src'), 'track');
+    if (name) track.setAttribute('src', name);
+  }
+
+  for (var obj of Array.from(rootEl.querySelectorAll('object[data]'))) {
+    var objData = obj.getAttribute('data');
+    var ok = detectKind(objData) || 'image';
+    var name = await fetchAsset(objData, ok);
+    if (name) obj.setAttribute('data', name);
+  }
+
+  for (var emb of Array.from(rootEl.querySelectorAll('embed[src]'))) {
+    var embSrc = emb.getAttribute('src');
+    var ek = detectKind(embSrc) || 'image';
+    var name = await fetchAsset(embSrc, ek);
+    if (name) emb.setAttribute('src', name);
+  }
+
+  for (var preload of Array.from(rootEl.querySelectorAll('link[rel~="preload"][href]'))) {
+    var pAs = (preload.getAttribute('as') || '').toLowerCase();
+    var preKind = pAs === 'font' ? 'font' : pAs === 'image' ? 'image' : pAs === 'video' ? 'video' : pAs === 'audio' ? 'audio' : pAs === 'track' ? 'track' : pAs === 'style' ? 'css' : pAs === 'script' ? 'js' : detectKind(preload.getAttribute('href'));
+    if (!preKind) continue;
+    var name = await fetchAsset(preload.getAttribute('href'), preKind);
+    if (name) preload.setAttribute('href', name);
+  }
+
+  return files;
+}
+
+function rewriteAssetURLsToAbsolute(rootEl) {
+  rootEl.querySelectorAll('link[rel~="stylesheet"][href]').forEach((link) => {
+    try {
+      link.setAttribute('href', new URL(link.getAttribute('href'), document.baseURI).href);
+    } catch {}
+  });
+  rootEl.querySelectorAll('script[src]').forEach((script) => {
+    try {
+      script.setAttribute('src', new URL(script.getAttribute('src'), document.baseURI).href);
+    } catch {}
+  });
+}
+
+function crc32(buf) {
+  if (!crc32.table) {
+    var table = new Uint32Array(256);
+    for (var i = 0; i < 256; i++) {
+      var c = i;
+      for (var k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      table[i] = c;
+    }
+    crc32.table = table;
+  }
+  var t = crc32.table;
+  var crc = 0xFFFFFFFF;
+  for (var j = 0; j < buf.length; j++) crc = (crc >>> 8) ^ t[(crc ^ buf[j]) & 0xFF];
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+function createZipBlob(files) {
+  var enc = new TextEncoder();
+  var entries = files.map(f => {
+    var data = typeof f.content === 'string' ? enc.encode(f.content) : f.content;
+    return { name: f.name, nameBytes: enc.encode(f.name), data, crc: crc32(data), size: data.byteLength };
+  });
+
+  var chunks = [];
+  var offset = 0;
+  entries.forEach(e => {
+    e.offset = offset;
+    var lh = new ArrayBuffer(30);
+    var dv = new DataView(lh);
+    dv.setUint32(0, 0x04034b50, true);
+    dv.setUint16(4, 20, true);
+    dv.setUint16(6, 0x0800, true);
+    dv.setUint16(8, 0, true);
+    dv.setUint16(10, 0, true);
+    dv.setUint16(12, 0x21, true);
+    dv.setUint32(14, e.crc, true);
+    dv.setUint32(18, e.size, true);
+    dv.setUint32(22, e.size, true);
+    dv.setUint16(26, e.nameBytes.byteLength, true);
+    dv.setUint16(28, 0, true);
+    chunks.push(new Uint8Array(lh), e.nameBytes, e.data);
+    offset += 30 + e.nameBytes.byteLength + e.size;
+  });
+
+  var cdStart = offset;
+  var cdSize = 0;
+  entries.forEach(e => {
+    var cd = new ArrayBuffer(46);
+    var dv = new DataView(cd);
+    dv.setUint32(0, 0x02014b50, true);
+    dv.setUint16(4, 20, true);
+    dv.setUint16(6, 20, true);
+    dv.setUint16(8, 0x0800, true);
+    dv.setUint16(10, 0, true);
+    dv.setUint16(12, 0, true);
+    dv.setUint16(14, 0x21, true);
+    dv.setUint32(16, e.crc, true);
+    dv.setUint32(20, e.size, true);
+    dv.setUint32(24, e.size, true);
+    dv.setUint16(28, e.nameBytes.byteLength, true);
+    dv.setUint16(30, 0, true);
+    dv.setUint16(32, 0, true);
+    dv.setUint16(34, 0, true);
+    dv.setUint16(36, 0, true);
+    dv.setUint32(38, 0, true);
+    dv.setUint32(42, e.offset, true);
+    chunks.push(new Uint8Array(cd), e.nameBytes);
+    cdSize += 46 + e.nameBytes.byteLength;
+  });
+
+  var eocd = new ArrayBuffer(22);
+  var dvE = new DataView(eocd);
+  dvE.setUint32(0, 0x06054b50, true);
+  dvE.setUint16(4, 0, true);
+  dvE.setUint16(6, 0, true);
+  dvE.setUint16(8, entries.length, true);
+  dvE.setUint16(10, entries.length, true);
+  dvE.setUint32(12, cdSize, true);
+  dvE.setUint32(16, cdStart, true);
+  dvE.setUint16(20, 0, true);
+  chunks.push(new Uint8Array(eocd));
+
+  return new Blob(chunks, { type: 'application/zip' });
+}
+
+// Reads the stored (method 0) entries createZipBlob writes; deflate is unsupported
+function readZipEntries(buffer) {
+  const view = new DataView(buffer);
+  const bytes = new Uint8Array(buffer);
+  const decoder = new TextDecoder();
+  const entries = [];
+  let offset = 0;
+
+  while (offset + 30 <= bytes.length && view.getUint32(offset, true) === 0x04034b50) {
+    const method = view.getUint16(offset + 8, true);
+    const size = view.getUint32(offset + 18, true);
+    const nameLength = view.getUint16(offset + 26, true);
+    const dataStart = offset + 30 + nameLength + view.getUint16(offset + 28, true);
+    if (method !== 0) throw new Error('This zip is compressed; extract it and choose the file inside.');
+    entries.push({
+      name: decoder.decode(bytes.subarray(offset + 30, offset + 30 + nameLength)),
+      text: decoder.decode(bytes.subarray(dataStart, dataStart + size))
+    });
+    offset = dataStart + size;
+  }
+
+  return entries;
+}
+
+function downloadBlobAsFile(blob, filename) {
+  var a = document.createElement('a');
+  a.download = filename;
+  a.href = URL.createObjectURL(blob);
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(a.href), 0);
+}
+
+export function attachBrowseStoragePopup(id, action) {
+  var listingEl = document.getElementById(id + '-listing');
+  var listingHome = listingEl?.parentNode;
+  if (listingEl) {
+    listingEl.classList.add('save-as-listing-detached');
+    listingEl.style.display = 'none';
+  }
+
+  var createBtnEl = document.getElementById(id + '-create-container-button');
+  var createBtnHome = createBtnEl?.parentNode;
+  if (createBtnEl) {
+    createBtnEl.classList.add('save-as-listing-detached');
+    createBtnEl.style.display = 'none';
+  }
+
+  var createDivEl = document.getElementById(id + '-create-container');
+  var createDivHome = createDivEl?.parentNode;
+  if (createDivEl) {
+    createDivEl.classList.add('save-as-listing-detached');
+    createDivEl.style.display = 'none';
+  }
+
+  var iconHome = `<span class="browse-nav-icon">${Icon['.fas.fa-house']}</span>`;
+  var iconBack = `<span class="browse-nav-icon">${Icon['.fas.fa-arrow-left']}</span>`;
+
+  var browseBtn = document.getElementById(id + '-update');
+  browseBtn?.addEventListener('click', () => {
+    if (document.getElementById('browse-storage')) return;
+    var urlInputEl = document.getElementById(id + '-input');
+    var priorURL = urlInputEl?.value || '';
+
+    var modalClose = getButtonHTML({ key: 'dialog.browse-storage.close.button', button: 'close', buttonClass: 'close', iconSize: 'fa-2x' });
+
+    document.body.appendChild(fragmentFromString(`
+      <aside aria-labelledby="browse-storage-label" class="do on" dir="${Config.User.UI.LanguageDir}" id="browse-storage" lang="${Config.User.UI.Language}" xml:lang="${Config.User.UI.Language}">
+        <h2 data-i18n="dialog.browse-storage.h2" id="browse-storage-label">${i18n.t('dialog.browse-storage.h2.textContent')}</h2>
+        ${modalClose}
+        <div class="browse-storage-nav">
+          <button class="browse-nav-back" type="button" title="${i18n.t('dialog.browse-storage.back.button.title')}" aria-label="${i18n.t('dialog.browse-storage.back.button.title')}">${iconBack}</button>
+          <span class="browse-storage-breadcrumb"></span>
+          <span class="browse-storage-nav-actions"></span>
+        </div>
+        <div class="browse-storage-body"></div>
+        <div class="browse-storage-selected">
+          <label data-i18n="dialog.browse-storage.selected-path.label" for="browse-storage-selected-path">${i18n.t('dialog.browse-storage.selected-path.label.textContent')}</label>
+          <input id="browse-storage-selected-path" readonly="readonly" type="text" value="${priorURL}" />
+        </div>
+        <div class="browse-storage-actions">
+          <button class="cancel" type="button" data-i18n="dialog.browse-storage.cancel.button">${i18n.t('dialog.browse-storage.cancel.button.textContent')}</button>
+          <button class="create select-folder" type="button" data-i18n="dialog.browse-storage.select-folder.button">${i18n.t('dialog.browse-storage.select-folder.button.textContent')}</button>
+        </div>
+      </aside>
+    `));
+
+    var browseModal = document.getElementById('browse-storage');
+    var modalBody = browseModal.querySelector('.browse-storage-body');
+    var navActions = browseModal.querySelector('.browse-storage-nav-actions');
+    var breadcrumbEl = browseModal.querySelector('.browse-storage-breadcrumb');
+    var selectedPathInput = browseModal.querySelector('#browse-storage-selected-path');
+    var backBtn = browseModal.querySelector('.browse-nav-back');
+
+    if (listingEl) {
+      listingEl.classList.remove('save-as-listing-detached');
+      listingEl.style.display = '';
+      modalBody.appendChild(listingEl);
+    }
+    if (createDivEl) {
+      createDivEl.classList.remove('save-as-listing-detached');
+      createDivEl.style.display = '';
+      modalBody.appendChild(createDivEl);
+    }
+    if (createBtnEl) {
+      createBtnEl.classList.remove('save-as-listing-detached');
+      createBtnEl.style.display = '';
+      navActions.appendChild(createBtnEl);
+    }
+
+    var updateBreadcrumb = () => {
+      var cur = urlInputEl?.value || '';
+      var rootLabel = i18n.t('dialog.browse-storage.breadcrumb-root.textContent');
+      var crumbs = [];
+      try {
+        var u = new URL(cur);
+        crumbs.push({ label: rootLabel, url: u.origin + '/' });
+        var parts = u.pathname.split('/').filter(Boolean);
+        var accum = '';
+        parts.forEach((part) => {
+          accum += '/' + part;
+          crumbs.push({ label: decodeURIComponent(part), url: u.origin + accum + '/' });
+        });
+      } catch {
+        crumbs.push({ label: rootLabel, url: '' });
+      }
+      backBtn.disabled = crumbs.length <= 1;
+      while (breadcrumbEl.firstChild) breadcrumbEl.removeChild(breadcrumbEl.firstChild);
+      crumbs.forEach((crumb, idx) => {
+        var isLast = idx === crumbs.length - 1;
+        var isFirst = idx === 0;
+        if (idx > 0) {
+          var sep = document.createElement('span');
+          sep.className = 'browse-storage-breadcrumb-sep';
+          sep.textContent = '/';
+          breadcrumbEl.appendChild(sep);
+        }
+        var node;
+        if (isLast) {
+          node = document.createElement('span');
+          node.className = 'browse-storage-breadcrumb-current';
+        }
+        else {
+          node = document.createElement('a');
+          node.href = '#';
+          node.dataset.url = crumb.url;
+        }
+        if (isFirst) {
+          node.classList.add('browse-storage-breadcrumb-home');
+          node.innerHTML = iconHome;
+          var labelSpan = document.createElement('span');
+          labelSpan.textContent = crumb.label;
+          node.appendChild(labelSpan);
+        }
+        else {
+          node.textContent = crumb.label;
+        }
+        breadcrumbEl.appendChild(node);
+      });
+    };
+    updateBreadcrumb();
+
+    breadcrumbEl.addEventListener('click', (ev) => {
+      var link = ev.target.closest('a[data-url]');
+      if (!link) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      var targetURL = link.dataset.url;
+      if (!targetURL) return;
+      if (urlInputEl) {
+        urlInputEl.value = targetURL;
+        urlInputEl.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      triggerBrowse(targetURL, id, action);
+    });
+
+    var syncSelectedPath = () => {
+      selectedPathInput.value = urlInputEl?.value || '';
+      updateBreadcrumb();
+    };
+    urlInputEl?.addEventListener('input', syncSelectedPath);
+
+    backBtn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      var cur = urlInputEl?.value || '';
+      try {
+        var u = new URL(cur);
+        var parts = u.pathname.split('/').filter(Boolean);
+        if (parts.length === 0) return;
+        parts.pop();
+        u.pathname = parts.length ? '/' + parts.join('/') + '/' : '/';
+        var parentURL = u.toString();
+        if (urlInputEl) {
+          urlInputEl.value = parentURL;
+          urlInputEl.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        triggerBrowse(parentURL, id, action);
+      } catch {}
+    });
+
+    var detachAndRestore = () => {
+      urlInputEl?.removeEventListener('input', syncSelectedPath);
+      if (listingHome && listingEl) {
+        listingEl.classList.add('save-as-listing-detached');
+        listingEl.style.display = 'none';
+        listingHome.appendChild(listingEl);
+      }
+      if (createDivHome && createDivEl) {
+        createDivEl.classList.add('save-as-listing-detached');
+        createDivEl.style.display = 'none';
+        createDivHome.appendChild(createDivEl);
+      }
+      if (createBtnHome && createBtnEl) {
+        createBtnEl.classList.add('save-as-listing-detached');
+        createBtnEl.style.display = 'none';
+        createBtnHome.appendChild(createBtnEl);
+      }
+      browseModal.parentNode?.removeChild(browseModal);
+    };
+
+    browseModal.addEventListener('click', (ev) => {
+      if (ev.target.closest('button.close') || ev.target.closest('button.cancel')) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (urlInputEl) {
+          urlInputEl.value = priorURL;
+          urlInputEl.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        detachAndRestore();
+        return;
+      }
+      if (ev.target.closest('button.select-folder')) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        detachAndRestore();
+      }
+    });
+  });
+}
+
+function triggerBrowse(url, id, action){
+  var inputBox = document.getElementById(id);
+  if (url.length > 10 && url.match(/^https?:\/\//g) && url.slice(-1) == "/"){
+    const gitforge = Config.Storage?.backend?.('gitforge');
+    if (gitforge?.canList?.(url)) {
+      generateGitForgeBrowserList(url, id, action).catch(e => {
+        showErrorResponseMessage(inputBox, { status: e.status, statusText: e.message });
+      });
+      return;
+    }
+    var headers;
+    headers = {'Accept': 'text/turtle, application/ld+json'};
+    setBrowserListLoading(id, true);
+    getResourceGraph(url, headers, { noProxy: true }).then(({ graph: g }) => {
+      if (!g) {
+        setBrowserListLoading(id, false);
+        return;
+      }
+      generateBrowserList(g, url, id, action).then(l => {
+        showStorageDescription(g, id, url);
+        return l;
+      },
+      function(reason){
+        setBrowserListLoading(id, false);
+        console.log('???? ' + reason); // Probably no reason for it to get to here
+      });
+    },
+    function({ response } = {}){
+      setBrowserListLoading(id, false);
+      var node = document.getElementById(id + '-ul');
+
+      showErrorResponseMessage(node, response);
+    });
+  }
+  else{
+    sanitizeInsertAdjacentHTML(inputBox, 'beforeend', `<div class="response-message"><p class="error" data-i18n="browser.error.invalid-location.p">${i18n.t('browser.error.invalid-location.p.textContent')}</p></div>`);
+  }
+}
+
+function showCreateContainer(baseURL, id, action, e) {
+  //FIXME: Do these checks for now until showCreateContainer is refactored
+  if (!e) {
+    return;
+  }
+  id = id || generateAttributeId();
+
+  var div = document.getElementById(id + '-create-container');
+  if (div) {
+    div.replaceChildren();
+  }
+
+  sanitizeInsertAdjacentHTML(div, 'beforeend', `<label data-18n="browser.create-container-name.label" for="${id}-create-container-name">${i18n.t('browser.create-container-name.label.textContent')}</label> <input data-i18n="browser.create-container-name.input" dir="auto" id="${id}-create-container-name" name="${id}-create-container-name" type="text" placeholder="${i18n.t('browser.create-container-name.input.placeholder')}" /> <button class="insert" data-i18n="browser.create-container-name.button" disabled="disabled" title="${i18n.t('browser.create-container-name.button.title')}" type="button">${i18n.t('browser.create-container-name.button.textContent')}</button>`);
+
+  var label = div.querySelector('label');
+  var input = div.querySelector('input');
+
+  var createButton = document.querySelector('#' + id + '-create-container button.insert');
+
+  input.addEventListener('keyup', (e) => {
+    var containerLabel = domSanitize(input.value.trim());
+
+    if (containerLabel.length) {
+      createButton.removeAttribute('disabled');
+    }
+    else {
+      createButton.disabled = 'disabled';
+    }
+  });
+
+  createButton.addEventListener('click', (e) => {
+    //FIXME: Escaping containerLabel and containerURL (request-target) can be better.
+
+    var patch = {};
+    var containerLabel = domSanitize(input.value.trim());
+    var insertG = '<> <' + ns.dcterms.title.value +  '> """' + escapeRDFLiteral(containerLabel) + '""" .';
+    patch = { 'insert': insertG };
+
+    containerLabel = containerLabel.endsWith('/') ? containerLabel.slice(0, -1) : containerLabel;
+
+    var containerURL = baseURL + encodeURIComponent(containerLabel) + '/';
+
+    var options = { 'headers': { 'If-None-Match': '*' } };
+
+    var node = document.getElementById(id + '-create-container');
+
+    Config.Storage.patchWithConneg(containerURL, patch, options)
+      .then(response => {
+        triggerBrowse(containerURL, id, action);
+      })
+      .catch(reason => {
+        // console.log(reason);
+
+        var main = `      <article about=""><dl id="document-title"><dt>Title</dt><dd property="dcterms:title">${containerLabel}</dd></dl></article>`;
+
+        var o = {
+          'omitLang': true,
+          'prefixes': {
+            'dcterms': 'http://purl.org/dc/terms/'
+          }
+        }
+
+        var data = createHTML(containerLabel, main, o);
+
+        // console.log(data);
+
+        options.headers['Content-Type'] = 'text/html';
+
+        Config.Storage.putWithConneg(containerURL, data, options)
+          .then(response => {
+            triggerBrowse(containerURL, id, action);
+          })
+          .catch(reason => {
+            // console.log(reason)
+
+            showErrorResponseMessage(node, reason.response, 'createContainer');
+          })
+      })
+  });
+}
+
+function showErrorResponseMessage(node, response, context) {
+  if (!node) return;
+  response = response || {};
+  var statusCode = ('status' in response) ? response.status : 0;
+  statusCode = (typeof statusCode === 'string') ? parseInt(response.slice(-3)) : statusCode;
+  // console.log(statusCode);
+  // console.log(response);
+
+  var msgs = node.querySelectorAll('.response-message');
+  for(var i = 0; i < msgs.length; i++){
+    msgs[i].parentNode.removeChild(msgs[i]);
+  }
+
+  var statusText = response.statusText || '';
+  //TODO: use Sanitizer API?
+  statusText = statusText
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+
+  var msg = '';
+
+  let errorKey = 'default';
+
+  switch(statusCode) {
+    default:
+      break;
+    case 401:
+      if (Config.User.IRI) {
+        errorKey = 'invalid-credentials';
+      } else {
+        errorKey = 'unauthenticated';
+      }
+      break;
+    case 403:
+      errorKey = 'request-forbidden';
+      break;
+    case 404:
+      errorKey = 'not-found';
+      break;
+    case 405:
+      errorKey = 'request-not-supported';
+      break;
+    case 409:
+      errorKey = 'conflict';
+      break;
+    case 412:
+      errorKey = "precondition-failed";
+      switch (context) {
+        default:
+          break;
+        case 'createContainer':
+          errorKey = `${errorKey}-create-container-name`;
+          break;
+      }
+  }
+
+  msg = i18n.t(`browser.error.${errorKey}.p.textContent`);
+
+  sanitizeInsertAdjacentHTML(node, 'beforeend', `<div class="response-message"><p class="error" data-i18n="browser.error.${errorKey}.p">${msg}</p></div>`);
+}
+
+
+//TODO: Refactor, especially buttons.
+function initBrowse(baseUrl, input, browseButton, createButton, id, action){
+  input.value = baseUrl;
+  if (baseUrl && /^https?:\/\//.test(baseUrl) && baseUrl.length > 10) {
+    browseButton?.removeAttribute('disabled');
+  }
+
+  const gitforge = Config.Storage?.backend?.('gitforge');
+  if (gitforge?.canList?.(baseUrl)) {
+    generateGitForgeBrowserList(baseUrl, id, action)
+      .catch((e) => {
+        const node = document.getElementById(id);
+        if (node) {
+          showErrorResponseMessage(node, { status: e.status, statusText: e.message });
+        }
+      })
+      .then(() => {
+        let sampNode = document.getElementById(id + '-' + action);
+        if (sampNode) {
+          sampNode.textContent = (action == 'write') ? input.value + (document.getElementById(id + '-filename')?.value || generateAttributeId()) : input.value;
+        }
+      });
+  } else {
+    var headers = {'Accept': 'text/turtle, application/ld+json'};
+    setBrowserListLoading(id, true);
+    getResourceGraph(baseUrl, headers, { noProxy: true })
+      .then(({ graph: g }) => {
+        if (!g) {
+          setBrowserListLoading(id, false);
+          return;
+        }
+        return generateBrowserList(g, baseUrl, id, action)
+          .then(() => showStorageDescription(g, id, baseUrl));
+      })
+      .catch(() => setBrowserListLoading(id, false))
+      .then(() => {
+        let sampNode = document.getElementById(id + '-' + action);
+        if (sampNode) {
+          sampNode.textContent = (action == 'write') ? input.value + (document.getElementById(id + '-filename')?.value || generateAttributeId()) : input.value;
+        }
+      });
+  }
+
+
+
+  if (createButton) {
+    createButton.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+
+      showCreateContainer(input.value, id, action, e);
+    }, false);
+  }
+}
+
+var browserListLoadingTimers = {};
+
+function setBrowserListLoading(id, isLoading) {
+  var list = document.getElementById(id + '-ul');
+  if (!list || !list.parentNode) return;
+  clearTimeout(browserListLoadingTimers[id]);
+  delete browserListLoadingTimers[id];
+  list.parentNode.querySelectorAll('.container-loading').forEach(n => n.remove());
+  if (isLoading) {
+    sanitizeInsertAdjacentHTML(list, 'afterend', `<p class="container-loading">${Icon['.fas.fa-circle-notch.fa-spin.fa-fw']} <em data-i18n="browser.loading">${i18n.t('browser.loading.textContent')}</em></p>`);
+    browserListLoadingTimers[id] = setTimeout(() => {
+      delete browserListLoadingTimers[id];
+      var em = document.getElementById(id + '-ul')?.parentNode?.querySelector('.container-loading em');
+      if (em) {
+        em.setAttribute('data-i18n', 'browser.loading-slow');
+        em.textContent = i18n.t('browser.loading-slow.textContent');
+      }
+    }, 10000);
+  }
+}
+
+async function generateGitForgeBrowserList(url, id, action) {
+  const gitforge = Config.Storage?.backend?.('gitforge');
+  if (!gitforge) return;
+
+  const inputEl = document.getElementById(id + '-input');
+  inputEl.value = url;
+  inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+
+  const containerNode = document.getElementById(id);
+  containerNode.querySelectorAll('.response-message').forEach(n => n.parentNode.removeChild(n));
+  const createContainer = document.getElementById(id + '-create-container');
+  if (createContainer) createContainer.replaceChildren();
+
+  const list = document.getElementById(id + '-ul');
+
+  let items;
+  setBrowserListLoading(id, true);
+  try {
+    items = await gitforge.list(url);
+  } catch (e) {
+    setBrowserListLoading(id, false);
+    sanitizeInsertAdjacentHTML(containerNode, 'beforeend', `<div class="response-message"><p class="error">${e.message}</p></div>`);
+    return;
+  }
+
+  list.replaceChildren();
+  list.parentNode.querySelectorAll('.container-empty, .container-loading').forEach(n => n.remove());
+
+  try {
+    const u = new URL(url);
+    const parts = u.pathname.replace(/^\//, '').replace(/\/$/, '').split('/').filter(Boolean);
+    if (parts.length > 1) {
+      let prev;
+      if (parts.length === 2) {
+        prev = `${u.origin}/${parts[0]}/`;
+      } else {
+        const popped = parts.slice(0, -1);
+        if ((popped.length === 4 && popped[2] === 'src' && popped[3] === 'branch') ||
+            (popped.length === 3 && popped[2] === 'tree')) {
+          prev = `${u.origin}/${popped[0]}/${popped[1]}/`;
+        } else {
+          prev = `${u.origin}/${popped.join('/')}/`;
+        }
+      }
+      const upId = `gf-up-${generateAttributeId()}`;
+      sanitizeInsertAdjacentHTML(list, 'beforeend', `<li class="container"><input type="radio" name="containers" value="${prev}" id="${upId}" /><label for="${upId}" id="browser-up">..</label></li>`);
+    }
+  } catch {}
+
+  const containersOnly = containerNode.hasAttribute('data-containers-only');
+  const dirs = items.filter(i => i.type === 'dir').sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+  const files = containersOnly ? [] : items.filter(i => i.type === 'file').sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+
+  const renderItem = (it) => {
+    const inputId = `gf-${generateAttributeId()}`;
+    return `<li class="${it.type === 'dir' ? 'container' : ''}"><input type="radio" name="resources" value="${it.url}" id="${inputId}"/><label for="${inputId}">${it.name}</label></li>`;
+  };
+  const html = [...dirs.map(renderItem), ...files.map(renderItem)].join('\n');
+  sanitizeInsertAdjacentHTML(list, 'beforeend', html);
+
+  if (dirs.length === 0 && files.length === 0) {
+    sanitizeInsertAdjacentHTML(list, 'afterend', '<p class="container-empty"><em>(empty)</em></p>');
+  }
+
+  const actionNode = document.getElementById(id + '-' + action);
+  const labels = list.querySelectorAll('label');
+  labels.forEach(label => {
+    const li = label.parentNode;
+    const input = li.querySelector('input');
+    const nextUrl = input.value;
+    label.addEventListener('click', () => {
+      if (li.classList.contains('container')) {
+        generateGitForgeBrowserList(nextUrl, id, action).catch(() => {});
+      } else {
+        inputEl.value = nextUrl;
+        if (actionNode) actionNode.textContent = nextUrl;
+      }
+    }, false);
+  });
+}
+
+function generateBrowserList(g, url, id, action) {
+  //TODO: This should be part of refactoring.
+  var inputType = (id == 'location-generate-feed') ? 'checkbox' : 'radio';
+
+  var inputEl = document.getElementById(id + '-input');
+  inputEl.value = url;
+  inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+
+  return new Promise((resolve, reject) => {
+    var msgs = document.getElementById(id).querySelectorAll('.response-message');
+
+    for(var i = 0; i < msgs.length; i++){
+      msgs[i].parentNode.removeChild(msgs[i]);
+    }
+
+    //TODO: Perhaps this should be handled outside of generateBrowserList?
+    var createContainer = document.getElementById(id + '-create-container');
+    if (createContainer) {
+      createContainer.replaceChildren();
+    }
+
+    var list = document.getElementById(id + '-ul');
+    list.replaceChildren();
+    list.parentNode.querySelectorAll('.container-empty, .container-loading').forEach(n => n.remove());
+
+    var urlPath = url.split("/");
+    if (urlPath.length > 4){ // This means it's not the base URL
+      urlPath.splice(-2,2);
+      var prevUrl = forceTrailingSlash(urlPath.join("/"));
+      var upBtn = '<li class="container"><input type="radio" name="containers" value="' + prevUrl + '" id="' + prevUrl + '" /><label for="' + prevUrl + '" id="browser-up">..</label></li>';
+      sanitizeInsertAdjacentHTML(list, 'afterbegin', upBtn);
+    }
+
+    var containersOnly = document.getElementById(id)?.hasAttribute('data-containers-only');
+    var current = g.node(rdf.namedNode(url));
+    var contains = current.out(ns.ldp.contains).values.map(v => domSanitize(v));
+    var containersLi = Array();
+    var resourcesLi = Array();
+    contains.forEach(c => {
+      var cg = g.node(rdf.namedNode(c));
+      var resourceTypes = getGraphTypes(cg);
+
+      var path = c.split("/");
+      if (resourceTypes.includes(ns.ldp.Container.value) || resourceTypes.includes(ns.ldp.BasicContainer.value)){
+        var slug = path[path.length-2];
+        containersLi.push('<li class="container"><input type="radio" name="resources" value="' + c + '" id="' + slug + '"/><label for="' + slug + '">' + decodeURIComponent(slug) + '</label></li>');
+      }
+      else if (!containersOnly) {
+        slug = path[path.length-1];
+        resourcesLi.push('<li><input type="' + inputType + '" name="resources" value="' + c + '" id="' + slug + '"/><label for="' + slug + '">' + decodeURIComponent(slug) + '</label></li>');
+      }
+
+    });
+    containersLi.sort(function (a, b) {
+      return a.toLowerCase().localeCompare(b.toLowerCase());
+    });
+    resourcesLi.sort(function (a, b) {
+      return a.toLowerCase().localeCompare(b.toLowerCase());
+    });
+    var liHTML = containersLi.join('\n') + resourcesLi.join('\n');
+    sanitizeInsertAdjacentHTML(list, 'beforeend', liHTML);
+
+    var buttons = list.querySelectorAll('label');
+    if(!containersLi.length && !resourcesLi.length){
+      sanitizeInsertAdjacentHTML(list, 'afterend', '<p class="container-empty"><em>(empty)</em></p>');
+    }
+
+    for(let i = 0; i < buttons.length; i++) {
+      var buttonParent = buttons[i].parentNode;
+      var buttonInput = buttonParent.querySelector('input');
+
+      //TODO: Find a better way than checking specific ids.
+      if (!(id == 'location-generate-feed' && !buttonParent.classList.contains('container'))) {
+        var nextUrl = buttonInput.value;
+        nextLevelButton(buttons[i], nextUrl, id, action);
+      }
+    }
+
+    return resolve(list);
+  });
+}
+
+function nextLevelButton(button, url, id, action) {
+  url = sanitizeIRI(url);
+  id = domSanitize(id);
+  action = domSanitize(action);
+
+  //Action is for features that need to show a samp URL, e.g., save as URL (before submitting). The open feature doesn't have samp.
+  var actionNode = document.getElementById(id + '-' + action);
+
+  //TODO: Some refactoring needed because it is radio only. For now this function is not called for inputType=checkbox
+  var inputType = (id == 'location-generate-feed') ? 'checkbox' : 'radio';
+
+  button.addEventListener('click', () => {
+    if(button.parentNode.classList.contains('container')){
+      var headers;
+      headers = {'Accept': 'text/turtle, application/ld+json'};
+      setBrowserListLoading(id, true);
+      getResourceGraph(url, headers, { noProxy: true }).then(({ graph: g }) => {
+          if (!g) {
+            setBrowserListLoading(id, false);
+            return;
+          }
+          if (actionNode) {
+            actionNode.textContent = (action == 'write') ? url + (document.getElementById(id + '-filename')?.value || generateAttributeId()) : url;
+          }
+          return generateBrowserList(g, url, id, action);
+        },
+        function({ response } = {}){
+          setBrowserListLoading(id, false);
+          var node = document.getElementById(id);
+
+          showErrorResponseMessage(node, response);
+        }
+      );
+    }
+    else {
+      var leafInput = document.getElementById(id + '-input');
+      leafInput.value = url;
+      leafInput.dispatchEvent(new Event('input', { bubbles: true }));
+      var alreadyChecked = button.parentNode.querySelector('input[type="radio"]').checked;
+      var radios = button.parentNode.parentNode.querySelectorAll('input[checked="true"]');
+
+      if (actionNode) {
+        actionNode.textContent =  url;
+      }
+
+      for(var i = 0; i < radios.length; i++){
+        radios[i].removeAttribute('checked');
+      }
+      if(alreadyChecked){
+        button.parentNode.querySelector('input[type="radio"]').removeAttribute('checked');
+      }
+      else{
+        button.parentNode.querySelector('input[type="radio"]').setAttribute('checked', 'true');
+      }
+    }
+  }, false);
+}
+
+function showStorageDescription(s, id, storageUrl, checkAgain) {
+  var samp = document.getElementById(id + '-samp');
+  var sD = document.getElementById(id + '-storage-description');
+
+  if (samp && !sD) {
+    var sDPromise = getLinkRelation(ns.solid.storageDescription.value, storageUrl);
+
+    return sDPromise
+      .then(sDURLs => {
+        // TODO: resourceIRI for getLinkRelation should be the
+        // closest IRI (not necessarily the document).
+
+        if (sDURLs.length) {
+          ///TODO: Handle multiple storage descriptions?
+          var sDURL = sDURLs[0];
+          Config.Storages = Config.Storages || {};
+          Config.Storages[s.term.value] = {
+            "storageDescription": sDURL
+          };
+        }
+        if (sD) {
+          sD.replaceChildren();
+        }
+        const details = document.getElementById(`${id}-storage-description-details`);
+        if (details) {
+          details.remove();
+        }
+        sanitizeInsertAdjacentHTML(samp, 'afterend', `<details id="${id}-storage-description-details"><summary data-i18n="dialog.storage-details.summary">${i18n.t('dialog.storage-details.summary.textContent')}</summary></details>`);
+
+        sD = document.getElementById(id + '-storage-description-details');
+
+        sD.addEventListener('click', (e) => {
+          if (!sD.open) {
+            var storageDescriptionNode = document.getElementById(id + '-storage-description');
+
+            if (!storageDescriptionNode) {
+              var storageLocation = `<dl id="storage-location"><dt data-i18n="dialog.storage-location.dt">${i18n.t('dialog.storage-location.dt.textContent')}</dt><dd><a href="${storageUrl}" rel="noopener" target="_blank">${storageUrl}</a></dd></dl>`;
+
+              getResourceGraph(sDURL).then(({ graph: g }) => {
+                if (g) {
+                  var primaryTopic = g.out(ns.foaf.primaryTopic).values;
+                  g = (primaryTopic.length) ? g.node(rdf.namedNode(primaryTopic[0])) : g.node(rdf.namedNode(storageUrl));
+
+                  var selfDescription = getStorageSelfDescription(g);
+                  var contactInformation = getContactInformation(g);
+                  var persistencePolicy = getPersistencePolicy(g);
+                  var odrlPolicies = getODRLPolicies(g);
+                  var communicationOptions = getCommunicationOptions(g);
+
+                  sanitizeInsertAdjacentHTML(sD, 'beforeend', '<div id="' + id + '-storage-description">' + storageLocation + selfDescription + contactInformation + persistencePolicy + odrlPolicies + communicationOptions + '</div>');
+
+                  var subscriptionsId = id + '-storage-description-details';
+                  var topicResource = s.term.value;
+
+                  var nodes = document.querySelectorAll('[id="' + id + '-storage-description"] [id^="notification-subscriptions-"]');
+                  buttonSubscribeNotificationChannel(nodes, topicResource);
+                }
+                else {
+                  // TODO: var status = (g.status) ? g.status
+                  sanitizeInsertAdjacentHTML(sD, 'beforeend', '<div id="' + id + '-storage-description">Unavailable</div>');
+                }
+              });
+            }
+          }
+        });
+
+        // console.log(Config.Resource);
+      })
+      .catch(error => {
+        // console.log('Error fetching solid:storageDescription endpoint:', error)
+        // throw error
+      });
+  }
+}
+
+export async function openResource(iri, options) {
+  options = options || {};
+  var headers = { 'Accept': setAcceptRDFTypes() };
+  // var pIRI = getProxyableIRI(iri);
+  // if (pIRI.slice(0, 5).toLowerCase() == 'http:') {
+  // }
+
+  var handleResource = async function handleResource(iri, headers, options) {
+    var message = `Opening <a href="${iri} rel="noopener" target="_blank">${iri}</a>.`;
+    var actionMessage = `Opening <a href="${iri}" rel="noopener" target="_blank">${iri}</a>`;
+
+    const messageObject = {
+      'content': actionMessage,
+      'type': 'info',
+      'timer': 10000
+    }
+
+    addMessageToLog({...messageObject, content: message}, Config.MessageLog);
+    const messageId = showActionMessage(document.body, messageObject);
+    let response;
+    let error;
+
+    // Attempt 1: GET with existing RDF Accept header (CORS-safe, no preflight)
+    try {
+      response = await Config.Storage.get(iri, headers, options);
+    } catch(e) {
+      // Attempt 2: bare GET, no Accept header, let server decide
+      try {
+        response = await Config.Storage.get(iri, {}, options);
+      } catch(e2) {
+        error = e2;
+
+        // Offline or unreachable: fall back to the latest device copy
+        const collection = await getDeviceStorageItem(stripFragmentFromString(iri)).catch(() => null);
+        const latestItemId = collection?.items?.[0];
+        const localItem = latestItemId ? await getDeviceStorageItem(latestItemId).catch(() => null) : null;
+
+        if (localItem?.content) {
+          response = new Response(localItem.content, { headers: { 'Content-Type': localItem.mediaType || 'text/html' } });
+
+          const localCopyMessage = {
+            'content': `Showing a copy of <a href="${iri}" rel="noopener" target="_blank">${iri}</a> saved on this device (${localItem.updated || 'date unknown'}).`,
+            'type': 'info',
+            'timer': 10000
+          }
+          addMessageToLog(localCopyMessage, Config.MessageLog);
+          showActionMessage(document.body, localCopyMessage, { clearId: messageId });
+        }
+        else {
+
+        var message = `Unable to open <a href="${iri}" rel="noopener" target="_blank">${iri}</a>.`;
+        var actionMessage = `Unable to open <a href="${iri}" rel="noopener" target="_blank">${iri}</a>.`;
+
+        // Network failure rather than an HTTP error, so point at the device copies
+        if (!error.status) {
+          actionMessage += ` <a href="/offline.html">See documents available on this device</a>.`;
+        }
+
+        const messageObject = {
+          'content': actionMessage,
+          'type': 'error',
+          'timer': 5000,
+          'code': error.status
+        }
+
+        addMessageToLog({...messageObject, content: message}, Config.MessageLog);
+        showActionMessage(document.body, messageObject, { clearId: messageId });
+
+        throw error
+        }
+      }
+    }
+
+    if (response) {
+      // console.log(response)
+      iri = encodeURI(iri)
+      var cT = response.headers.get('Content-Type');
+      var options = {};
+      options['contentType'] = (cT) ? cT.split(';')[0].toLowerCase().trim() : 'text/turtle';
+      options['subjectURI'] = iri;
+
+      let data = await response.text()
+
+      setDocumentURL(iri);
+      var documentURL = Config.DocumentURL;
+      Config['Resource'][documentURL] = Config['Resource'][documentURL] || {};
+      updateSupplementalInfo(response, { documentURL });
+
+      var spawnOptions = {};
+
+      var checkMarkdownInMediaTypes = ['text/markdown', 'text/plain'];
+      const isMarkdownSource = checkMarkdownInMediaTypes.includes(options['contentType']);
+      if (isMarkdownSource) {
+        data = parseMarkdown(data, {createDocument: true});
+        spawnOptions['defaultStylesheet'] = true;
+        //XXX: Perhaps okay for text/markdown but not text/plain?
+        options.contentType = 'text/html';
+      }
+
+      if (Config.MediaTypes.RDF.includes(options['contentType'])) {
+        if (!isMarkdownSource) {
+          // Markdown-origin HTML skips storeHash; first sync sets it via the normalized pipeline
+          options['storeHash'] = true;
+        }
+        await getResourceInfo(data, options);
+      }
+
+      const o = await buildResourceView(data, options)
+      // console.log(o)
+      spawnOptions['defaultStylesheet'] = ('defaultStylesheet' in o) ? o.defaultStylesheet : (('defaultStylesheet' in spawnOptions) ? spawnOptions['defaultStylesheet'] : false);
+      spawnOptions['init'] = true;
+      if (Config.DocumentModes.output.length) {
+        spawnOptions['output'] = Config.DocumentModes.output[0];
+      }
+
+      var html = await spawnDokieli(document, o.data, o.options['contentType'], o.options['subjectURI'], spawnOptions);
+
+      window.history.replaceState({}, '', '#open=' + iri);
+    }
+
+    Config.DocumentAction = 'open';
+
+    var rm = document.querySelector('#document-action-message')
+    if (rm) {
+      rm.parentNode.removeChild(rm)
+    }
+    var message = `Opened <a href="${iri}" rel="noopener" target="_blank">${iri}</a>.`;
+    message = {
+      'content': message,
+      'type': 'success',
+      'timer': 3000
+    }
+    addMessageToLog(message, Config.MessageLog);
+    showActionMessage(document.body, message, { clearId: messageId });
+  }
+
+  await handleResource(iri, headers, options);
+}
+
+export function showNewDocument(e) {
+  if (e) {
+    e.target.closest('button').disabled = true;
+  }
+
+  const documentOptions = {
+    ...Config.DOMProcessing,
+    format: true,
+    // TODO: Revisit because the user should be informed (show dialog) whether they want to retain or include certain scripts.
+    // sanitize: true,
+    normalize: true
+  };
+
+  var buttonDisabled = (document.location.protocol === 'file:') ? ' disabled="disabled"' : '';
+
+  const id = 'new-document';
+
+  var buttonClose = getButtonHTML({ key: `dialog.${id}.close.button`, button: 'close', buttonClass: 'close', iconSize: 'fa-2x' });
+
+  document.body.appendChild(fragmentFromString(`
+    <aside aria-labelledby="${id}-label" class="do on" dir="${Config.User.UI.LanguageDir}" id="${id}" lang="${Config.User.UI.Language}" rel="schema:hasPart" resource="#${id}" xml:lang="${Config.User.UI.Language}">
+      <h2 data-i18n="dialog.${id}.h2" id="${id}-label" property="schema:name">${i18n.t(`dialog.${id}.h2.textContent`)} ${Config.Button.Info.NewDocument}</h2>
+      ${buttonClose}
+      <div class="info"></div>
+      <form>
+        <fieldset id="${id}-fieldset">
+          <legend data-i18n="dialog.${id}.legend">${i18n.t(`dialog.${id}.legend.textContent`)}</legend>
+          <ul>
+            <li><input type="radio" id="${id}-article" name="${id}" value="${id}-article" checked="checked" /> <label for="${id}-article">${Icon['.fas.fa-newspaper']} <span class="${id}-article"><strong data-i18n="${id}-article.strong">${i18n.t(`${id}-article.strong.textContent`)}</strong> <span data-i18n="${id}-article.span">${i18n.t(`${id}-article.span.textContent`)}</span></span></label></li>
+            <li><input type="radio" id="${id}-slideshow" name="${id}" value="${id}-slideshow" /> <label for="${id}-slideshow">${Icon['.fas.fa-slideshow']} <span class="${id}-slideshow"><strong data-i18n="${id}-slideshow.strong">${i18n.t(`${id}-slideshow.strong.textContent`)}</strong> <span data-i18n="${id}-slideshow.span">${i18n.t(`${id}-slideshow.span.textContent`)}</span></span></label></li>
+            <li><input type="radio" id="${id}-cv" name="${id}" value="${id}-cv" /> <label for="${id}-cv">${Icon['.fas.fa-book-skull']} <span class="${id}-cv"><strong data-i18n="${id}-cv.strong">${i18n.t(`${id}-cv.strong.textContent`)}</strong> <span data-i18n="${id}-cv.span">${i18n.t(`${id}-cv.span.textContent`)}</span></span></label></li>
+            <li><input type="radio" id="${id}-specification" name="${id}" value="${id}-specification" /> <label for="${id}-specification">${Icon['.fas.fa-scroll']} <span class="${id}-specification"><strong data-i18n="${id}-specification.strong">${i18n.t(`${id}-specification.strong.textContent`)}</strong> <span data-i18n="${id}-specification.span">${i18n.t(`${id}-specification.span.textContent`)}</span></span></label></li>
+            <li><input type="radio" id="${id}-questionnaire" name="${id}" value="${id}-questionnaire" /> <label for="${id}-questionnaire">${Icon['.fas.fa-list-check']} <span class="${id}-questionnaire"><strong data-i18n="${id}-questionnaire.strong">${i18n.t(`${id}-questionnaire.strong.textContent`)}</strong> <span data-i18n="${id}-questionnaire.span">${i18n.t(`${id}-questionnaire.span.textContent`)}</span></span></label></li>
+          </ul>
+          <button class="create ${id}" type="submit" data-i18n="dialog.${id}.create-template.button" title="${i18n.t(`dialog.${id}.create-template.button.title`)}">${i18n.t(`dialog.${id}.create-template.button.textContent`)}</button>
+        </fieldset>
+      </form>
+    </aside>
+  `));
+
+  var createNewDocumentDialog = document.getElementById(id);
+
+  createNewDocumentDialog.addEventListener('click', (e) => {
+    if (e.target.closest('button.close')) {
+      setMenuButtonDisabled('.resource-new');
+    }
+
+    if (!e.target.closest('button.create')) {
+      return
+    }
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    setMenuButtonDisabled('.resource-new');
+
+    // const selected = createNewDocumentDialog.querySelector(`input[name="${id}"]:checked`)?.value;
+
+    const form = e.target.closest('form');
+
+    const formValues = getFormValues(form);
+    // console.log(formValues)
+
+    switch (formValues[id]) {
+      case 'new-document-article': default:
+        createNewDocument();
+        break;
+      case 'new-document-slideshow':
+        createNewSlideshow();
+        break;
+      case 'new-document-cv':
+        createNewCV();
+        break;
+      case 'new-document-specification':
+        createNewSpecification();
+        break;
+      case 'new-document-questionnaire':
+        createNewQuestionnaire();
+        break;
+    }
+  });
+}
+
+export function openDocument(e) {
+  if(typeof e !== 'undefined') {
+    e.target.disabled = true;
+  }
+
+  var buttonClose = getButtonHTML({ key: 'dialog.open-document.close', button: 'close', buttonClass: 'close', iconSize: 'fa-2x' });
+
+  sanitizeInsertAdjacentHTML(document.body, 'beforeend', `
+    <aside aria-labelledby="open-document-label" class="do on" dir="${Config.User.UI.LanguageDir}" id="open-document" lang="${Config.User.UI.Language}" rel="schema:hasPart" resource="#open-document" xml:lang="${Config.User.UI.Language}">
+      <h2 data-i18n="dialog.open-document.h2" id="open-document-label" property="schema:name">${i18n.t('dialog.open-document.h2.textContent')} ${Config.Button.Info.Open}</h2>
+      ${buttonClose}
+      <div class="info"></div>
+      <p><label data-i18n="dialog.open-document.open-local-file.label" for="open-local-file">${i18n.t('dialog.open-document.open-local-file.label.textContent')}</label> <input type="file" id="open-local-file" name="open-local-file" multiple="" /></p>
+    </aside>
+  `);
+
+  var id = 'location-open-document';
+  var action = 'read';
+
+  var openDocument = document.getElementById('open-document');
+  setupResourceBrowser(openDocument , id, action);
+  var idSamp = (typeof Config.User.Storage == 'undefined') ? '' : '<p><samp id="' + id + '-' + action + '">https://example.org/path/to/article</samp></p>';
+  sanitizeInsertAdjacentHTML(openDocument, 'beforeend', `${idSamp}<button class="open" data-i18n="dialog.open-document.open.button" title="${i18n.t('dialog.open-document.open.button.title')}" type="submit">${i18n.t('dialog.open-document.open.button.textContent')}</button>`);
+  attachBrowseStoragePopup(id, action);
+
+  openDocument.addEventListener('click', function (e) {
+    if (e.target.closest('button.close')) {
+      setMenuButtonDisabled('.resource-open');
+    }
+
+    if (e.target.closest('button.open')) {
+      var openDocument = document.getElementById('open-document');
+      var rm = openDocument.querySelector('.response-message');
+      if (rm) {
+        rm.parentNode.removeChild(rm);
+      }
+
+      var bli = document.getElementById(id + '-input');
+      var iri = bli.value;
+
+      var options = {};
+
+      openResource(iri, options);
+    }
+  });
+
+  openDocument.querySelector('#open-local-file').addEventListener('change', openInputFile, false);
+}
+
+export function viewSource(e) {
+  if (e) {
+    e.target.closest('button').disabled = true;
+  }
+
+  const documentOptions = {
+    ...Config.DOMProcessing,
+    format: true,
+    // TODO: Revisit because the user should be informed (show dialog) whether they want to retain or include certain scripts.
+    // sanitize: true,
+    normalize: true
+  };
+
+  var buttonDisabled = (document.location.protocol === 'file:') ? ' disabled="disabled"' : '';
+
+  var buttonClose = getButtonHTML({ key: 'dialog.source-view.close.button', button: 'close', buttonClass: 'close', iconSize: 'fa-2x' });
+
+  document.body.appendChild(fragmentFromString(`
+    <aside aria-labelledby="source-view-label" class="do on" dir="${Config.User.UI.LanguageDir}" id="source-view" lang="${Config.User.UI.Language}" rel="schema:hasPart" resource="#source-view" xml:lang="${Config.User.UI.Language}">
+      <h2 data-i18n="dialog.source-view.h2" id="source-view-label" property="schema:name">${i18n.t('dialog.source-view.h2.textContent')} ${Config.Button.Info.Source}</h2>
+      ${buttonClose}
+      <div class="info"></div>
+      <textarea dir="ltr" id="source-edit" rows="24" cols="80"></textarea>
+      <p><button class="update" data-i18n="dialog.source-view.update.button"${buttonDisabled} title="Update source" type="submit">${i18n.t('dialog.source-view.update.button.textContent')}</button></p>
+    </aside>
+  `));
+  var sourceBox = document.getElementById('source-view');
+  var input = document.getElementById('source-edit');
+  const fullHTML = getDocument(document.body, documentOptions);
+  const parsedDoc = new DOMParser().parseFromString(fullHTML, 'text/html');
+  input.value = parsedDoc.body.outerHTML;
+
+  sourceBox.addEventListener('click', (e) => {
+    if (e.target.closest('button.update')) {
+      var data = document.getElementById('source-edit').value;
+
+      const wasAuthor = Config.Editor?.mode === 'author';
+
+      // Prevent ydoc/provider leak racing the new editor on the same IDB room.
+      if (Config.EditorEnabled && Config.Editor) {
+        Config.Editor.destroyEditor();
+      }
+
+      // initDocumentMenu's ready listeners are {once:true}, so preserve menu instead of recreating.
+      const preserveNodes = Array.from(
+        document.body.querySelectorAll(':scope > .do, :scope > #toc-nav')
+      ).filter(n => n.id !== 'source-view');
+      preserveNodes.forEach(n => n.remove());
+
+      document.body.setHTMLUnsafe(domSanitize(data));
+
+      preserveNodes.forEach(n => {
+        if (n.id === 'document-menu' || n.id === 'document-info') {
+          document.body.prepend(n);
+        } else {
+          document.body.appendChild(n);
+        }
+      });
+
+      // A collaborative room would otherwise win over the pasted source on the next sync
+      if (Config.Editor) Config.Editor.replaceSharedContent = true;
+
+      if (wasAuthor) {
+        Config.Editor.toggleEditor('author');
+      }
+
+      // No input event for a pasted source
+      if (Config.DocumentURL && !Config.DocumentURL.startsWith('blob:')) {
+        autoSave(Config.DocumentURL, { method: 'IndexedDB' }).catch(() => {});
+      }
+
+      sourceBox.remove();
+      document.querySelector('#document-menu .resource-source').disabled = false;
+    }
+
+    if (e.target.closest('button.close')) {
+      setMenuButtonDisabled('.resource-source');
+    }
+  });
+}
+
+export function editCustomStylesheet(e) {
+  if (document.getElementById('custom-style-view')) return;
+
+  if (e) {
+    e.target.closest('button').disabled = true;
+  }
+
+  var buttonClose = getButtonHTML({ key: 'dialog.custom-style-view.close.button', button: 'close', buttonClass: 'close', iconSize: 'fa-2x' });
+
+  document.body.appendChild(fragmentFromString(`
+    <aside aria-labelledby="custom-style-view-label" class="do on" dir="${Config.User.UI.LanguageDir}" id="custom-style-view" lang="${Config.User.UI.Language}" rel="schema:hasPart" resource="#custom-style-view" xml:lang="${Config.User.UI.Language}">
+      <h2 data-i18n="dialog.custom-style-view.h2" id="custom-style-view-label" property="schema:name">${i18n.t('dialog.custom-style-view.h2.textContent')}</h2>
+      ${buttonClose}
+      <div class="info"></div>
+      <textarea dir="ltr" id="custom-style-edit" rows="24" cols="80" spellcheck="false"></textarea>
+      <p><button class="update" data-i18n="dialog.custom-style-view.update.button" title="${i18n.t('dialog.custom-style-view.update.button.title')}" type="submit">${i18n.t('dialog.custom-style-view.update.button.textContent')}</button></p>
+    </aside>
+  `));
+
+  var box = document.getElementById('custom-style-view');
+  var input = document.getElementById('custom-style-edit');
+
+  input.value = getCustomStylesheetContent();
+
+  const reenableEditButton = () => {
+    var btn = document.querySelector('#document-views .resource-edit-custom-style');
+    if (btn) btn.disabled = false;
+  };
+
+  const closeBox = () => {
+    box.remove();
+    reenableEditButton();
+  };
+
+  box.addEventListener('click', (ev) => {
+    if (ev.target.closest('button.update')) {
+      var css = document.getElementById('custom-style-edit').value;
+      applyCustomStylesheetPreview(css);
+      closeBox();
+    }
+    if (ev.target.closest('button.close')) {
+      closeBox();
+    }
+  });
+}
+
+function getCustomStylesheetContent() {
+  var styleEl = document.getElementById('dokieli-custom-style');
+  return styleEl ? (styleEl.textContent || '') : '';
+}
+
+function applyCustomStylesheetPreview(css) {
+  var styleEl = document.getElementById('dokieli-custom-style');
+  if (!css.trim()) {
+    if (styleEl) styleEl.remove();
+    return;
+  }
+  if (!styleEl) {
+    styleEl = document.createElement('style');
+    styleEl.id = 'dokieli-custom-style';
+    document.head.appendChild(styleEl);
+  }
+  styleEl.textContent = css;
+}
+
+export function toggleMarkdownMode(e) {
+  // Update the standalone WYSIWYM|Markdown toggle state.
+  const buttonPressed = e.target.closest('button');
+  const toggle = document.getElementById('editor-area-toggle');
+  toggle.querySelectorAll('button').forEach(button => {
+    button.setAttribute('aria-pressed', 'false');
+    button.disabled = false;
+  })
+  buttonPressed.setAttribute('aria-pressed', 'true');
+  buttonPressed.disabled = true;
+
+  // Find the node currently in markdown mode (if any) by its data attribute.
+  const mdNode = document.querySelector('[data-markdown-mode]');
+
+  if (mdNode) {
+    // Exit markdown mode: parse markdown -> HTML, restart PM
+    const markdownText = mdNode.textContent;
+    const wasAuthored = mdNode.getAttribute('data-markdown-mode-was-authored') === 'true';
+    const wasNew = mdNode.getAttribute('data-markdown-mode-was-new') === 'true';
+
+    mdNode.setHTMLUnsafe(domSanitize(parseMarkdown(markdownText)));
+    mdNode.removeAttribute('contenteditable');
+    mdNode.removeAttribute('data-markdown-mode');
+    mdNode.removeAttribute('data-markdown-mode-was-authored');
+    mdNode.removeAttribute('data-markdown-mode-was-new');
+
+    if (wasAuthored) {
+      Config.Editor['new'] = wasNew;
+      // New docs reinit on the passed node; existing docs fall back to the construction-time node
+      Config.Editor.init('author', wasNew ? mdNode : undefined);
+      Config.EditorEnabled = true;
+      Config.EditorWasEnabled = true;
+      updateButtons();
+    }
+  } else {
+    // Enter markdown mode: convert HTML to markdown
+    const wasAuthored = Config.EditorEnabled;
+    const sourceNode = (wasAuthored && Config.Editor?.getContentNode?.())
+                       || selectArticleNode(document);
+    const hasContent = sourceNode.textContent.trim().length > 0;
+
+    if (hasContent && !Config.markdownModeConfirmed) {
+      if (!confirm(i18n.t('dialog.mode-markdown.confirm.textContent'))) {
+        return;
+      }
+      Config.markdownModeConfirmed = true;
+    }
+
+    const markdown = htmlToMarkdown(sourceNode);
+
+    // Use the article node when PM is on it; when PM is on body, create a fresh article
+    const pmParent = wasAuthored
+      ? Config.Editor.editorView?.dom?.parentNode
+      : null;
+    const contentNode =
+      pmParent && pmParent !== document.body
+        ? pmParent
+        : document.createElement("article");
+
+    // Detach the toolbar before destroy so it can be re-inserted
+    const editorToolbar = document.getElementById('document-editor');
+    editorToolbar?.remove();
+
+    if (wasAuthored) {
+      if (Config.Editor.editorView) {
+        Config.Editor.editorView.destroy();
+        Config.Editor.editorView = null;
+      }
+      Config.Editor.authorToolbarView = null;
+      Config.EditorEnabled = false;
+      Config.EditorWasEnabled = true;
+    }
+
+    // For existing docs contentNode is a new element not yet in the DOM; insert it.
+    if (!contentNode.parentNode) {
+      document.body.insertBefore(contentNode, document.body.firstChild);
+    }
+
+    // Re-insert toolbar in markdown mode: hide editing buttons, keep Back to Reading.
+    if (editorToolbar) {
+      editorToolbar.classList.add('editor-toolbar-markdown');
+      document.body.appendChild(editorToolbar);
+    }
+
+    contentNode.textContent = markdown;
+    contentNode.contentEditable = 'plaintext-only';
+    contentNode.setAttribute('data-markdown-mode', 'true');
+    contentNode.setAttribute('data-markdown-mode-was-authored', String(wasAuthored));
+    contentNode.setAttribute('data-markdown-mode-was-new', String(!!Config.Editor['new']));
+    contentNode.focus();
+  }
+}
+
+export async function saveAsDocument(e) {
+  if (e) {
+    e.target.closest('button').disabled = true;
+  }
+
+  const documentOptions = {
+    ...Config.DOMProcessing,
+    format: true,
+    sanitize: true,
+    normalize: true
+  };
+
+  var buttonClose = getButtonHTML({ key: 'dialog.save-as-document.close.button', button: 'close', buttonClass: 'close', iconSize: 'fa-2x' });
+
+  document.body.appendChild(fragmentFromString(`
+    <aside aria-labelledby="save-as-document-label" class="do on" dir="${Config.User.UI.LanguageDir}" id="save-as-document" lang="${Config.User.UI.Language}" rel="schema:hasPart" resource="#save-as-document" xml:lang="${Config.User.UI.Language}">
+      <h2 data-i18n="dialog.save-as-document.h2" id="save-as-document-label" property="schema:name">${i18n.t('dialog.save-as-document.h2.textContent')} ${Config.Button.Info.SaveAs}</h2>
+      ${buttonClose}
+      <div class="info"></div>
+    </aside>
+  `));
+
+  var saveAsDocument = document.getElementById('save-as-document');
+  saveAsDocument.addEventListener('click', (e) => {
+    if (e.target.closest('button.close') || e.target.closest('button.cancel')) {
+      document.querySelector('#document-menu .resource-save-as').disabled = false;
+    }
+  });
+  saveAsDocument.addEventListener('click', (e) => {
+    if (e.target.closest('button.cancel')) {
+      saveAsDocument.parentNode?.removeChild(saveAsDocument);
+    }
+  });
+
+  var fieldset = '';
+
+  var locationInboxId = 'location-inbox';
+  var locationInboxAction = 'read';
+
+  saveAsDocument.addEventListener('click', (e) => {
+    if (e.target.closest('input#' + locationInboxId + '-set')) {
+      if (e.target.getAttribute('checked')) {
+        e.target.removeAttribute('checked');
+
+        fieldset = saveAsDocument.querySelector('#' + locationInboxId + '-fieldset');
+        fieldset.parentNode.removeChild(fieldset);
+      }
+      else {
+        e.target.setAttribute('checked', 'checked');
+
+        sanitizeInsertAdjacentHTML(e.target.closest('li, div, p') || e.target.parentNode, 'beforeend', '<fieldset id="' + locationInboxId + '-fieldset"></fieldset>');
+        fieldset = saveAsDocument.querySelector('#' + locationInboxId + '-fieldset');
+        setupResourceBrowser(fieldset, locationInboxId, locationInboxAction, { containersOnly: true });
+        sanitizeInsertAdjacentHTML(fieldset, 'beforeend', `<p data-i18n="dialog.save-as-document.article-inbox.p">${i18n.t('dialog.save-as-document.article-inbox.p.textContent')} <samp id="${locationInboxId}-${locationInboxAction}"></samp></p>`);
+        var lii = document.getElementById(locationInboxId + '-input');
+        lii.focus();
+        lii.placeholder = 'https://example.org/path/to/inbox/';
+        attachBrowseStoragePopup(locationInboxId, locationInboxAction);
+      }
+    }
+  });
+
+  var locationAnnotationServiceId = 'location-annotation-service';
+  var locationAnnotationServiceAction = 'read';
+
+  saveAsDocument.addEventListener('click', (e) => {
+    if (e.target.closest('input#' + locationAnnotationServiceId + '-set')) {
+      if (e.target.getAttribute('checked')) {
+        e.target.removeAttribute('checked');
+
+        fieldset = saveAsDocument.querySelector('#' + locationAnnotationServiceId + '-fieldset');
+        fieldset.parentNode.removeChild(fieldset);
+      }
+      else {
+        e.target.setAttribute('checked', 'checked');
+
+        sanitizeInsertAdjacentHTML(e.target.closest('li, div, p') || e.target.parentNode, 'beforeend', '<fieldset id="' + locationAnnotationServiceId + '-fieldset"></fieldset>');
+        fieldset = saveAsDocument.querySelector('#' + locationAnnotationServiceId + '-fieldset');
+        setupResourceBrowser(fieldset, locationAnnotationServiceId, locationAnnotationServiceAction, { containersOnly: true });
+        sanitizeInsertAdjacentHTML(fieldset, 'beforeend', `<p data-i18n="dialog.save-as-document.article-annotation-service.p">${i18n.t('dialog.save-as-document.article-annotation-service.p.textContent')} <samp id="${locationAnnotationServiceId}-${locationAnnotationServiceAction}"></samp></p>`);
+        var lasi = document.getElementById(locationAnnotationServiceId + '-input');
+        lasi.focus();
+        lasi.placeholder = 'https://example.org/path/to/annotation/';
+        attachBrowseStoragePopup(locationAnnotationServiceId, locationAnnotationServiceAction);
+      }
+    }
+  });
+
+  //https://www.w3.org/TR/ATAG20/#gl_b31
+  //TODO: Better tracking of fails so that author can correct.
+  var img = document.querySelectorAll('img:not(:is(.do *))');
+  var imgFailed = [];
+  var imgPassed = [];
+  var imgCantTell = [];
+  var imgTestResult;
+  if (img.length == 0) {
+    imgTestResult = 'earl:inapplicable';
+  }
+  else {
+    img.forEach(i => {
+      if (i.hasAttribute('alt')) {
+        if(i.alt.trim() === '') {
+          imgCantTell.push(i);
+        }
+        imgPassed.push(i);
+      }
+      else {
+        imgFailed.push(i);
+      }
+    });
+  }
+  var imgAccessibilityReport = [];
+  if (imgFailed.length) {
+    imgAccessibilityReport.push(`<li data-i18n="dialog.accessibility-report.image-failed.li">${i18n.t('dialog.accessibility-report.image-failed.li.innerHTML')}</li>`);
+  }
+  if (imgCantTell.length) {
+    imgAccessibilityReport.push(`<li data-i18n="dialog.accessibility-report.image-cant-tell.li">${i18n.t('dialog.accessibility-report.image-cant-tell.li.innerHTML')}</li>`);
+  }
+
+  var video = document.querySelectorAll('video');
+  var videoFailed = [];
+  var videoPassed = [];
+  var videoCantTell = [];
+  var videoTestResult = 'earl:untested';
+  if (video.length == 0) {
+    videoTestResult = 'earl:inapplicable';
+  }
+  else {
+    video.forEach(i => {
+      if (i.querySelector('track') && i.hasAttribute('kind')) {
+        videoPassed.push(i);
+      }
+      else {
+        videoFailed.push(i);
+      }
+    });
+  }
+  var videoAccessibilityReport = [];
+  if (videoFailed.length) {
+    videoAccessibilityReport.push(`<li data-i18n="dialog.accessibility-report.video-failed.li">${i18n.t('dialog.accessibility-report.video-failed.li.innerHTML')}</li>`);
+  }
+
+  var audio = document.querySelectorAll('audio');
+  var audioFailed = [];
+  var audioPassed = [];
+  var audioCantTell = [];
+  var audioTestResult = 'earl:untested';
+  if (audio.length == 0) {
+    audioTestResult = 'earl:inapplicable';
+  }
+  else {
+    audio.forEach(i => {
+      if (i.querySelector('track') && i.hasAttribute('kind')) {
+        audioPassed.push(i);
+      }
+      else {
+        audioFailed.push(i);
+      }
+    });
+  }
+  var audioAccessibilityReport = [];
+  if (audioFailed.length) {
+    audioAccessibilityReport.push(`<li> data-i18n="dialog.accessibility-report.audio-failed.li">${i18n.t('dialog.accessibility-report.audio-failed.li.innerHTML')}</li>`);
+  }
+
+  var aRWarning = `<p data-i18n="dialog.accessibility-report.warning.p">${i18n.t('dialog.accessibility-report.warning.p.textContent')}</p>`;
+  var aRSuccess = `<p data-i18n="dialog.accessibility-report.success.p">${i18n.t('dialog.accessibility-report.success.p.textContent')}</p>`;
+  var accessibilityReport = '';
+  if (imgAccessibilityReport.length || audioAccessibilityReport.length || videoAccessibilityReport.length) {
+    accessibilityReport += aRWarning + '<ul>' + imgAccessibilityReport.join('') + audioAccessibilityReport.join('') + videoAccessibilityReport.join('') + '</ul>';
+  }
+  else {
+    accessibilityReport += aRSuccess;
+  }
+  accessibilityReport = `<details id="accessibility-report-save-as"><summary data-i18n="dialog.accessibility-report.summary">${i18n.t('dialog.accessibility-report.summary.textContent')}</summary>${accessibilityReport}</details>`;
+
+  let sourceHistoryItem = '';
+  let dokielizeItem = '';
+
+  var isAlreadyDokielized = !!document.querySelector('head script[src*="/scripts/dokieli"], head link[rel~="stylesheet"][href*="dokieli.css"]');
+  var dokielizeChecked = isAlreadyDokielized ? ' checked="checked"' : '';
+
+  if (Config.DocumentAction !== 'new') {
+    sourceHistoryItem = `<li><input type="checkbox" id="derivation-data" name="derivation-data" checked="checked" /><label data-i18n="dialog.save-as-document.source-history.label" for="derivation-data">${i18n.t('dialog.save-as-document.source-history.label.textContent')}</label> ${Config.Button.Info.Derivation}</li>`;
+    dokielizeItem = `<li><input type="checkbox" id="dokielize-resource" name="dokielize-resource"${dokielizeChecked} /><label data-i18n="dialog.save-as-document.dokielize.label" for="dokielize-resource">${i18n.t('dialog.save-as-document.dokielize.label.textContent')}</label> ${Config.Button.Info.Dokielize}</li>`;
+  }
+
+  var currentURL = (Config.DocumentURL && /^https?:\/\//.test(Config.DocumentURL)) ? Config.DocumentURL : '';
+
+  var defaultLocalFilename = '';
+  try {
+    if (currentURL) {
+      var lu = new URL(currentURL);
+      var lastSeg = lu.pathname.split('/').pop();
+      defaultLocalFilename = (lastSeg || '').replace(/\.[^./]+$/, '');
+    }
+  } catch {}
+  if (!defaultLocalFilename) defaultLocalFilename = getDefaultDocumentBasename(selectArticleNode(document));
+
+  var id = 'location-save-as';
+  var action = 'write';
+
+  var iconGlobe = Icon['.fas.fa-globe'];
+  var iconDownload = Icon['.fas.fa-download'];
+  var iconFile = Icon['.fas.fa-file'];
+  var iconCheck = Icon['.fas.fa-check'];
+
+  var saveAsBody = `
+    <form class="save-as-form">
+      <div class="tabs save-as-tabs">
+        <nav>
+          <ul>
+            <li class="selected"><a href="#save-as-web" data-tab="web" data-i18n="dialog.save-as-document.tab-web.a">${i18n.t('dialog.save-as-document.tab-web.a.textContent')}</a></li>
+            <li><a href="#save-as-local" data-tab="local" data-i18n="dialog.save-as-document.tab-local.a">${i18n.t('dialog.save-as-document.tab-local.a.textContent')}</a></li>
+          </ul>
+        </nav>
+
+        <div class="selected" id="save-as-web">
+          <fieldset id="${id}-fieldset"><legend data-i18n="dialog.save-as-document.save-destination.legend">${i18n.t('dialog.save-as-document.save-destination.legend.textContent')}</legend></fieldset>
+          <fieldset class="save-as-asset-handling">
+            <legend data-i18n="dialog.save-as-document.asset-handling.legend">${i18n.t('dialog.save-as-document.asset-handling.legend.textContent')}</legend>
+            <ul class="save-as-cards">
+              <li>
+                <input type="radio" id="asset-reference" name="base-url" value="base-url-absolute" checked="checked" />
+                <label for="asset-reference">
+                  ${iconGlobe}
+                  <span class="save-as-card-text">
+                    <strong data-i18n="dialog.save-as-document.asset-reference-remote.label.strong">${i18n.t('dialog.save-as-document.asset-reference-remote.label.strong.textContent')}</strong>
+                    <span data-i18n="dialog.save-as-document.asset-reference-remote.desc.span">${i18n.t('dialog.save-as-document.asset-reference-remote.desc.span.textContent')}</span>
+                  </span>
+                  ${iconCheck}
+                </label>
+              </li>
+              <li>
+                <input type="radio" id="asset-bundle" name="base-url" value="base-url-relative" />
+                <label for="asset-bundle">
+                  ${iconDownload}
+                  <span class="save-as-card-text">
+                    <strong data-i18n="dialog.save-as-document.asset-bundle.label.strong">${i18n.t('dialog.save-as-document.asset-bundle.label.strong.textContent')}</strong>
+                    <span data-i18n="dialog.save-as-document.asset-bundle.desc.span">${i18n.t('dialog.save-as-document.asset-bundle.desc.span.textContent')}</span>
+                  </span>
+                  ${iconCheck}
+                </label>
+              </li>
+            </ul>
+          </fieldset>
+        </div>
+
+        <div id="save-as-local">
+          <p class="save-as-filename-row">
+            <label for="save-as-local-filename" data-i18n="dialog.save-as-document.local-filename.label">${i18n.t('dialog.save-as-document.local-filename.label.textContent')}</label>
+            <input id="save-as-local-filename" name="save-as-local-filename" type="text" value="${defaultLocalFilename}" />
+          </p>
+          <fieldset class="save-as-asset-handling">
+            <legend data-i18n="dialog.save-as-document.asset-handling.legend">${i18n.t('dialog.save-as-document.asset-handling.legend.textContent')}</legend>
+            <ul class="save-as-cards">
+              <li>
+                <input type="radio" id="local-asset-bundle" name="local-asset-handling" value="bundle" checked="checked" />
+                <label for="local-asset-bundle">
+                  ${iconDownload}
+                  <span class="save-as-card-text">
+                    <strong data-i18n="dialog.save-as-document.asset-bundle-local.label.strong">${i18n.t('dialog.save-as-document.asset-bundle-local.label.strong.textContent')}</strong>
+                    <span data-i18n="dialog.save-as-document.asset-bundle-local.desc.span">${i18n.t('dialog.save-as-document.asset-bundle-local.desc.span.textContent')}</span>
+                  </span>
+                  ${iconCheck}
+                </label>
+              </li>
+              <li>
+                <input type="radio" id="local-asset-reference" name="local-asset-handling" value="reference" />
+                <label for="local-asset-reference">
+                  ${iconGlobe}
+                  <span class="save-as-card-text">
+                    <strong data-i18n="dialog.save-as-document.asset-reference-local.label.strong">${i18n.t('dialog.save-as-document.asset-reference-local.label.strong.textContent')}</strong>
+                    <span data-i18n="dialog.save-as-document.asset-reference-local.desc.span">${i18n.t('dialog.save-as-document.asset-reference-local.desc.span.textContent')}</span>
+                  </span>
+                  ${iconCheck}
+                </label>
+              </li>
+              <li>
+                <input type="radio" id="local-asset-single" name="local-asset-handling" value="single" />
+                <label for="local-asset-single">
+                  ${iconFile}
+                  <span class="save-as-card-text">
+                    <strong data-i18n="dialog.save-as-document.asset-single.label.strong">${i18n.t('dialog.save-as-document.asset-single.label.strong.textContent')}</strong>
+                    <span data-i18n="dialog.save-as-document.asset-single.desc.span">${i18n.t('dialog.save-as-document.asset-single.desc.span.textContent')}</span>
+                  </span>
+                  ${iconCheck}
+                </label>
+              </li>
+            </ul>
+          </fieldset>
+        </div>
+      </div>
+
+      <details class="save-as-advanced">
+        <summary data-i18n="dialog.save-as-document.linked-data-features.summary">${i18n.t('dialog.save-as-document.linked-data-features.summary.textContent')}</summary>
+        <ul class="save-as-options">
+          <li><input id="${locationInboxId}-set" name="${locationInboxId}-set" type="checkbox" /> <label data-i18n="dialog.save-as-document.set-inbox.label" for="${locationInboxId}-set">${i18n.t('dialog.save-as-document.set-inbox.label.textContent')}</label> ${Config.Button.Info.Inbox}</li>
+          <li><input id="${locationAnnotationServiceId}-set" name="${locationAnnotationServiceId}-set" type="checkbox" /> <label data-i18n="dialog.save-as-document.set-annotation-service.label" for="${locationAnnotationServiceId}-set">${i18n.t('dialog.save-as-document.set-annotation-service.label.textContent')}</label> ${Config.Button.Info.AnnotationService}</li>
+          ${sourceHistoryItem}
+          ${dokielizeItem}
+        </ul>
+      </details>
+
+      ${accessibilityReport}
+
+      <div class="save-as-actions">
+        <button class="cancel" type="button" data-i18n="dialog.save-as-document.cancel.button">${i18n.t('dialog.save-as-document.cancel.button.textContent')}</button>
+        <button class="create save-changes" type="submit" data-i18n="dialog.save-as-document.save-changes.button" title="${i18n.t('dialog.save-as-document.save-changes.button.title')}">${i18n.t('dialog.save-as-document.save-changes.button.textContent')}</button>
+      </div>
+    </form>
+  `;
+
+  sanitizeInsertAdjacentHTML(saveAsDocument, 'beforeend', saveAsBody);
+
+  fieldset = saveAsDocument.querySelector('fieldset#' + id + '-fieldset');
+  setupResourceBrowser(fieldset, id, action);
+  sanitizeInsertAdjacentHTML(fieldset, 'beforeend', `<p data-i18n="dialog.save-as-document.save-location.p" id="${id}-samp">${i18n.t('dialog.save-as-document.save-location.p.textContent')} <samp id="${id}-${action}"></samp></p>`);
+  var bli = document.getElementById(id + '-input');
+  bli.focus();
+  bli.placeholder = 'https://example.org/path/to/article';
+
+  attachBrowseStoragePopup(id, action);
+
+  saveAsDocument.addEventListener('click', (e) => {
+    var tabLink = e.target.closest('.save-as-tabs nav a');
+    if (!tabLink) return;
+    e.preventDefault();
+    var tab = tabLink.dataset.tab;
+    saveAsDocument.querySelectorAll('.save-as-tabs nav li').forEach(li => li.classList.remove('selected'));
+    tabLink.closest('li').classList.add('selected');
+    saveAsDocument.querySelectorAll('.save-as-tabs > div').forEach(d => d.classList.remove('selected'));
+    var targetId = tab === 'local' ? 'save-as-local' : 'save-as-web';
+    saveAsDocument.querySelector('#' + targetId)?.classList.add('selected');
+  });
+
+  saveAsDocument.addEventListener('click', async (e) => {
+    if (!e.target.closest('button.create')) {
+      return
+    }
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    var saveAsDocument = document.getElementById('save-as-document')
+
+    var activeTab = saveAsDocument.querySelector('.save-as-tabs nav li.selected a')?.dataset.tab;
+    if (activeTab === 'local') {
+      var localFilenameInput = saveAsDocument.querySelector('#save-as-local-filename');
+      var localBase = (localFilenameInput?.value || 'document').trim().replace(/\.[^./]+$/, '') || 'document';
+      var localChoice = saveAsDocument.querySelector('input[name="local-asset-handling"]:checked')?.value || 'bundle';
+
+      var mdMode = !!document.querySelector('[data-markdown-mode]');
+      var localExtension = mdMode ? 'md' : 'html';
+      var localFilename = localBase + '.' + localExtension;
+
+      if (mdMode) {
+        var payload = getSavePayload(localFilename, documentOptions);
+        exportAsDocument(payload.data, { filename: localFilename, mediaType: payload.contentType });
+      }
+      else {
+        var localHtml = document.documentElement.cloneNode(true);
+        if (localChoice === 'single') {
+          localHtml.querySelectorAll('link[rel~="stylesheet"], style, script').forEach(n => n.parentNode.removeChild(n));
+          var strippedHtml = getDocument(localHtml, documentOptions);
+          exportAsDocument(strippedHtml, { filename: localFilename, mediaType: 'text/html' });
+        }
+        else if (localChoice === 'reference') {
+          rewriteAssetURLsToAbsolute(localHtml);
+          var referencedHtml = getDocument(localHtml, documentOptions);
+          exportAsDocument(referencedHtml, { filename: localFilename, mediaType: 'text/html' });
+        }
+        else {
+          var assetFiles = await bundleExternalAssets(localHtml);
+          var bundledHtml = getDocument(localHtml, documentOptions);
+          if (assetFiles.length === 0) {
+            exportAsDocument(bundledHtml, { filename: localFilename, mediaType: 'text/html' });
+          }
+          else {
+            var zipBlob = createZipBlob([{ name: localFilename, content: bundledHtml }, ...assetFiles]);
+            downloadBlobAsFile(zipBlob, localBase + '.zip');
+          }
+        }
+      }
+      saveAsDocument.parentNode?.removeChild(saveAsDocument);
+      document.querySelector('#document-menu .resource-save-as').disabled = false;
+      return;
+    }
+
+    var urlInputEl = saveAsDocument.querySelector('#' + id + '-input');
+    var filenameInputEl = saveAsDocument.querySelector('#' + id + '-filename');
+    var baseUrlValue = (urlInputEl?.value || '').trim();
+    var filenameValue = (filenameInputEl?.value || '').trim();
+    var storageIRI = '';
+    try {
+      if (baseUrlValue) {
+        var baseHref = baseUrlValue.slice(-1) === '/' ? baseUrlValue : baseUrlValue + '/';
+        storageIRI = filenameValue ? new URL(filenameValue, baseHref).href : baseHref;
+      }
+    } catch {
+      storageIRI = '';
+    }
+
+    var rm = saveAsDocument.querySelector('.response-message')
+    if (rm) {
+      rm.parentNode.removeChild(rm)
+    }
+
+
+    // TODO: this needs to be form validation instead
+    if (!storageIRI.length || !/^https?:\/\/[^/]+\//.test(storageIRI) || (storageIRI.match(/:\/\//g) || []).length > 1) {
+      sanitizeInsertAdjacentHTML(saveAsDocument, 'beforeend',
+        `<div class="response-message"><p class="error" data-i18n="dialog.save-as-document.error.missing-location.p">${i18n.t("dialog.save-as-document.error.missing-location.p.textContent")}</p></div>`
+      )
+
+      return
+    }
+
+    var html = document.documentElement.cloneNode(true)
+    var o, r
+
+    if (Config.DocumentAction !== 'new') {
+      var dokielize = document.querySelector('#dokielize-resource')
+      if (dokielize.checked) {
+        html = getDocument(html, documentOptions)
+        html = await spawnDokieli(document, html, 'text/html', storageIRI, {'init': false})
+      }
+
+      var wasDerived = document.querySelector('#derivation-data')
+      if (wasDerived.checked) {
+        o = { 'id': 'document-derived-from', 'title': 'Derived From' };
+        r = { 'rel': 'prov:wasDerivedFrom', 'href': Config.DocumentURL };
+        html = setDocumentRelation(html, [r], o);
+
+        html = setDate(html, { 'id': 'document-derived-on', 'property': 'prov:generatedAtTime' });
+        o = { 'id': 'document-identifier', 'title': 'Identifier' };
+        r = { 'rel': 'owl:sameAs', 'href': storageIRI };
+        html = setDocumentRelation(html, [r], o);
+      }
+    }
+
+    var inboxLocation = saveAsDocument.querySelector('#' + locationInboxId + '-' + locationInboxAction);
+    if (inboxLocation) {
+      inboxLocation = inboxLocation.innerText.trim();
+      o = { 'id': 'document-inbox', 'title': 'Notifications Inbox' };
+      r = { 'rel': 'ldp:inbox', 'href': inboxLocation };
+      html = setDocumentRelation(html, [r], o);
+    }
+
+    var annotationServiceLocation = saveAsDocument.querySelector('#' + locationAnnotationServiceId + '-' + locationAnnotationServiceAction)
+    if (annotationServiceLocation) {
+      annotationServiceLocation = annotationServiceLocation.innerText.trim();
+      o = { 'id': 'document-annotation-service', 'title': 'Annotation Service' };
+      r = { 'rel': 'oa:annotationService', 'href': annotationServiceLocation };
+      html = setDocumentRelation(html, [r], o);
+    }
+
+    var blobImageMapping = [];
+    if (hasUploadTarget()) {
+      blobImageMapping = rewriteBlobImagesToRelative(html);
+    }
+
+    var baseURLSelectionChecked = saveAsDocument.querySelector('input[name="base-url"]:checked');
+    let baseURLType;
+    let nodes;
+    if (baseURLSelectionChecked) {
+      baseURLType = baseURLSelectionChecked.value
+      nodes = html.querySelectorAll('head link, [src], object[data]')
+      var base = html.querySelector('head base[href]');
+      var baseOptions = {'baseURLType': baseURLType};
+      if (base) {
+        baseOptions['iri'] = base.href;
+      }
+      nodes = rewriteBaseURL(nodes, baseOptions)
+    }
+
+    html = getDocument(html, documentOptions)
+
+    var progress = saveAsDocument.querySelector('progress')
+    if(progress) {
+      progress.parentNode.removeChild(progress)
+    }
+    sanitizeInsertAdjacentHTML(e.target, 'afterend', '<progress min="0" max="100" value="0"></progress>')
+    progress = saveAsDocument.querySelector('progress')
+
+    let saveData = html;
+    let saveContentType = 'text/html';
+    if (isMarkdownTarget(storageIRI)) {
+      const payload = getSavePayload(storageIRI, documentOptions);
+      saveData = payload.data;
+      saveContentType = payload.contentType;
+    }
+    else if (Config.User.Keys?.Encryption?.Enabled && Config.User.Keys?.Encryption?.DocumentEncrypt) {
+      saveData = await encryptArticlePayload(saveData, storageIRI);
+    }
+
+    Config.Storage.put(storageIRI, saveData, saveContentType, null, { 'progress': progress, 'contentType': saveContentType })
+      .then(async response => {
+        progress.parentNode.removeChild(progress)
+
+        if (baseURLType == 'base-url-relative') {
+          copyRelativeResources(storageIRI, nodes)
+        }
+
+        if (blobImageMapping.length) {
+          await uploadBlobAssets(storageIRI, blobImageMapping);
+          clearBlobAssets();
+        }
+
+        let url = response.headers?.get?.('Location') || response.url || storageIRI
+        url = sanitizeIRI(url);
+
+        sanitizeInsertAdjacentHTML(saveAsDocument, 'beforeend',
+          `<div class="response-message"><p class="success" data-i18n="dialog.save-as-document.success.saved-at.p"><span>${i18n.t('dialog.save-as-document.success.saved-at.p.textContent')}</span> <a href="${url}">${url}</a></p></div>`
+        )
+
+        const wasNewDocument = Config.DocumentAction === 'new';
+        Config.DocumentAction = 'save-as';
+
+        setTimeout(() => {
+          if (wasNewDocument) {
+            Config.Editor['new'] = false;
+            hideDocumentMenu();
+            openResource(url);
+          }
+          else {
+            window.open(url, '_blank');
+          }
+        }, 3000)
+      })
+
+      .catch(error => {
+        console.log('Error saving document: ' + error)
+
+        progress.parentNode.removeChild(progress)
+
+        let message
+
+        var requestAccess = '';
+        var linkHeaders;
+        var inboxURL;
+        var link = error?.response?.headers?.get('Link');
+        if (link) {
+          linkHeaders = LinkHeader.parse(link);
+        }
+
+        if (Config.User.IRI && linkHeaders && linkHeaders.has('rel', ns.ldp.inbox.value)){
+          inboxURL = linkHeaders.rel(ns.ldp.inbox.value)[0].uri;
+          requestAccess = `<p><button class="request-access" data-i18n="dialog.save-as-document.request-access.button" data-inbox="${inboxURL}" data-target="${storageIRI}" title="${i18n.t('dialog.save-as-document.request-access.button.title')}" type="button">${i18n.t('dialog.save-as-document.request-access.button.textContent')}</button></p>`;
+        }
+
+        let errorKey = 'default'
+
+        switch (error.status) {
+          case 0:
+          case 405:
+            errorKey = 'unwritable-location';
+            break
+          case 401:
+            errorKey = 'invalid-credentials';
+            if(!Config.User.IRI){
+              errorKey = 'unauthenticated';
+            }
+            break
+          case 403:
+            errorKey = 'unauthorized';
+            break
+          case 406:
+            errorKey = 'unacceptable';
+            break
+          default:
+            // message = error.message // Could not save
+            break
+        }
+
+        message = i18n.t(`dialog.save-as-document.error.${errorKey}.p.textContent`);
+
+        //TODO:i18n
+        sanitizeInsertAdjacentHTML(saveAsDocument, 'beforeend', 
+          `<div class="response-message"><p class="error" data-i18n="dialog.save-as-document.error.${errorKey}.p">${message}</p>${requestAccess}</div>`
+        );
+
+        if (Config.User.IRI && requestAccess) {
+          document.querySelector('#save-as-document .response-message .request-access').addEventListener('click', (e) => {
+            var objectId = '#' + generateAttributeId();
+
+            inboxURL = e.target.dataset.inbox;
+            var accessTo = e.target.dataset.target;
+            var agent = Config.User.IRI;
+
+            e.target.disabled = true;
+            var responseMessage = e.target.parentNode;
+            sanitizeInsertAdjacentHTML(responseMessage, 'beforeend', 
+              `<span class="progress" data-to="${inboxURL}">${Icon[".fas.fa-circle-notch.fa-spin.fa-fw"]}</span>`
+            );
+
+            var notificationStatements = `<dl about="` + objectId + `" prefix="acl: http://www.w3.org/ns/auth/acl#">
+<dt>Object type</dt><dd><a about="` + objectId + `" href="` + ns.acl.Authorization.value + `" typeof="acl:Authorization">Authorization</a></dd>
+<dt>Agents</dt><dd><a href="` + agent + `" property="acl:agent">` + agent + `</a></dd>
+<dt>Access to</dt><dd><a href="` + accessTo + `" property="acl:accessTo">` + accessTo + `</a></dd>
+<dt>Modes</dt><dd><a href="` + ns.acl.Read.value + `" property="acl:mode">Read</a></dd><dd><a href="` + ns.acl.Write.value + `" property="acl:mode">Write</a></dd>
+</dl>
+`;
+
+            var notificationData = {
+              "type": ['as:Request'],
+              "inbox": inboxURL,
+              "object": objectId,
+              "statements": notificationStatements
+            };
+
+            responseMessage = document.querySelector('#save-as-document .response-message');
+
+            return notifyInbox(notificationData)
+              .catch(error => {
+                console.log('Error notifying the inbox:', error)
+
+                responseMessage
+                  .querySelector('.progress[data-to="' + inboxURL + '"]')
+                  .setHTMLUnsafe(domSanitize(`${Icon[".fas.fa-times-circle.fa-fw"]} <span data-i18n="dialog.save-as-document.request-access.not-notified.span">${i18n.t('dialog.save-as-document.request-access.not-notified.span.textContent')}</span>`))
+              })
+              .then(result => {
+                var notificationSent = Icon[".fas.fa-check-circle.fa-fw"];
+
+                if (result && result.location) {
+                  let locationUrl = domSanitize(result.location);
+                  notificationSent = `<a href="${locationUrl}" rel="noopener" "target="_blank">${Icon[".fas.fa-check-circle.fa-fw"]}</a>`;
+                }
+
+                responseMessage
+                  .querySelector('.progress[data-to="' + inboxURL + '"]')
+                  .setHTMLUnsafe(domSanitize(notificationSent))
+              })
+
+          })
+        }
+      })
+  })
+}
+
+export function createNewCV(e) {
+  hideDocumentMenu();
+
+  Config.Editor.toggleEditor('author', { template: 'new-cv' });
+
+  Config.DocumentAction = 'new';
+
+  disableAutoSave(Config.DocumentURL, {'method': 'IndexedDB'});
+
+  updateButtons();
+
+  initCV();
+}
+
+export function createNewSpecification(e) {
+  hideDocumentMenu();
+
+  Config.Editor.toggleEditor('author', { template: 'new-specification' });
+
+  Config.DocumentAction = 'new';
+
+  disableAutoSave(Config.DocumentURL, {'method': 'IndexedDB'});
+
+  updateButtons();
+
+  initSpecification();
+}
+
+export function createNewQuestionnaire(e) {
+  hideDocumentMenu();
+
+  Config.Editor.toggleEditor('author', { template: 'new-questionnaire' });
+
+  Config.DocumentAction = 'new';
+
+  disableAutoSave(Config.DocumentURL, {'method': 'IndexedDB'});
+
+  updateButtons();
+
+  initQuestionnaire();
+}
+
+export function createNewDocument(e) {
+  hideDocumentMenu();
+
+  Config.Editor.toggleEditor('author', { template: 'new' });
+
+  Config.DocumentAction = 'new';
+
+  disableAutoSave(Config.DocumentURL, {'method': 'IndexedDB'});
+
+  updateButtons();
+}
+
+export function createNewSlideshow(e) {
+  hideDocumentMenu();
+
+  const liveEditor = Config.Editor?.mode === 'author' && Config.Editor.authorToolbarView?.editorView;
+
+  
+  if (liveEditor) {
+    Config.Editor.toggleEditor('social');
+  //   Config.Editor.wrapArticleAsSlideshow();
+  //   updateButtons();
+  //   initSlideshow({ focusEditor: true });
+  //   return;
+  }
+
+  Config.Editor.toggleEditor('author', { template: 'new-slideshow' });
+
+  Config.DocumentAction = 'new';
+
+  disableAutoSave(Config.DocumentURL, {'method': 'IndexedDB'});
+
+  updateButtons();
+
+  initSlideshow({ focusEditor: true });
+}
+
+export function initSlideshowInteraction() {
+  updateSlideshowControls();
+}
+
+let hoveredSlide = null;
+let controlsHideTimer = null;
+let controlsInit = false;
+let draggingSlideId = null;
+let slideshowControlsEl = null;
+let slideDropIndicatorEl = null;
+
+export function updateSlideshowControls() {
+  const isSlideshow = document.body.classList.contains('shower');
+  const isAuthor = Config.Editor.mode === 'author';
+
+  if (!isSlideshow) {
+    slideshowControlsEl?.remove();
+    slideDropIndicatorEl?.remove();
+    return;
+  }
+
+  // Re-attach if body.replaceChildren (e.g., setTemplateNewSlideshow) detached them.
+  if (slideshowControlsEl && !slideshowControlsEl.isConnected) document.body.appendChild(slideshowControlsEl);
+  if (slideDropIndicatorEl && !slideDropIndicatorEl.isConnected) document.body.appendChild(slideDropIndicatorEl);
+
+  if (slideshowControlsEl) {
+    slideshowControlsEl.dataset.author = isAuthor ? 'true' : 'false';
+    return;
+  }
+
+  const div = document.createElement('div');
+  div.className = 'do';
+  div.id = 'slideshow-controls';
+  div.dataset.author = isAuthor ? 'true' : 'false';
+  div.hidden = true;
+  div.innerHTML = `<button class="do slide-delete author-only" type="button" title="Delete slide" aria-label="Delete slide">${Icon['.fas.fa-trash-alt']}</button><div class="do add-slide-menu author-only"><button class="do add-slide-trigger" type="button" title="Add slide after" aria-label="Add slide after" aria-expanded="false">${Icon['.fas.fa-plus']}</button><div class="add-slide-options" hidden><button class="do add-slide-option" data-template="normal" type="button">Normal</button><button class="do add-slide-option" data-template="shout" type="button">Shout</button><button class="do add-slide-option" data-template="cover" type="button">Cover</button></div></div><button class="do enter-slide-full" type="button" title="Present this slide" aria-label="Present this slide">⛶</button>`;
+  document.body.appendChild(div);
+  slideshowControlsEl = div;
+
+  const indicator = document.createElement('div');
+  indicator.id = 'slide-drop-indicator';
+  indicator.className = 'do';
+  indicator.hidden = true;
+  document.body.appendChild(indicator);
+  slideDropIndicatorEl = indicator;
+
+  initSlideshowControlsHover(div, indicator);
+}
+
+function initSlideshowControlsHover(controls, indicator) {
+  if (controlsInit) return;
+  controlsInit = true;
+
+  const positionAt = (slide) => {
+    const rect = slide.getBoundingClientRect();
+    controls.style.top = `${rect.top + window.scrollY + 8}px`;
+    controls.style.left = `${rect.right + window.scrollX + 8}px`;
+    controls.hidden = false;
+  };
+
+  const scheduleHide = () => {
+    clearTimeout(controlsHideTimer);
+    controlsHideTimer = setTimeout(() => { controls.hidden = true; hoveredSlide = null; }, 250);
+  };
+
+  const hideIndicator = () => { indicator.hidden = true; };
+
+  document.addEventListener('mouseover', (e) => {
+    if (!document.body.classList.contains('shower')) return;
+    if (document.body.classList.contains('full')) return;
+    if (e.target.closest('#slideshow-controls')) {
+      clearTimeout(controlsHideTimer);
+      return;
+    }
+    const slide = e.target.closest('.slide');
+    if (slide && slide !== hoveredSlide) {
+      hoveredSlide = slide;
+      clearTimeout(controlsHideTimer);
+      positionAt(slide);
+    } else if (!slide) {
+      scheduleHide();
+    }
+  });
+
+  controls.addEventListener('click', (e) => {
+    if (e.target.closest('.enter-slide-full') && hoveredSlide) {
+      // hoveredSlide may be the rail-active clone; resolve to the real slide by id.
+      const slides = Array.from(document.querySelectorAll('.shower .slide'))
+        .filter(s => !s.closest('#rail-active-placeholder'));
+      const idx = slides.findIndex(s => s.id === hoveredSlide.id);
+      if (idx >= 0) {
+        Slideshow.goTo(idx);
+        Slideshow.enterFullMode();
+      }
+      clearTimeout(controlsHideTimer);
+      controls.hidden = true;
+      hoveredSlide = null;
+      return;
+    }
+    if (e.target.closest('.add-slide-trigger')) {
+      const trigger = e.target.closest('.add-slide-trigger');
+      const options = controls.querySelector('.add-slide-options');
+      const open = options.hidden;
+      options.hidden = !open;
+      trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+      return;
+    }
+    const opt = e.target.closest('.add-slide-option');
+    if (opt) {
+      const template = opt.dataset.template || 'normal';
+      const targetId = hoveredSlide?.id;
+      const options = controls.querySelector('.add-slide-options');
+      options.hidden = true;
+      controls.querySelector('.add-slide-trigger')?.setAttribute('aria-expanded', 'false');
+      ensureAuthorAndDo(() => { addSlideAfter(targetId, template); relayoutIfSingle(); });
+      return;
+    }
+    if (e.target.closest('.slide-delete') && hoveredSlide) {
+      // Refuse to delete the only slide; a slideshow needs at least one.
+      const real = Array.from(document.querySelectorAll('.shower .slide'))
+        .filter(s => !s.closest('#rail-active-placeholder'));
+      if (real.length <= 1) return;
+      const id = hoveredSlide.id;
+      ensureAuthorAndDo(() => { Config.Editor.deleteSlideById(id); relayoutIfSingle(); });
+      controls.hidden = true;
+      hoveredSlide = null;
+    }
+  });
+
+  document.addEventListener('dragstart', (e) => {
+    if (!document.body.classList.contains('shower')) return;
+    if (document.body.classList.contains('full')) return;
+    const slide = e.target.closest('.slide');
+    if (!slide) return;
+    // The rail clone is the draggable proxy for the active slide; the editable original isn't.
+    if (slide.classList.contains('active') && !slide.closest('#rail-active-placeholder')) return;
+    if (Config.Editor.mode !== 'author') {
+      e.preventDefault();
+      Config.Editor.toggleEditor('author');
+      return;
+    }
+    draggingSlideId = slide.id;
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('application/x-slide-id', draggingSlideId);
+
+    const rect = slide.getBoundingClientRect();
+    const ghostHost = document.createElement('div');
+    ghostHost.className = 'shower single';
+    ghostHost.style.cssText = `position:fixed;top:0;left:-10000px;width:${rect.width}px;height:${rect.height}px;pointer-events:none;`;
+    const ghostArticle = document.createElement('article');
+    ghostArticle.style.cssText = 'margin:0;padding:0;';
+    const clone = slide.cloneNode(true);
+    clone.style.margin = '0';
+    ghostArticle.appendChild(clone);
+    ghostHost.appendChild(ghostArticle);
+    document.body.appendChild(ghostHost);
+    e.dataTransfer.setDragImage(ghostHost, e.clientX - rect.left, e.clientY - rect.top);
+    setTimeout(() => ghostHost.remove(), 0);
+
+    document.body.classList.add('slide-dragging');
+  }, true);
+  document.addEventListener('dragend', (e) => {
+    if (!draggingSlideId) return;
+    draggingSlideId = null;
+    document.body.classList.remove('slide-dragging');
+    hideIndicator();
+  }, true);
+
+  document.addEventListener('dragover', (e) => {
+    if (!draggingSlideId) return;
+    const slide = e.target.closest('.slide');
+    if (!slide) { hideIndicator(); return; }
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = 'move';
+    const rect = slide.getBoundingClientRect();
+    const before = e.clientY < rect.top + rect.height / 2;
+    const y = (before ? rect.top : rect.bottom) + window.scrollY;
+    indicator.style.top = `${y - 4}px`;
+    indicator.style.left = `${rect.left + window.scrollX - 4}px`;
+    indicator.style.width = `${rect.width + 8}px`;
+    indicator.hidden = false;
+  }, true);
+
+  document.addEventListener('drop', (e) => {
+    if (!draggingSlideId) return;
+    const slide = e.target.closest('.slide');
+    hideIndicator();
+    if (!slide || slide.id === draggingSlideId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const rect = slide.getBoundingClientRect();
+    const before = e.clientY < rect.top + rect.height / 2;
+    Config.Editor.moveSlide(draggingSlideId, slide.id, before);
+    relayoutIfSingle();
+  }, true);
+}
+
+function relayoutIfSingle() {
+  if (document.body.classList.contains('full')) return;
+  requestAnimationFrame(() => Slideshow.layoutSingle());
+}
+
+function newSlideFragment(template = 'normal') {
+  const id = 'slide-' + generateAttributeId();
+  const wrapper = (inner) => `<section class="slide" id="${id}" inlist="" rel="schema:hasPart" resource="#${id}" typeof="bibo:Slide">${inner}</section>`;
+  switch (template) {
+    case 'shout':
+      return fragmentFromString(wrapper(`<h2 class="shout" property="schema:name"></h2>`));
+    case 'cover':
+      return fragmentFromString(wrapper(`<h2 property="schema:name"></h2><div datatype="rdf:HTML" property="schema:description"><p><span about="" rel="bibo:presentedAt" resource="#event-presentation" rev="bibo:presents"></span></p><p resource="#event-presentation" typeof="schema:Event bibo:Conference"><span rel="schema:superEvent" resource="#conference" rev="schema:subEvent" typeof="bibo:Conference"><a href="" rel="schema:url"></a></span>, <a href="" rel="schema:location"></a>, <time datatype="xsd:dateTime" property="schema:startDate"></time><time datatype="xsd:dateTime" property="schema:endDate"></time></p><address><img alt="" height="96" src="" width="96"> <span></span> <a class="do-print-a-href-hide" href="" rel="schema:performer"></a> <span></span></address><footer><dl><dt>Project</dt><dd><a class="do-print-a-href-hide" href="" rel="schema:workFeatured"></a></dd><dt>Slides</dt><dd><a about="#event-presentation" class="do-print-a-href-hide" href="" rel="schema:workFeatured"></a></dd></dl></footer></div>`));
+    default:
+      return fragmentFromString(wrapper(`<h2 property="schema:name"></h2><div datatype="rdf:HTML" property="schema:description"><p></p></div>`));
+  }
+}
+
+function activateSlideById(id) {
+  requestAnimationFrame(() => {
+    const slides = Array.from(document.querySelectorAll('.shower main article .slide'));
+    const idx = slides.findIndex(s => s.id === id);
+    if (idx >= 0) Slideshow.goTo(idx);
+  });
+}
+
+export function addSlide(e) {
+  hideDocumentMenu();
+  const active = document.querySelector('.shower .slide.active');
+  const fragment = newSlideFragment();
+  const newId = fragment.querySelector('section.slide')?.id;
+  if (active?.id) {
+    Config.Editor.insertSlideAfter(active.id, fragment);
+  } else {
+    Config.Editor.insertSlideAtEnd(fragment);
+  }
+  relayoutIfSingle();
+  if (newId) activateSlideById(newId);
+}
+
+export function addSlideAfter(targetId, template = 'normal') {
+  hideDocumentMenu();
+  const fragment = newSlideFragment(template);
+  const newId = fragment.querySelector('section.slide')?.id;
+  if (targetId) {
+    Config.Editor.insertSlideAfter(targetId, fragment);
+  } else {
+    Config.Editor.insertSlideAtEnd(fragment);
+  }
+  relayoutIfSingle();
+  if (newId) activateSlideById(newId);
+}
+
+function ensureAuthorAndDo(action) {
+  if (Config.Editor.mode === 'author') {
+    action();
+    return;
+  }
+  Config.Editor.toggleEditor('author');
+  // In collab mode the doc binds asynchronously; wait until slides appear in PM state
+  let attempts = 0;
+  const tryRun = () => {
+    const view = Config.Editor.authorToolbarView?.editorView;
+    if (view) {
+      let hasSlides = false;
+      view.state.doc.descendants(n => {
+        if (hasSlides) return false;
+        if (n.type.name === 'section' && (n.attrs.originalAttributes?.class || '').split(' ').includes('slide')) {
+          hasSlides = true;
+        }
+      });
+      if (hasSlides) { action(); return; }
+    }
+    if (++attempts < 40) setTimeout(tryRun, 50);
+  };
+  tryRun();
+}
+
+// Strip inline rail artifacts so serialize/print sees a clean DOM; restore on next frame.
+function exitSingleBeforeSerialize() {
+  Slideshow.clearSingleLayout();
+  requestAnimationFrame(() => Slideshow.layoutSingle());
+}
+
+export function showEmbedData(e) {
+  if(document.querySelector('#embed-data-entry')) { return; }
+
+  // var eventEmbedData = function(e) {
+    e.target.setAttribute('disabled', 'disabled');
+    var scriptCurrent = document.querySelectorAll('head script[id^="meta-"]');
+
+    var scriptType = {
+      'meta-turtle': {
+        mediaType: 'text/turtle',
+        scriptStart: `<script id="meta-turtle" title="Turtle" type="text/turtle">`,
+        cdataStart: `#${Config.CDATAStart}\n`,
+        cdataEnd: `\n#${Config.CDATAEnd}`,
+        scriptEnd: `</script>`
+      },
+      'meta-json-ld': {
+        mediaType: 'application/ld+json',
+        scriptStart: `<script id="meta-json-ld" title="JSON-LD" type="application/ld+json">`,
+        cdataStart: `${Config.CDATAStart}\n`,
+        cdataEnd: `\n${Config.CDATAEnd}`,
+        scriptEnd: `</script>`
+      },
+      'meta-trig': {
+        mediaType: 'application/trig',
+        scriptStart: `<script id="meta-trig" title="TriG" type="application/trig">`,
+        cdataStart: `#${Config.CDATAStart}\n`,
+        cdataEnd: `\n#${Config.CDATAEnd}`,
+        scriptEnd: `</script>`
+      }
+    }
+
+    var scriptCurrentData = {};
+    if (scriptCurrent.length) {
+      for(var i = 0; i < scriptCurrent.length; i++) {
+        var v = scriptCurrent[i];
+        var id = v.id;
+        scriptCurrentData[id] = v.getHTML().split(/\r\n|\r|\n/);
+        scriptCurrentData[id].shift();
+        scriptCurrentData[id].pop();
+        scriptCurrentData[id] = {
+          'type': v.getAttribute('type') || '',
+          'title': v.getAttribute('title') || '',
+          'content' : scriptCurrentData[id].join('\n')
+        };
+      }
+    }
+
+    var buttonClose = getButtonHTML({ key: 'dialog.embed-data-entry.close.button', button: 'close', buttonClass: 'close', iconSize: 'fa-2x' });
+
+    var embedMenu = `
+    <aside aria-labelledby="embed-data-entry-label" class="do on tabs" dir="${Config.User.UI.LanguageDir}" id="embed-data-entry" lang="${Config.User.UI.Language}" rel="schema:hasPart" resource="#embed-data-entry" xml:lang="${Config.User.UI.Language}">
+      <h2 data-i18n="dialog.embed-data-entry.h2" id="embed-data-entry-label" property="schema:name">${i18n.t('dialog.embed-data-entry.h2.textContent')} ${Config.Button.Info.EmbedData}</h2>
+      ${buttonClose}
+      <div class="info"></div>
+      <nav><ul><li class="selected"><a href="#embed-data-turtle">Turtle</a></li><li><a href="#embed-data-json-ld">JSON-LD</a></li><li><a href="#embed-data-trig">TriG</a></li></ul></nav>
+      <div id="embed-data-turtle" class="selected"><textarea dir="ltr" placeholder="Enter data in Turtle" name="meta-turtle" cols="80" rows="24">${(scriptCurrentData['meta-turtle'] ? scriptCurrentData['meta-turtle'].content : '')}</textarea><button class="save" data-i18n="dialog.embed-data-entry.submit.button" title="${i18n.t('dialog.embed-data-entry.submit.button.title')}" type="submit">${i18n.t('dialog.embed-data-entry.submit.button.textContent')}</button></div>
+      <div id="embed-data-json-ld"><textarea dir="ltr" placeholder="Enter data in JSON-LD" name="meta-json-ld" cols="80" rows="24">${(scriptCurrentData['meta-json-ld'] ? scriptCurrentData['meta-json-ld'].content : '')}</textarea><button class="save" data-i18n="dialog.embed-data-entry.submit.button" title="${i18n.t('dialog.embed-data-entry.submit.button.title')}" type="submit">${i18n.t('dialog.embed-data-entry.submit.button.textContent')}</button></div>
+      <div id="embed-data-trig"><textarea dir="ltr" placeholder="Enter data in TriG" name="meta-trig" cols="80" rows="24">${(scriptCurrentData['meta-trig'] ? scriptCurrentData['meta-trig'].content : '')}</textarea><button class="save" data-i18n="dialog.embed-data-entry.submit.button" title="${i18n.t('dialog.embed-data-entry.submit.button.title')}" type="submit">${i18n.t('dialog.embed-data-entry.submit.button.textContent')}</button></div>
+    </aside>
+    `;
+
+    document.body.appendChild(fragmentFromString(embedMenu));
+    document.querySelector('#embed-data-turtle textarea').focus();
+    var a = document.querySelectorAll('#embed-data-entry nav a');
+    for(let i = 0; i < a.length; i++) {
+      a[i].addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+
+        var li = e.target.parentNode;
+        if(!li.classList.contains('selected')) {
+          document.querySelector('#embed-data-entry nav li.selected').classList.remove('selected');
+          li.classList.add('selected');
+          document.querySelector('#embed-data-entry > div.selected').classList.remove('selected');
+          var d = document.querySelector('#embed-data-entry > div' + e.target.hash);
+          d.classList.add('selected');
+          d.querySelector('textarea').focus();
+        }
+      });
+    }
+
+    document.querySelector('#embed-data-entry button.close').addEventListener('click', (e) => {
+      document.querySelector('button.embed-data-meta').removeAttribute('disabled');
+    });
+
+    var buttonSave = document.querySelectorAll('#embed-data-entry button.save');
+    for (let i = 0; i < buttonSave.length; i++) {
+      buttonSave[i].addEventListener('click', (e) => {
+        var textarea = e.target.closest('.selected').querySelector('textarea');
+        var name = textarea.getAttribute('name');
+        var data = textarea.value.trim();
+
+        var script = document.getElementById(name);
+        if (scriptType[name] && data.length) {
+          //If there was a script already
+
+          serializeData(data, scriptType[name].mediaType, scriptType[name].mediaType, { sanitize: true })
+            .then(scriptEntry => {
+              const scriptTextContent = scriptType[name].cdataStart + scriptEntry + scriptType[name].cdataEnd;
+
+              if (script) {
+                script.textContent = scriptTextContent;
+              }
+              else {
+                const el = document.createElement('script');
+                el.id = name;
+                el.title = scriptType[name].title;  // if needed
+                el.type = scriptType[name].mediaType;
+                el.textContent = scriptTextContent;
+                document.querySelector('head').appendChild(el);
+              }
+            })
+            //TODO: Catch here when the input is invalid. Show alert indicating invalid. Let user correct it before saving again.
+        }
+        else {
+          //Remove if no longer used
+          script?.parentNode.removeChild(script);
+        }
+
+        var ede = document.getElementById('embed-data-entry');
+        ede.parentNode.removeChild(ede);
+        document.querySelector('.embed-data-meta').removeAttribute('disabled');
+      });
+    }
+  // };
+
+  // var edih = document.querySelector('button.embed-data-meta');
+  // edih.removeEventListener('click', eventEmbedData);
+  // edih.addEventListener('click', eventEmbedData);
+}
+
+//TODO: Review grapoi
+export function showDocumentMetadata(node) {
+  if(document.querySelector('#document-metadata')) { return; }
+
+  var documentURL = Config.DocumentURL;
+
+  var content = selectArticleNode(document);
+  var count = contentCount(content);
+  var creators = [], authors = [], contributors = [], editors = [], performers = [];
+  var citationsTo = [];
+  var requirements = [];
+  var advisements = [];
+  var skos = [];
+
+  // var subjectURI = currentLocation();
+  // var options = {'contentType': 'text/html', 'subjectURI': subjectURI };
+// console.log(options)
+  var g = Config.Resource[documentURL].graph;
+  var citations = Object.keys(Config.Citation).concat([ns.dcterms.references.value, ns.schema.citation.value]);
+  var triples = g.out().quads();
+  // g.out().terms.length
+  for (const t of triples) {
+// console.log(t)
+    var s = t.subject.value;
+    var p = t.predicate.value;
+    var o = t.object.value;
+
+    //TODO: Distinguish between external/internal for Config.Resource[documentURL].citations (right now it is external only), then use that for citations in showDocumentMetadata instead of using this triples.forEach
+    if (citations.includes(p)) {
+      citationsTo.push(t);
+    }
+  };
+
+  requirements = (Config.Resource[documentURL].spec && Config.Resource[documentURL].spec['requirement']) ? Object.keys(Config.Resource[documentURL].spec['requirement']) : [];
+  advisements = (Config.Resource[documentURL].spec && Config.Resource[documentURL].spec['advisement']) ? Object.keys(Config.Resource[documentURL].spec['advisement']) : [];
+  skos = (Config.Resource[documentURL].skos) ? Config.Resource[documentURL].skos : [];
+
+  citations = `<tr class="citations"><th data-i18n="panel.document-metadata.citations.th">${i18n.t('panel.document-metadata.citations.th.textContent')}</th><td>${citationsTo.length}</td></tr>`;
+  requirements = `<tr class="requirements"><th data-i18n="panel.document-metadata.requirements.th">${i18n.t('panel.document-metadata.requirements.th.textContent')}</th><td>${requirements.length}</td></tr>`;
+  advisements = `<tr class="advisements"><th data-i18n="panel.document-metadata.advisements.th">${i18n.t('panel.document-metadata.advisements.th.textContent')}</th><td>${advisements.length}</td></tr>`;
+  var conceptsList = [];
+  conceptsList = (skos.type && skos.type[ns.skos.Concept.value]) ? skos.type[ns.skos.Concept.value] : conceptsList;
+
+  var concepts = `<tr class="concepts"><th data-i18n="panel.document-metadata.concepts.th">${i18n.t('panel.document-metadata.concepts.th.textContent')}</th><td>${conceptsList.length}</td></tr>`;
+  // TODO: Review grapoi . Check it matches expected
+  var statements = `<tr class="statements"><th data-i18n="panel.document-metadata.statements.th">${i18n.t('panel.document-metadata.statements.th.textContent')}</th><td>${g.out().terms.length}</td></tr>`;
+
+  var graphCreators = getGraphCreators(g) || [];
+  if (Config.Resource[documentURL].headers?.linkHeaders?.has('rel', 'describedby')) {
+    let describedby = Config.Resource[documentURL].headers.linkHeaders.rel('describedby')[0].uri;
+    let describedbyGraph = Config.Resource[describedby]?.graph;
+
+    if (describedbyGraph) {
+      graphCreators = graphCreators.concat(getGraphCreators(describedbyGraph) || []);
+    }
+  }
+  graphCreators = graphCreators.length ? [...new Set(graphCreators)] : undefined;
+
+  var graphEditors = getGraphEditors(g);
+  var graphAuthors = getGraphAuthors(g);
+  var graphContributors = getGraphContributors(g);
+  var graphPerformers = getGraphPerformers(g);
+
+  if (graphCreators) {
+    graphCreators.forEach(i => {
+      var go = g.node(rdf.namedNode(i));
+      let name = getGraphLabelOrIRI(go);
+      name = (name === i) ? getUserLabelOrIRI(i) : name;
+      creators.push(`<li>${name}</li>`);
+    });
+    if (creators.length){
+      creators = `<tr class="people"><th data-i18n="panel.document-metadata.creators.th">${i18n.t('panel.document-metadata.creators.th.textContent')}</th><td><ul class="creators">${creators.join('')}</ul></td></tr>`;
+    }
+  }
+
+  if (graphEditors) {
+    graphEditors.forEach(i => {
+      var go = g.node(rdf.namedNode(i));
+      let name = getGraphLabelOrIRI(go);
+      name = (name === i) ? getUserLabelOrIRI(i) : name;
+      editors.push(`<li>${name}</li>`);
+    });
+    if (editors.length){
+      editors = `<tr class="people"><th data-i18n="panel.document-metadata.editors.th">${i18n.t('panel.document-metadata.editors.th.textContent')}</th><td><ul class="editors">${editors.join('')}</ul></td></tr>`;
+    }
+  }
+
+  if (graphAuthors) {
+    graphAuthors.forEach(i => {
+      var go = g.node(rdf.namedNode(i));
+      let name = getGraphLabelOrIRI(go);
+      name = (name === i) ? getUserLabelOrIRI(i) : name;
+      authors.push(`<li>${name}</li>`);
+    });
+    if (authors.length){
+      authors = `<tr class="people"><th data-i18n="panel.document-metadata.authors.th">${i18n.t('panel.document-metadata.authors.th.textContent')}</th><td><ul class="authors">${authors.join('')}</ul></td></tr>`;
+    }
+  }
+
+  if (graphContributors) {
+    graphContributors.forEach(i => {
+      var go = g.node(rdf.namedNode(i));
+      let name = getGraphLabelOrIRI(go);
+      name = (name === i) ? getUserLabelOrIRI(i) : name;
+      contributors.push(`<li>${name}</li>`);
+    });
+    if (contributors.length){
+      contributors = `<tr class="people"><th data-i18n="panel.document-metadata.contributors.th">${i18n.t('panel.document-metadata.contributors.th.textContent')}</th><td><ul class="contributors">${contributors.join('')}</ul></td></tr>`;
+    }
+  }
+
+  if (graphPerformers) {
+    graphPerformers.forEach(i => {
+      var go = g.node(rdf.namedNode(i));
+      let name = getGraphLabelOrIRI(go);
+      name = (name === i) ? getUserLabelOrIRI(i) : name;
+      performers.push(`<li>${name}</li>`);
+    });
+    if (performers.length){
+      performers = `<tr class="people"><th>Performers</th><td><ul class="performers">${performers.join('')}</ul></td></tr>`;
+    }
+  }
+
+  var data = creators + authors + editors + contributors + performers + citations + requirements + advisements + concepts + statements;
+
+      // <tr><th>Lines</th><td>' + count.lines + '</td></tr>\n\
+      // <tr><th>A4 Pages</th><td>' + count.pages.A4 + '</td></tr>\n\
+      // <tr><th>US Letter</th><td>' + count.pages.USLetter + '</td></tr>\n\
+  var html = `
+  <section id="document-metadata">
+    <table>
+      <caption data-i18n="panel.document-metadata.caption">${i18n.t('panel.document-metadata.caption.textContent')}</caption>
+      <tbody>
+        ${data}
+        <tr><th data-i18n="panel.document-metadata.reading-time.th">${i18n.t('panel.document-metadata.reading-time.th.textContent')}</th><td>${count.readingTime} <span data-i18n="datetime.minutes.span">${i18n.t('datetime.minutes.span.textContent')}</span></td></tr>
+        <tr><th data-i18n="panel.document-metadata.characters.th">${i18n.t('panel.document-metadata.characters.th.textContent')}</th><td>${count.chars}</td></tr>
+        <tr><th data-i18n="panel.document-metadata.words.th">${i18n.t('panel.document-metadata.words.th.textContent')}</th><td>${count.words}</td></tr>
+        <tr><th data-i18n="panel.document-metadata.bytes.th">${i18n.t('panel.document-metadata.bytes.th.textContent')}</th><td>${count.bytes}</td></tr>
+      </tbody>
+    </table>
+  </section>`;
+
+  sanitizeInsertAdjacentHTML(node, 'beforeend', html);
+}
+
+export function contentCount(node) {
+  node = node || selectArticleNode(document);
+  node = getNodeWithoutClasses(node, 'do');
+  var doctype = (node instanceof Element && node.tagName.toLowerCase() === 'html') ? getDoctype() : '';
+  var content = node.textContent.trim();
+  var contentCount = { readingTime:1, words:0, chars:0, lines:0, pages:{A4:1, USLetter:1}, bytes:0 };
+  if (content.length) {
+    var lineHeight = node.ownerDocument.defaultView.getComputedStyle(node, null)["line-height"];
+    var linesCount = Math.ceil(node.clientHeight / parseInt(lineHeight));
+    contentCount = {
+      readingTime: Math.ceil(content.split(' ').length / 200),
+      words: content.match(/\S+/g).length,
+      chars: content.length,
+      lines: linesCount,
+      pages: { A4: Math.ceil(linesCount / 47), USLetter: Math.ceil(linesCount / 63) },
+      bytes: encodeURI(doctype + node.outerHTML).split(/%..|./).length - 1
+    };
+  }
+  return contentCount;
+}
+
+export function resourceSave(e, options) {
+  const documentOptions = {
+    ...Config.DOMProcessing,
+    format: true,
+    sanitize: true,
+    normalize: true
+  };
+
+  var url = Config.DocumentURL || currentLocation();
+  var data = getDocument(null, documentOptions);
+  options = options || {};
+
+  getResourceInfo(data, options).then(i => {
+    if (Config.DocumentAction == 'new') {
+      saveAsDocument(e);
+    }
+    else {
+      if (e.target.closest('.create-version')) {
+        createMutableResource(url);
+      }
+      else if (e.target.closest('.create-immutable')) {
+        createImmutableResource(url);
+      }
+      else if (e.target.closest('.resource-save')) {
+        updateMutableResource(url).then(() => markLocalSnapshotPublished(url)).catch(() => {});
+      }
+    }
+  });
+}
+
+export function initEditHistory() {
+  var buttonToggle = getButtonHTML({ key: 'panel.edit-history.toggle.button', button: 'toggle', buttonClass: 'toggle' });
+
+  var aside = `
+  <aside aria-labelledby="document-edit-history-label" class="do" contenteditable="false" dir="${Config.User.UI.LanguageDir}" id="document-edit-history" lang="${Config.User.UI.Language}" rel="schema:hasPart" resource="#document-edit-history" xml:lang="${Config.User.UI.Language}">
+    <h2 data-i18n="panel.edit-history.h2" id="document-edit-history-label" property="schema:name">${i18n.t('panel.edit-history.h2.textContent')}</h2>
+    ${buttonToggle}
+    <div>
+      <div class="info"></div>
+      <ul class="versions"></ul>
+    </div>
+  </aside>`;
+  sanitizeInsertAdjacentHTML(document.body, 'beforeend', aside);
+  aside = document.getElementById('document-edit-history');
+  editHistoryAside = aside;
+
+  document.addEventListener('click', async e => {
+    const button = e.target.closest('button.edit-history-preview');
+    if (!button || button.disabled) return;
+
+    const itemId = button.dataset.key;
+    const item = versionItemCache.get(itemId);
+    if (!item?.content) return;
+
+    button.disabled = true;
+
+    const documentOptions = { ...Config.DOMProcessing, format: true, sanitize: true, normalize: true };
+    const currentContent = getDocument(null, documentOptions);
+    showResourceReviewChanges(currentContent, item.content, null, {
+      mode: 'edit-history-preview',
+      versionItem: item,
+    });
+
+    const reviewPanel = document.getElementById('review-changes');
+    if (!reviewPanel) {
+      // No diff; nothing to show, leave the button disabled.
+      return;
+    }
+
+    new MutationObserver((mutations, obs) => {
+      const removed = [...mutations].some(m => [...m.removedNodes].some(n => n.id === 'review-changes'));
+      if (!removed) return;
+      obs.disconnect();
+      // Re-enable only if this version was not the one restored.
+      if (button.isConnected && lastRestoredKey !== itemId) {
+        button.disabled = false;
+      }
+    }).observe(document.body, { childList: true });
+  });
+
+  window.addEventListener('dokieli:version-current-changed', () => {
+    if (aside.classList.contains('on')) {
+      showEditHistory();
+    }
+  });
+
+  // Tear down the Yjs observer when the panel is closed via the toggle button.
+  new MutationObserver(() => {
+    if (!aside.classList.contains('on')) {
+      unobserveEditHistory();
+      unobserveEditHistory = () => {};
+    }
+  }).observe(aside, { attributeFilter: ['class'] });
+
+  return aside;
+}
+
+export async function showEditHistory() {
+  hideDocumentMenu();
+
+  if (!editHistoryAside) {
+    initEditHistory();
+  }
+  const aside = editHistoryAside;
+
+  // Re-attach to body if the editor removed it from the DOM.
+  if (!aside.isConnected) {
+    document.body.appendChild(aside);
+  }
+  aside.classList.add('on');
+
+  // Observe Yjs versions map for peer changes while panel is open.
+  unobserveEditHistory();
+  unobserveEditHistory = onYjsVersionsChanged(() => showEditHistory());
+
+  const list = aside.querySelector('ul.versions');
+  list.replaceChildren();
+  versionItemCache.clear();
+
+  let items;
+  if (Config.Editor['collab']) {
+    items = getYjsVersions();
+  } else if (Config.Editor['author'] || Config.Editor['social']) {
+    // Editor initialised but not in collab mode, try IDB directly.
+    items = await getYjsVersionsFromIDB({ limit: 100});
+    if (!items.length) {
+      const collection = await getDeviceStorageItem(Config.DocumentURL);
+      if (!collection?.items?.length) {
+        sanitizeInsertAdjacentHTML(list, 'beforeend', `<li><p data-i18n="panel.edit-history.empty.p">${i18n.t('panel.edit-history.empty.p.textContent')}</p></li>`);
+        return;
+      }
+      items = [];
+      for (const itemId of collection.items) {
+        const item = await getDeviceStorageItem(itemId);
+        if (item) items.push(item);
+      }
+    }
+  } else {
+    // Editor not yet active, read Yjs versions directly from IDB.
+    items = await getYjsVersionsFromIDB({ limit: 100 });
+  }
+
+  if (!items.length) {
+    sanitizeInsertAdjacentHTML(list, 'beforeend', `<li><p data-i18n="panel.edit-history.empty.p">${i18n.t('panel.edit-history.empty.p.textContent')}</p></li>`);
+    return;
+  }
+
+  const currentKey = getCurrentVersionKey() || (items[0] ? (items[0].updated || items[0].id) : null);
+
+  for (const item of items) {
+    const key = item.updated || item.id;
+    versionItemCache.set(key, item);
+
+    const datetime = item.updated || item.published || '';
+    const a = item.actor;
+    const actor = (a?.name || a?.iri)
+      ? `<dl class="author-name"><dt>Authors</dt><dd>${getAgentHTML({ iri: a?.iri, name: a?.name, image: a?.avatar })}</dd></dl>`
+      : '';
+
+    const isCurrent = key === currentKey;
+    const isRestored = key === lastRestoredKey;
+    const action = isCurrent
+      ? `<span class="edit-history-current" data-i18n="panel.edit-history.item.current.span">${i18n.t('panel.edit-history.item.current.span.textContent')}</span>`
+      : `<button class="edit-history-preview" data-i18n="panel.edit-history.item.preview.button" data-key="${key}" title="${i18n.t('panel.edit-history.item.preview.button.title')}" type="button"${isRestored ? ' disabled' : ''}>${i18n.t('panel.edit-history.item.preview.button.textContent')}</button>`;
+
+    const dateDisplay = datetime ? `<dl class="created"><dt>Created</dt><dd><time content="${datetime}" datatype="xsd:dateTime" datetime="${datetime}" property="dcterms:created">${datetime.substr(0, 19).replace('T', ' ')}</time> ${action}</dd></dl>` : '';
+
+    sanitizeInsertAdjacentHTML(list, 'beforeend', `
+      <li data-datetime="${datetime}"${isCurrent ? ' class="selected"' : ''}>
+        ${actor}
+        ${dateDisplay}
+      </li>
+      `);
+  }
+}
+
+export function mementoDocument(e) {
+  if(typeof e !== 'undefined') {
+    var b = e.target.closest('button');
+    if(b.disabled) { return; }
+    else {
+      b.disabled = true;
+    }
+  }
+
+  showTimeMap();
+}
+
+
+export function showRobustLinks(e, selector) {
+  if (e) {
+    e.target.closest('button').disabled = true;
+  }
+
+  var robustLinks = selector || document.querySelectorAll('cite > a[href^="http"][data-versionurl][data-versiondate]');
+
+  var buttonClose = getButtonHTML({ key: 'dialog.robustify-links.close.button', button: 'close', buttonClass: 'close', iconSize: 'fa-2x' });
+
+  document.body.appendChild(fragmentFromString(`
+    <aside aria-labelledby="robustify-links-label" class="do on" dir="${Config.User.UI.LanguageDir}" id="robustify-links" lang="${Config.User.UI.Language}" rel="schema:hasPart" resource="#robustify-links" xml:lang="${Config.User.UI.Language}">
+      <h2 id="robustify-links-label" property="schema:name">Robustify Links ${Config.Button.Info.RobustLinks}</h2>
+      ${buttonClose}
+      <div class="info"></div>
+      <div id="robustify-links-input">
+        <p><input id="robustify-links-select-all" type="checkbox" value="true"/><label data-i18n="dialog.robustify-links.select-all.label" for="robustify-links-select-all">${i18n.t('dialog.robustify-links.select-all.label.textContent')}</label></p>
+        <p><input id="robustify-links-reuse" type="checkbox" value="true" checked="checked"/><label data-i18n="dialog.robustify-links.reuse.label" for="robustify-links-reuse">${i18n.t('dialog.robustify-links.reuse.label.textContent')}</label></p>
+        <ul id="robustify-links-list"></ul>
+      </div>
+      <button class="robustify" title="Robustify Links" type="submit">Robustify</button>
+    </aside>
+  `));
+
+  //TODO: Move unique list of existing RL's to Config.Resource?
+  var robustLinksUnique = {};
+  robustLinks.forEach(i => {
+    if (!robustLinksUnique[i.href]) {
+      robustLinksUnique[i.href] = {
+        "node": i,
+        "data-versionurl": i.getAttribute("data-versionurl"),
+        "data-versiondate": i.getAttribute("data-versiondate")
+      };
+    }
+    else {
+      // console.log(i);
+    }
+  });
+
+  // console.log('robustLinks: ' + robustLinks.length);
+  // console.log(robustLinksUnique)
+  // console.log('<robustLinksUnique:  ' + Object.keys(robustLinksUnique).length);
+
+  var rlCandidates = document.querySelectorAll('cite > a[href^="http"]:not([data-versionurl]):not([data-versiondate])');
+  // console.log(rlCandidates)
+  var rlInput = document.querySelector('#robustify-links-input');
+
+  sanitizeInsertAdjacentHTML(rlInput, 'afterbegin', '<p class="count"><data>' + rlCandidates.length + '</data> candidates.</p>');
+
+  var rlUL = document.querySelector('#robustify-links-list');
+  rlCandidates.forEach(i => {
+    var html = '<li><input id="' + i.href + '" type="checkbox" value="' + i.href + '" /> <label for="' + i.href + '"><a dir="ltr" href="' + i.href + '" rel="noopener" target="_blank" title="' + i.textContent + '">' + i.href + '</a></label>';
+
+    // TODO: addEventListener
+    //   if(robustLinksUnique[i.href]) {
+    //     console.log('Reuse Robust Link? ' + robustLinksUnique[i.href]["data-versionurl"]);
+    //     html += '<button class="robustlinks-reuse" title="' + robustLinksUnique[i.href]["data-versionurl"] + '">' + Icon[".fas.fa-recycle"] + '</button>';
+    //   }
+
+    html += '</li>';
+    sanitizeInsertAdjacentHTML(rlUL, 'beforeend', html);
+  });
+
+
+  var robustifyLinks = document.getElementById('robustify-links');
+  robustifyLinks.addEventListener('click', function (e) {
+    if (e.target.closest('button.close')) {
+      document.querySelector('#document-menu .robustify-links').disabled = false;
+    }
+
+    if (e.target.closest('button.robustify')) {
+      e.target.disabled = true;
+
+      var rlChecked = document.querySelectorAll('#robustify-links-list input:checked');
+
+      // var promises = [];
+
+      rlChecked.forEach(i => {
+        // console.log('Robustifying: ' + i.value)
+        // console.log(i);
+
+        var options = {};
+        options['showRobustLinksDecoration'] = false;
+        options['showActionMessage'] = false;
+        var node = document.querySelector('cite > a[href="' + i.value + '"]:not([data-versionurl]):not([data-versiondate])');
+
+        // console.log(node);
+
+        sanitizeInsertAdjacentHTML(i.parentNode, 'beforeend', '<span class="progress" data-to="' + i.value + '">' + Icon[".fas.fa-circle-notch.fa-spin.fa-fw"] + '</span>')
+
+        // window.setTimeout(function () {
+        // console.log(i.value);
+
+        var progress = document.querySelector('#robustify-links-list .progress[data-to="' + i.value + '"]');
+
+        var robustLinkFound = false;
+
+        var robustifyLinksReuse = document.querySelector('#robustify-links-reuse');
+        if (robustifyLinksReuse.checked) {
+          Object.keys(robustLinksUnique).forEach(url => {
+            if (i.value == url) {
+              // console.log(robustLinksUnique[url])
+              progress.setHTMLUnsafe(domSanitize('<a href="' + robustLinksUnique[url]["data-versionurl"] + '" rel="noopener" target="_blank">' + Icon[".fas.fa-archive"] + '</a>'));
+              // console.log(node)
+              node.setAttribute("data-versionurl", robustLinksUnique[url]["data-versionurl"]);
+              node.setAttribute("data-versiondate", robustLinksUnique[url]["data-versiondate"]);
+
+              showRobustLinksDecoration(node.closest('cite'));
+
+              robustLinkFound = true;
+            }
+          });
+        }
+
+        if (!robustLinkFound) {
+          createRobustLink(i.value, node, options).then(
+            function(rl){
+              var versionURL = ("data-versionurl" in rl) ? rl["data-versionurl"] : rl.href;
+
+              if ("data-versionurl" in rl && "data-versiondate" in rl) {
+                robustLinksUnique[i.value] = {
+                  "node": node,
+                  "data-versionurl": rl["data-versionurl"],
+                  "data-versiondate": rl["data-versiondate"]
+                }
+                // console.log('Add    robustLinksUnique: ' + Object.keys(robustLinksUnique).length);
+              }
+
+              progress.setHTMLUnsafe(domSanitize('<a href="' + versionURL + '" rel="noopener" target="_blank">' + Icon[".fas.fa-archive"] + '</a>'));
+
+              showRobustLinksDecoration(node.closest('cite'));
+            })
+            .catch(r => {
+              progress.setHTMLUnsafe(domSanitize(Icon[".fas.fa-times-circle"] + ' Unable to archive. Try later.'));
+            });
+        }
+        // console.log('</robustLinksUnique: ' + Object.keys(robustLinksUnique).length);
+        e.target.disabled = false;
+      });
+    }
+
+    if (e.target.closest('#robustify-links-select-all')) {
+      var rlInput = document.querySelectorAll('#robustify-links-list input');
+      // console.log(rlInput.value)
+      // console.log(e.target.checked)
+      if (e.target.checked) {
+        rlInput.forEach(i => {
+          i.setAttribute('checked', 'checked');
+          i.checked = true;
+        });
+      }
+      else {
+        rlInput.forEach(i => {
+          i.removeAttribute('checked');
+          i.checked = false;
+        });
+      }
+    }
+
+    if (e.target.closest('#robustify-links-list input')) {
+      // console.log(e.target)
+      if(e.target.getAttribute('checked')) {
+        e.target.removeAttribute('checked');
+      }
+      else {
+        e.target.setAttribute('checked', 'checked');
+      }
+      // console.log(e.target);
+    }
+  });
+}
+
+export function createRobustLink(uri, node, options){
+  return snapshotAtEndpoint(undefined, uri, 'https://web.archive.org/save/', '', {'Accept': '*/*', 'showActionMessage': false })
+    .then(r => {
+      // console.log(r)
+      //FIXME TODO: Doesn't handle relative URLs in Content-Location from w3.org or something. Getting Overview.html but base is lost.
+      if (r) {
+        var o = {
+          "href": uri
+        };
+        var versionURL = r.location;
+
+        if (typeof versionURL === 'string') {
+          var vD = versionURL.split('/')[4];
+          if (vD) {
+            var versionDate = vD.substr(0,4) + '-' + vD.substr(4,2) + '-' + vD.substr(6,2) + 'T' + vD.substr(8,2) + ':' + vD.substr(10,2) + ':' + vD.substr(12,2) + 'Z';
+
+            node.setAttribute('data-versionurl', versionURL);
+            node.setAttribute('data-versiondate', versionDate);
+
+            o["data-versionurl"] = versionURL;
+            o["data-versiondate"] = versionDate;
+          }
+        }
+
+        options['showActionMessage'] = ('showActionMessage' in options) ? options.showActionMessage : true;
+
+        if (options.showActionMessage) {
+          var message = `Archived <a href="${uri}">${uri}</a> at <a href="${versionURL}">${versionURL}</a> and created RobustLink.`;
+
+          message = {
+            'content': message,
+            'type': 'success'
+          }
+
+          addMessageToLog(message, Config.MessageLog);
+          showActionMessage(document.body, message);
+        }
+
+        if (options.showRobustLinksDecoration) {
+          showRobustLinksDecoration();
+        }
+
+        return o;
+      }
+      else {
+        return Promise.reject();
+      }
+    });
+}
+
+export async function snapshotAtEndpoint(e, iri, endpoint, noteData, options = {}) {
+  iri = iri || Config.DocumentURL || currentLocation();
+  endpoint = endpoint || 'https://pragma.archivelab.org/';
+
+  if (!(await requestOriginConsent(endpoint, { reason: 'archive' }))) { return; }
+  var progress, svgFail, messageArchivedAt;
+  options['showActionMessage'] = ('showActionMessage' in options) ? options.showActionMessage : true;
+
+  //TODO: Move to Config?
+  svgFail = Icon[".fas.fa-times-circle.fa-fw"];
+
+  messageArchivedAt = Icon[".fas.fa-archive"] + ' Archived at ';
+
+  var responseMessages = {
+    "403": svgFail + ' Archive unavailable. Please try later.',
+    "504": svgFail + ' Archive timeout. Please try later.'
+  }
+
+  // if(note.length) {
+  //   noteData.annotation["message"] = note;
+  // }
+
+  if (options.showActionMessage) {
+    var button = e.target.closest('button');
+
+    if (typeof e !== 'undefined' && button) {
+      if (button.disabled) { return; }
+      else { button.disabled = true; }
+
+      var archiveNode = button.parentNode;
+      var message = 'Archiving in progress.';
+      message = {
+        'content': message,
+        'type': 'info'
+      }
+      addMessageToLog(message, Config.MessageLog);
+      sanitizeInsertAdjacentHTML(archiveNode, 'beforeend', ' <span class="progress">' + Icon[".fas.fa-circle-notch.fa-spin.fa-fw"] + ' ' + message.content + '</span>');
+    }
+
+    progress = archiveNode.querySelector('.progress');
+  }
+
+  var handleError = function(response) {
+    if (options.showActionMessage) {
+      var message = responseMessages[response.status];
+      message = {
+        'content': message,
+        'type': 'error',
+        'timer': 3000
+      }
+      addMessageToLog(message, Config.MessageLog);
+      progress.setHTMLUnsafe(domSanitize(responseMessages[response.status]));
+    }
+
+    return Promise.reject(responseMessages[response.status]);
+  }
+
+  var handleSuccess = function(o) {
+// console.log(o)
+    if (options.showActionMessage) {
+      var message = messageArchivedAt + '<a rel="noopener" target="_blank" href="' + o.location + '">' + o.location + '</a>';
+      message = {
+        'content': message,
+        'type': 'success'
+      }
+      addMessageToLog(message, Config.MessageLog);
+      progress.setHTMLUnsafe(domSanitize(message.content));
+    }
+
+    return Promise.resolve(o);
+  }
+
+  var checkLinkHeader = function(response) {
+    var link = response.headers.get('Link');
+
+    if (link && link.length) {
+      var rels = LinkHeader.parse(link);
+      if (rels.has('rel', 'memento')) {
+        var o = {
+          "response": response,
+          "location": rels.rel('memento')[0].uri
+        }
+        return handleSuccess(o);
+      }
+    }
+
+    return handleError(response);
+  }
+
+  //TODO: See also https://archive.org/help/wayback_api.php
+
+  switch (endpoint) {
+    case 'https://web.archive.org/save/':
+      var headers = { 'Accept': '*/*' };
+      // options['mode'] = 'no-cors';
+      var pIRI = endpoint + iri;
+      // i = 'https://web.archive.org/save/https://example.org/';
+
+      pIRI = (Config.WebExtensionEnabled) ? pIRI : getProxyableIRI(pIRI, {'forceProxy': true});
+      // pIRI = getProxyableIRI(pIRI, {'forceProxy': true})
+      // console.log(pIRI)
+      return Config.Storage.get(pIRI, headers, options)
+        .then(response => {
+          // console.log(response)
+          // for(var key of response.headers.keys()) {
+          //   console.log(key + ': ' + response.headers.get(key))
+          // }
+
+          let location = response.headers.get('Content-Location');
+          // console.log(location)
+          if (location && location.length) {
+            location = domSanitize(location);
+            //XXX: Scrape Internet Archive's HTML
+            if (location.startsWith('/web/')) {
+              var o = {
+                "response": response,
+                "location": 'https://web.archive.org' + location
+              }
+              return handleSuccess(o);
+            }
+            else {
+              return response.text()
+                .then(data => {
+                  // console.log(data)
+                  // ALLOW_UNKNOWN_PROTOCOLS is needed for namespaced attribute values that DOMPurify mistakenly interpret as an unknown protocol protocol; it will allow mailto: but strip out others it does not recognize
+                  data = domSanitize(data);
+
+                  var regexp = /var redirUrl = "([^"]*)";/;
+                  var match = data.match(regexp);
+                  // console.log(match)
+                  if (match && match[1].startsWith('/web/')) {
+                    var o = {
+                      "response": response,
+                      "location": 'https://web.archive.org' + match[1]
+                    }
+                    return handleSuccess(o);
+                  }
+                  else {
+                    return checkLinkHeader(response);
+                  }
+                })
+            }
+          }
+          else {
+            // response.text().then(data => { console.log(data) })
+
+            return checkLinkHeader(response);
+          }
+        })
+        .catch(response => {
+          // console.log(response)
+          return handleError(response);
+        })
+
+    case 'https://pragma.archivelab.org/':
+    default:
+      noteData = noteData || {
+        "url": iri,
+        "annotation": {
+          "@context": "https://www.w3.org/ns/anno.jsonld",
+          "@type": "Annotation",
+          "motivation": "linking",
+          "target": iri,
+          "rights": "https://creativecommons.org/publicdomain/zero/1.0/"
+        }
+      };
+
+      if (Config.User.IRI) {
+        noteData.annotation['creator'] = {};
+        noteData.annotation.creator["@id"] = Config.User.IRI;
+      }
+      if (Config.User.Name) {
+        noteData.annotation.creator["http://schema.org/name"] = Config.User.Name;
+      }
+      if (Config.User.Image) {
+        noteData.annotation.creator["http://schema.org/image"] = Config.User.Image;
+      }
+      if (Config.User.URL) {
+        noteData.annotation.creator["http://schema.org/url"] = Config.User.URL;
+      }
+
+      if(!('contentType' in options)){
+        options['contentType'] = 'application/json';
+      }
+
+      noteData = sanitizeObject(noteData);
+
+      return Config.Storage.post(endpoint, '', JSON.stringify(noteData), options.contentType, null, options)
+
+      .then(response => response.json())
+
+      .then(response => {
+        if (response['wayback_id']) {
+          var message;
+          let location = 'https://web.archive.org' + response.wayback_id
+
+          if (options.showActionMessage) {
+            message = messageArchivedAt + '<a href="' + location + '" rel="noopener" target="_blank">' + location + '</a>';
+            message = {
+              'content': message,
+              'type': 'info'
+            }
+            addMessageToLog(message, Config.MessageLog);
+            progress.setHTMLUnsafe(domSanitize(message.content));
+          }
+
+          return { "response": response, "location": location };
+        }
+        else {
+          if (options.showActionMessage) {
+            message = responseMessages[response.status];
+            message = {
+              'content': message,
+              'type': 'error'
+            }
+            addMessageToLog(message, Config.MessageLog);
+            progress.setHTMLUnsafe(domSanitize(message.content));
+          }
+
+          return Promise.reject(responseMessages[response.status])
+        }
+      })
+
+      .catch((err) => {
+        if (options.showActionMessage) {
+          var message = responseMessages[err.response.status];
+          message = {
+            'content': message,
+            'type': 'error'
+          }
+          addMessageToLog(message, Config.MessageLog);
+          progress.setHTMLUnsafe(domSanitize(message.content));
+        }
+      })
+  }
+}
+
+//Derived from saveAsDocument
+export function generateFeed(e) {
+  e.target.disabled = true;
+
+  var buttonClose = getButtonHTML({ key: "dialog.generate-feed.close.button", button: 'close', buttonClass: 'close', iconSize: 'fa-2x' });
+
+  document.body.appendChild(fragmentFromString(`
+    <aside aria-labelledby="generate-feed-label" class="do on" dir="${Config.User.UI.LanguageDir}" id="generate-feed" lang="${Config.User.UI.Language}" rel="schema:hasPart" resource="#generate-feed" xml:lang="${Config.User.UI.Language}">
+      <h2 data-i18n="dialog.generate-feed.h2" id="generate-feed-label" property="schema:name">${i18n.t('dialog.generate-feed.h2.textContent')} ${Config.Button.Info.GenerateFeeds}</h2>
+      ${buttonClose}
+      <div class="info"></div>
+    </aside>
+  `));
+
+  var generateFeed = document.getElementById('generate-feed');
+  generateFeed.addEventListener('click', (e) => {
+    if (e.target.closest('button.close')) {
+      setMenuButtonDisabled('.generate-feed');
+    }
+  });
+
+  var fieldset = '';
+
+  var id = 'location-generate-feed';
+  var action = 'write';
+  sanitizeInsertAdjacentHTML(generateFeed, 'beforeend', `<form><fieldset id="${id}-fieldset"><legend data-i18n="dialog.generate-feed.save-to.legend">${i18n.t('dialog.generate-feed.save-to.legend.textContent')}</legend></fieldset></form>`);
+  fieldset = generateFeed.querySelector('fieldset#' + id + '-fieldset');
+  setupResourceBrowser(fieldset, id, action);
+  var feedTitlePlaceholder = (Config.User.IRI && Config.User.Name) ? Config.User.Name + "'s" : "Foo's";
+  sanitizeInsertAdjacentHTML(fieldset, 'beforeend', `<p data-i18n="dialog.generate-feed.generate-location.p" id="${id}-samp">${i18n.t('dialog.generate-feed.generate-location.p.textContent')} <samp id="${id}-${action}"></samp></p><ul><li><label data-i18n="dialog.generate-feed.title.label" for="${id}-title">${i18n.t('dialog.generate-feed.title.label.textContent')}</label> <input type="text" placeholder="${feedTitlePlaceholder} Web Feed" name="${id}-title" value=""></li><li><label data-i18n="language.label" for="${id}-language">${i18n.t('language.label.textContent')}</label> <select id="${id}-language" name="${id}-language">${getLanguageOptionsHTML()}</select></li><li><label data-i18n="license.label" for="${id}-license">${i18n.t('license.label.textContent')}</label> <select id="${id}-license" name="${id}-license">${getLicenseOptionsHTML()}</select></li><li>${getFeedFormatSelection()}</li></ul><button class="create" data-i18n="dialog.generate-feed.generate.button" title="${i18n.t('dialog.generate-feed.generate.button.title')}" type="submit">${i18n.t('dialog.generate-feed.generate.button.textContent')}</button>`);
+  attachBrowseStoragePopup(id, action);
+  var bli = document.getElementById(id + '-input');
+  bli.focus();
+  bli.placeholder = 'https://example.org/path/to/feed.xml';
+
+  generateFeed.addEventListener('click', e => {
+    if (!e.target.closest('button.create')) {
+      return
+    }
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    var generateFeed = document.getElementById('generate-feed')
+    var storageIRI = generateFeed.querySelector('#' + id + '-' + action).innerText.trim();
+
+    // console.log('storageIRI: ' + storageIRI)
+    var rm = generateFeed.querySelector('.response-message')
+    if (rm) {
+      rm.parentNode.removeChild(rm)
+    }
+
+    // TODO: this needs to be form validation instead
+    if (!isHttpOrHttpsProtocol(storageIRI) || !storageIRI.length) {
+      sanitizeInsertAdjacentHTML(generateFeed, 'beforeend',
+        `<div class="response-message"><p class="error" data-i18n="dialog.generate-feed.error.missing-location.p">${i18n.t("dialog.generate-feed.error.missing-location.p.textContent")}</p></div>`
+      )
+
+      return
+    }
+
+    var options = {};
+    var feedFormat = Config.MediaTypes.Feed[0];
+    var feedFormatSelectionChecked = generateFeed.querySelector('select[id="feed-format"]')
+    if (feedFormatSelectionChecked.length) {
+      feedFormat = (Config.MediaTypes.Feed.indexOf(feedFormatSelectionChecked.value) > -1) ? feedFormatSelectionChecked.value : feedFormat;
+
+      options['contentType'] = feedFormat;
+    }
+
+    var feedTitle = generateFeed.querySelector('input[name="' + id + '-title"]').value || storageIRI
+
+    var feedLanguageSelected = generateFeed.querySelector('select[name="' + id + '-language"]').value
+    var feedLicenseSelected = generateFeed.querySelector('select[name="' + id + '-license"]').value
+
+    var feedURLSelection = [];
+
+    var checkedInput = generateFeed.querySelectorAll('#' + id + '-ul' + ' input[type="checkbox"]:checked')
+    checkedInput = Array.from(checkedInput)
+    if (checkedInput.length) {
+      feedURLSelection = checkedInput.map((el) => el.value);
+    }
+// console.log(feedURLSelection)
+
+    function getFeedData(urls) {
+      var promises = [];
+      var resourceData = {};
+
+      //TODO: update setAcceptTypes to give higher q-value to Config.MediaTypes.Markup than the rest of Config.MediaTypes.RDF
+      // const headers = {'Accept': 'text/html, application/xhtml+xml, image/svg+xml, text/turtle;q=0.9, application/ld+json;q=0.9'};
+      const headers = {};
+      urls.forEach(function (url) {
+        // var pIRI = getProxyableIRI(u);
+        promises.push(
+          Config.Storage.get(url, headers)
+            .then(response => {
+              var cT = response.headers.get('Content-Type');
+              var options = {};
+              options['contentType'] = (cT) ? cT.split(';')[0].toLowerCase().trim() : 'text/turtle';
+              options['subjectURI'] = sanitizeIRI(response.url);
+              options['storeHash'] = true;
+
+              return response.text()
+                .then(data => {
+                  return getResourceInfo(data, options)
+                  .then(d => ({ response, result: d }))
+                })
+                .catch(function (error) {
+                  console.error(`Error fetching ${url}:`, error.message);
+                  return Promise.resolve(); 
+                });
+            })
+            .then(({response, result}) => {
+              Config.Resource[url] = result;
+              updateSupplementalInfo(response, { documentURL: url });
+              resourceData[url] = Config.Resource[url];
+            })
+        );
+      });
+
+      return Promise.all(promises).then(() => resourceData);
+    }
+
+    getFeedData(feedURLSelection)
+      .then(resourceData => {
+        var feed = {
+          self: storageIRI,
+          title: feedTitle,
+          // description: 'TODO: User Input',
+          language: feedLanguageSelected,
+          license: feedLicenseSelected,
+          // copyright: 'TODO: User Input',
+          // rights: 'TODO: User Input',
+          author: {},
+          origin: new URL(storageIRI).origin,
+          items: resourceData
+        };
+
+        if (Config.User.IRI) {
+          feed['author']['uri'] = Config.User.IRI;
+          if (Config.User.Name) {
+            feed['author']['name'] = Config.User.Name;
+          }
+        }
+
+// console.log(feed)
+// console.log(options)
+
+        feed = createFeedXML(feed, options);
+// console.log(feed);
+        return feed;
+      })
+      .then(feedData => {
+        var progress = generateFeed.querySelector('progress')
+        if(progress) {
+          progress.parentNode.removeChild(progress)
+        }
+        sanitizeInsertAdjacentHTML(e.target, 'afterend', '<progress min="0" max="100" value="0"></progress>')
+        progress = generateFeed.querySelector('progress')
+
+// console.log(feedData)
+// console.log(storageIRI)
+// console.log(options);
+        Config.Storage.put(storageIRI, feedData, options.contentType, null, { 'progress': progress })
+          .then(response => {
+            progress.parentNode.removeChild(progress)
+
+            let url = response.url || storageIRI
+            url = sanitizeIRI(url);
+
+            // TODO: this needs to be form validation instead
+            if (!isHttpOrHttpsProtocol(url)) {
+              throw Error("Not a valid URL for value: ", url);
+            }
+
+            sanitizeInsertAdjacentHTML(generateFeed, 'beforeend',
+              `<div class="response-message"><p class="success" data-i18n="dialog.generate-feed.success.saved-at.p"><span>${i18n.t('dialog.generate-feed.success.saved-at.p.textContent')}</span> <a href="${url}" rel="noopener" target="_blank">${url}</a></p></div>`
+            )
+
+            setTimeout(() => {
+              window.open(url, '_blank')
+            }, 3000)
+          })
+
+          //TODO: Reuse saveAsDocument's catch
+          .catch(error => {
+            console.log('Error saving document. Status: ' + error.status)
+          })
+      })
+  })
+}
+
+export function showMessageLog(e, options) {
+  e.target.closest('button').disabled = true
+
+  var messageLog;
+
+  if (Config.MessageLog && Config.MessageLog.length) {
+    messageLog = `<table role="log"><caption data-i18n="dialog.message-log.caption">${i18n.t('dialog.message-log.caption.textContent')}</caption><thead><tr><th data-i18n="dialog.message-log.datetime.th">${i18n.t('dialog.message-log.datetime.th.textContent')}</th><th data-i18n="dialog.message-log.message.th">${i18n.t('dialog.message-log.message.th.textContent')}</th><th data-i18n="dialog.message-log.type.th">${i18n.t('dialog.message-log.type.th.textContent')}</th></tr></thead><tbody>`;
+    Object.keys(Config.MessageLog).forEach(i => {
+      messageLog += `<tr><td><time>${Config.MessageLog[i].dateTime}</time></td><td>${Config.MessageLog[i].content}</td><td data-i18n="dialog.message-log.${Config.MessageLog[i].type}.td">${i18n.t(`dialog.message-log.${Config.MessageLog[i].type}.td.textContent`)}</td></tr>`;
+    });
+    messageLog += '</tbody></table>';
+  }
+  else {
+    messageLog = `<p data-i18n="dialog.message-log.no-messages.p">${i18n.t('dialog.message-log.no-messages.p.textContent')}</p>`;
+  }
+
+  var buttonClose = getButtonHTML({ key: 'dialog.message-log.close.button', button: 'close', buttonClass: 'close', iconSize: 'fa-2x' });
+  document.body.appendChild(fragmentFromString(`
+    <aside aria-labelledby="message-log-label" class="do on" dir="${Config.User.UI.LanguageDir}" id="message-log" lang="${Config.User.UI.Language}" rel="schema:hasPart" resource="#message-log" xml:lang="${Config.User.UI.Language}">
+      <h2 data-i18n="dialog.message-log.h2" id="message-log-label" property="schema:name">${i18n.t('dialog.message-log.h2.textContent')} ${Config.Button.Info.MessageLog}</h2>
+      ${buttonClose}
+      <div class="info"></div>
+      ${messageLog}
+      ${Config.Button.Clipboard}<button class="clear" data-i18n="dialog.message-log.clear.button" title="${i18n.t('dialog.message-log.clear.button.title')}" type="button">${i18n.t('dialog.message-log.clear.button.textContent')}</button>
+    </aside>
+  `));
+
+  var messageLogNode = document.getElementById('message-log');
+  var copyButton = messageLogNode.querySelector('button.copy-to-clipboard');
+  var clearButton = messageLogNode.querySelector('button.clear');
+  var logTable = messageLogNode.querySelector('table[role="log"]');
+
+  if (logTable && copyButton) {
+    setCopyToClipboard(logTable, copyButton);
+  }
+  else if (copyButton) {
+    copyButton.disabled = true;
+  }
+
+  if (!logTable) {
+    clearButton.disabled = true;
+  }
+
+  clearButton.addEventListener('click', () => {
+    clearMessageLog();
+    logTable.replaceWith(fragmentFromString(domSanitize(`<p data-i18n="dialog.message-log.no-messages.p">${i18n.t('dialog.message-log.no-messages.p.textContent')}</p>`)));
+    if (copyButton) copyButton.disabled = true;
+    clearButton.disabled = true;
+  });
+
+  messageLogNode.querySelector('button.close').addEventListener('click', (e) => {
+    document.querySelector('button.message-log').removeAttribute('disabled');
+  });
+}
+
+//TODO: Minor refactoring to delete any URL, e.g., annotation (already implemented)
+export function resourceDelete(e, url, options) {
+  if (!url) { return; }
+
+  e.target.closest('button').disabled = true
+
+  var buttonClose = getButtonHTML({ key: 'dialog.delete.close.button', button: 'close', buttonClass: 'close', iconSize: 'fa-2x' });
+
+  document.body.appendChild(fragmentFromString(`
+    <aside aria-labelledby="delete-document-label" class="do on" dir="${Config.User.UI.LanguageDir}" id="delete-document" lang="${Config.User.UI.Language}" rel="schema:hasPart" resource="#delete-document" xml:lang="${Config.User.UI.Language}">
+      <h2 data-i18n="dialog.delete.h2" id="delete-document-label" property="schema:name">${i18n.t('dialog.delete.h2.textContent')} ${Config.Button.Info.Delete}</h2>
+      ${buttonClose}
+      <div class="info"></div>
+      <div>
+        <p data-i18n="dialog.delete.confirmation.p">${i18n.t('dialog.delete.confirmation.p.textContent')}</p><p><code>${url}</code></p>
+      </div>
+      <button class="cancel" title="${i18n.t('dialog.delete.cancel.button.title')}" type="button">${i18n.t('dialog.delete.cancel.button.textContent')}</button>
+      <button class="delete" data-i18n="dialog.delete.submit.button" title="${i18n.t('dialog.delete.submit.button.title')}" type="button">${i18n.t('dialog.delete.submit.button.textContent')}</button>
+    </aside>
+  `));
+
+  document.querySelector('#delete-document').addEventListener('click', (e) => {
+    if (e.target.closest('button.info')) { return; }
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    var buttonCC = e.target.closest('button.close') || e.target.closest('button.cancel');
+    var buttonDelete = e.target.closest('button.delete');
+
+    if (buttonCC) {
+      var parent = buttonCC.parentNode;
+      parent.parentNode.removeChild(parent);
+
+      document.querySelector('#document-menu .resource-delete').disabled = false;
+    }
+    else if (buttonDelete) {
+      Config.Storage.delete(url)
+        .then(response => {
+          Config.Editor.toggleEditor('author', { template: 'new' });
+
+          var message = `<span data-i18n="dialog.delete.success.default.p">${i18n.t('dialog.delete.success.default.p.textContent', {url}) }</span>`;
+          var actionMessage = '';
+
+          switch(response.status) {
+            case 200: case 204: default:
+              actionMessage = message;
+              break;
+
+            case 202:
+              message = `<span data-i18n="dialog.delete.success.in-progress.p">${i18n.t('dialog.delete.success.default.p.textContent', {url}) }</span>`;
+              actionMessage =  `<span data-i18n="dialog.delete.success.in-progress.p">${i18n.t('dialog.delete.success.default.p.textContent', {url}) }</span>`;
+
+              break;
+          }
+
+          const messageObject = {
+            'content': actionMessage,
+            'type': 'success',
+            'timer': 3000,
+            'code': response.status
+          }
+
+          addMessageToLog({...messageObject, content: message}, Config.MessageLog);
+          showActionMessage(document.body, messageObject);
+        })
+        .catch((error) => {
+          // console.log(error)
+          // console.log(error.status)
+          // console.log(error.response)
+
+          //TODO: Reuse saveAsDocument's catch to request access by checking the Link header.
+
+          var message = '';
+          var actionMessage = '';
+          // let actionTerm = 'delete';
+          var errorKey = 'default';
+          var actionMessageKey = 'default-action-message';
+
+          if (error.status) {
+            switch(error.status) {
+              case 401:
+                if (Config.User.IRI) {
+                  errorKey = 'unauthenticated';
+                }
+                else {
+                  errorKey = 'unauthenticated';
+                  actionMessageKey = 'unauthenticated-action-message';
+                }
+
+                break;
+
+              case 403: default:
+                if (Config.User.IRI) {
+                  var errorKey = 'default';
+                  var actionMessageKey = 'default-action-message';
+
+                }
+                else {
+                  errorKey = 'unauthenticated';
+                  actionMessageKey = 'unauthenticated-action-message';
+                }
+
+                break;
+
+              case 409:
+                //XXX: If/when there is more (structured) detail from the server, it can be processed and used here.
+                errorKey = "conflict";
+                actionMessageKey = "conflict-action-message";
+
+                break;
+            }
+          }
+
+          message = `<span data-i18n="dialog.delete.error.${errorKey}.p">${i18n.t(`dialog.delete.error.${errorKey}.p.textContent`, {url})}</span>`
+          //TODO: signoutShowSignIn()
+          actionMessage = `<span data-i18n="dialog.delete.error.${actionMessageKey}.p">${i18n.t(`dialog.delete.error.${actionMessageKey}.p.textContent`, {url, button: Config.Button.SignIn})}</span>`;
+
+          const messageObject = {
+            'content': actionMessage,
+            'type': 'error',
+            'timer': null,
+            'code': error.status
+          }
+
+          addMessageToLog({...messageObject, content: message}, Config.MessageLog);
+          showActionMessage(document.body, messageObject);
+        })
+      }
+  });
+}
+
+export function showDocumentCommunicationOptions(node) {
+  var communicationOptionsHTML = [];
+
+  var documentURL = Config.DocumentURL;
+
+  function waitUntil() {
+    if (!Config.Resource[documentURL].headers?.linkHeaders?.has('rel', 'describedby')) {
+      window.setTimeout(waitUntil, 250);
+    }
+    else {
+      var db = Config.Resource[documentURL].headers.linkHeaders.rel('describedby');
+
+      if (!db.every(relationItem => Config.Resource[relationItem.uri]?.graph !== undefined)) {
+        window.setTimeout(waitUntil, 250);
+      }
+      else {
+        db.forEach(relationItem => {
+          if (Config.Resource[relationItem.uri]?.graph !== undefined) {
+            communicationOptionsHTML.push(getCommunicationOptions(Config.Resource[relationItem.uri].graph, { 'subjectURI': documentURL }));
+          }
+        });
+
+        communicationOptionsHTML.forEach(html => {
+          sanitizeInsertAdjacentHTML(node, 'beforeend', html);
+          var nodes = document.querySelectorAll('#' + node.id + ' [id^="notification-subscriptions-"]');
+          buttonSubscribeNotificationChannel(nodes, documentURL);
+        });
+      }
+    }
+  }
+
+  waitUntil();
+}
+
+export function buttonSubscribeNotificationChannel(nodes, topicResource) {
+  //TODO: Consider using typeof selector instead and make sure it is in the markup
+  nodes.forEach(subNode => {
+    subNode.addEventListener('click', (e) => {
+      var button = e.target.closest('button');
+
+      if (button && (button.classList.contains('subscribe') || button.classList.contains('unsubscribe'))) {
+        e.preventDefault();
+        e.stopPropagation();
+
+        if (!(topicResource in Config.Subscription && 'Connection' in Config.Subscription[topicResource]) && button.classList.contains('subscribe')) {
+          var subscription = subNode.querySelector('[rel="notify:subscription"]').getAttribute('resource');
+          // console.log(Config.Resource[s.iri().toString()].subscription);
+          var channelType = Config.Resource[topicResource]['subscription'][subscription]['channelType'];
+
+          var data = {
+            "type": channelType[0],
+            "topic": topicResource
+          };
+
+          var features = Config.Resource[topicResource]['subscription'][subscription]['feature'];
+
+          if (features && features.length) {
+            var d = new Date();
+            var startAt = new Date(d.getTime() + 1000);
+            var endAt = new Date(startAt.getTime() + 3600000);
+
+            if (features.includes(ns.notify.startAt.value)) {
+              data['startAt'] = startAt.toISOString();
+            }
+            if (features.includes(ns.notify.endAt.value)) {
+              data['endAt'] = endAt.toISOString();
+            }
+            if (features.includes(ns.notify.rate.value)) {
+              data['rate'] = "PT10S";
+            }
+          }
+
+          subscribeToNotificationChannel(subscription, data)
+            .then(i => {
+              if (Config.Subscription[data.topic] && 'Connection' in Config.Subscription[data.topic]) {
+                button.textContent = i18n.t('dialog.notification-subscriptions.unsubscribe.button.textContent');
+                button.setAttribute('class', 'unsubscribe');
+                button.setAttribute('data-i18n', 'dialog.notification-subscriptions.unsubscribe.button');
+              }
+            }).catch(e => {
+              console.log(e);
+            });
+        }
+        else {
+          Config.Subscription[topicResource].Connection.close();
+          Config.Subscription[topicResource] = {};
+          button.textContent = i18n.t('dialog.notification-subscriptions.subscribe.button.textContent');
+          button.setAttribute('class', 'subscribe');
+          button.setAttribute('data-i18n', 'dialog.notification-subscriptions.subscribe.button');
+        }
+      }
+    });
+  });
+}
+
+export function showDocumentInfo(e) {
+  var documentInfo = document.getElementById('document-info');
+  if (documentInfo) {
+    documentInfo.parentNode.removeChild(documentInfo);
+  }
+
+  e.target.closest('button').disabled = true
+
+  var documentMenu = document.getElementById('document-menu');
+
+  var buttonClose = getButtonHTML({ key: 'panel.document-info.close.button', button: 'close', buttonClass: 'close', iconSize: 'fa-2x' });
+
+  var fragment = fragmentFromString(`
+    <aside aria-labelledby="document-info-label" class="do on" dir="${Config.User.UI.LanguageDir}" id="document-info" lang="${Config.User.UI.Language}" rel="schema:hasPart" resource="#document-info" xml:lang="${Config.User.UI.Language}">
+      <h2 data-i18n="panel.document-info.h2" id="document-info-label" property="schema:name">${i18n.t('panel.document-info.h2.textContent')}</h2>
+      ${buttonClose}
+    </aside>
+  `);
+  if (documentMenu) {
+    document.body.insertBefore(fragment, documentMenu.nextSibling);
+  } else {
+    document.body.appendChild(fragment);
+  }
+  var documentInfo = document.getElementById('document-info');
+
+  documentInfo.setAttribute('tabindex', '-1');
+  documentInfo.focus();
+
+  documentInfo.addEventListener('click', (e) => {
+    if (e.target.closest('button.close')) {
+      setMenuButtonDisabled('.document-info');
+    }
+  });
+
+  var articleNode = selectArticleNode(document);
+  var sections = articleNode.querySelectorAll('section:not(section section):not([id^=table-of]):not([id^=list-of])');
+
+  showListOfStuff(documentInfo);
+
+  showHighlightStructuredData(documentInfo);
+
+  if (sections.length) {
+    showTableOfContents(documentInfo, sections)
+
+    if (Config.SortableList && Config.EditorEnabled) {
+      sortToC();
+    }
+  }
+
+  showDocumentMetadata(documentInfo);
+
+  showDocumentCommunicationOptions(documentInfo);
+}
+
+export function getCommunicationOptions(g, options = {}) {
+  var subjectURI = options.subjectURI || g.term.value;
+  g = g.node(rdf.namedNode(subjectURI));
+// console.log(subjectURI)
+  var notificationSubscriptions = getNotificationSubscriptions(g);
+  var notificationChannels = getNotificationChannels(g);
+
+  Config.Resource[subjectURI] = Config.Resource[subjectURI] || {};
+
+  if (notificationSubscriptions) {
+    Config.Resource[subjectURI]['subscription'] = Config.Resource[subjectURI]['subscription'] || {};
+  }
+
+  if (notificationChannels) {
+    Config.Resource[subjectURI]['channel'] = Config.Resource[subjectURI]['channel'] || {};
+  }
+
+  var nSHTML = [];
+
+  if (notificationSubscriptions) {
+    nSHTML.push(`<dl id="notification-subscriptions-${subjectURI}"><dt data-i18n="dialog.notification-subscriptions.dt">${i18n.t('dialog.notification-subscriptions.dt.textContent')}</dt>`);
+
+    notificationSubscriptions.forEach(subscription => {
+      var nS = g.node(rdf.namedNode(subscription));
+      var channelType = getNotificationChannelTypes(nS);
+      var features = getNotificationFeatures(nS);
+
+      Config.Resource[subjectURI]['subscription'][subscription] = {};
+      Config.Resource[subjectURI]['subscription'][subscription]['channelType'] = channelType;
+      Config.Resource[subjectURI]['subscription'][subscription]['feature'] = features;
+
+      var buttonSubscribe = i18n.t('dialog.notification-subscriptions.subscribe.button.textContent');
+      var buttonDataI18n = 'dialog.notification-subscriptions.subscribe.button';
+      var buttonSubscribeClass = 'subscribe';
+
+      var topicResource = subjectURI;
+
+      if (Config.Subscription[topicResource] && Config.Subscription[topicResource].Connection) {
+        buttonSubscribe = i18n.t('dialog.notification-subscriptions.unsubscribe.button.textContent');
+        buttonDataI18n = 'dialog.notification-subscriptions.unsubscribe.button';
+        buttonSubscribeClass = 'unsubscribe';
+      }
+
+      nSHTML.push(`<dd id="notification-subscription-${subscription}"><details><summary><a href="${subscription}" rel="noopener" target="_blank">${subscription}</a></summary>`);
+      nSHTML.push(`<dl rel="notify:subscription" resource="${subscription}">`);
+      // nSHTML.push('<dt>Subscription</dt><dd><a href="' + subscription + '" rel="noopener" target="_blank">' + subscription + '</a></dd>');
+
+      var topic = subjectURI;
+
+      if (topic) {
+        nSHTML.push(`<dt data-i18n="dialog.notification-subscriptions.topic">${i18n.t('dialog.notification-subscriptions.topic.dt.textContent')}</dt><dd><a href="${topic}" rel="notify:topic nopener" target="_blank">${topic}</a> <button data-i18n="${buttonDataI18n}" id="notification-subscription-${subscription}-button" class="${buttonSubscribeClass}">${buttonSubscribe}</button></dd>`);
+      }
+
+      if (channelType) {
+        nSHTML.push(`<dt data-i18n="dialog.notification-subscriptions.channel-type">${i18n.t('dialog.notification-subscriptions.channel-type.dt.textContent')}</dt><dd><a href="${channelType}" rel="notify:channelType noopener" target="_blank">${channelType}</a></dd>`);
+      }
+
+      if (features) {
+        nSHTML.push(`<dt data-i18n="dialog.notification-subscriptions.features">${i18n.t('dialog.notification-subscriptions.features.dt.textContent')}</dt><dd><ul rel="notify:feature">`);
+
+        var nF = [];
+
+        features.forEach(iri => {
+          var label, href = iri;
+
+          switch (iri) {
+            case ns.notify.startAt.value:
+            case ns.notify.endAt.value:
+            case ns.notify.state.value:
+            case ns.notify.rate.value:
+            case ns.notify.accept.value:
+              label = getFragmentFromString(iri);
+              href = 'https://solidproject.org/TR/2022/notifications-protocol-20221231#notify-' + label;
+              break;
+
+            default:
+              break;
+          }
+
+          nSHTML.push('<li><a href="' + href + '" resource="' + iri + '" rel="noopener" target="_blank">' + label + '</a></li>');
+        });
+
+        nSHTML.push('</ul></dd>');
+      }
+
+      nSHTML.push('</dl></details></dd>');
+    })
+
+    nSHTML.push('</dl>');
+  }
+
+  return nSHTML.join('');
+}
+
+//https://solidproject.org/TR/notifications-protocol#discovery
+export function getNotificationSubscriptions(g) {
+  var notifysubscription = g.out(ns.notify.subscription).values;
+  return (notifysubscription.length)
+    ? notifysubscription
+    : undefined
+}
+
+export function getNotificationChannels(g) {
+  var notifychannel = g.out(ns.notify.channel).values;
+  return (notifychannel.length)
+    ? notifychannel
+    : undefined
+}
+
+export function getNotificationChannelTypes(g) {
+  var notifychannelType = g.out(ns.notify.channelType).values;
+  return (notifychannelType)
+    ? notifychannelType
+    : undefined
+}
+
+export function getNotificationFeatures(g) {
+  var notifyfeature = g.out(ns.notify.feature).values;
+  return (notifyfeature.length)
+    ? notifyfeature
+    : undefined
+}
+
+//doap:implements <https://solidproject.org/TR/2022/notification-protocol-20221231#subscription-client-subscription-request>
+export function subscribeToNotificationChannel(url, data) {
+  switch(data.type){
+    //doap:implements <https://solidproject.org/TR/websocket-channel-2023>
+    case ns.notify.WebSocketChannel2023.value:
+      return subscribeToWebSocketChannel(url, data);
+  }
+}
+
+//doap:implements <https://solidproject.org/TR/2022/notification-protocol-20221231#notification-channel-data-model>
+export function subscribeToWebSocketChannel(url, d, options = {}) {
+  if (!url || !d.type || !d.topic) { return Promise.reject(); }
+
+  options['contentType'] = options.contentType || 'application/ld+json';
+
+  var data;
+
+  switch (options.contentType) {
+    case 'text/turtle':
+      data = '<> a <' + d.type  + '> ;\n\
+<http://www.w3.org/ns/solid/notifications#topic> <' + d.topic + '> .';
+      break;
+
+    default:
+    case 'application/ld+json':
+      d['@context'] = d['@context'] || ["https://www.w3.org/ns/solid/notification/v1"];
+      // d['id'] = d['id'] || '';
+      // data['feature'] = '';
+      data = JSON.stringify(d);
+      break;
+  }
+
+// d.topic = 'https://csarven.localhost:8443/foo.html';
+  if (Config.Subscription[d.topic] && Config.Subscription[d.topic]['Connection']) {
+    Config.Subscription[d.topic]['Connection'].close();
+  }
+
+  Config.Subscription[d.topic] = {};
+  Config.Subscription[d.topic]['Request'] = d;
+
+// console.log(Config.Subscription)
+
+  data = domSanitize(data);
+
+  return Config.Storage.post(url, '', data, options.contentType, null, options)
+    .then(response => {
+      return processNotificationSubscriptionResponse(response, d);
+    })
+    .catch(error => {
+        console.error(error);
+
+        let message;
+
+        switch (error.status) {
+          case 0:
+          case 405:
+            message = 'subscription request not allowed.';
+            break;
+          case 401:
+            message = 'you are not authorized.'
+            if(!Config.User.IRI){
+              message += ' Try signing in.';
+            }
+            break;
+          case 403:
+            message = 'you do not have permission to request a subscription.';
+            break;
+          case 406:
+            message = 'representation not acceptable to the user agent.';
+            break;
+          default:
+            // some other reason
+            message = error.message;
+            break;
+        }
+
+        // re-throw, to break out of the promise chain
+        throw new Error('Cannot subscribe: ', message);
+    })
+    .then(data => {
+// console.log(data);
+// data = {
+//   '@context': ['https://www.w3.org/ns/solid/notifications/v1'],
+//   'type': 'WebSocketChannel2023',
+//   'topic': 'https://csarven.localhost:8443/foo.html',
+//   'receiveFrom': 'wss://csarven.localhost:8443/'
+// }
+
+      if (!(data.topic in Config.Subscription)) {
+        console.log('Config.Subscription[' + data.topic + '] undefined.');
+      }
+      Config.Subscription[data.topic]['Response'] = data;
+
+      switch (data.type) {
+        case 'WebSocketChannel2023': case ns.notify.WebSocketChannel2023.value:
+          data.type = ns.notify.WebSocketChannel2023.value;
+          return connectToWebSocket(data.receiveFrom, data).then(i => {
+            Config.Subscription[data.topic]['Connection'] = i;
+            // return Promise.resolve();
+          });
+      }
+    });
+}
+
+export function processNotificationSubscriptionResponse(response, d) {
+  var cT = response.headers.get('Content-Type');
+  var contentType = cT.split(';')[0].toLowerCase().trim();
+
+  var rD = (contentType == 'application/ld+json') ? response.json() : response.text();
+
+  return rD.then(data => {
+// console.log(data)
+    // return getGraphFromData(data, options).then
+    switch (contentType) {
+      case 'text/turtle':
+        return Promise.reject({'message': 'TODO text/turtle', 'data': data});
+
+      case 'application/ld+json':
+        if (data['@context'] && data.type && data.topic) {
+          if (d.topic != data.topic) {
+            console.log('TODO: topic requested != response');
+          }
+// console.log(d.type, data)
+          //TODO d.type == 'LDNChannel2023' && data.sender
+          if ((d.type == 'WebSocketChannel2023' || d.type == ns.notify.WebSocketChannel2023.value) && data.receiveFrom) {
+            return Promise.resolve(data);
+          }
+        }
+        else {
+          return Promise.reject({'message': 'Missing @context, type, topic(, receiveFrom)', 'data': data})
+        }
+        break;
+
+      default:
+      case 'text/plain':
+        return Promise.reject({'message': 'TODO text/plain?', 'data': data});
+    }
+  });
+}
+
+export function processNotificationChannelMessage(data, options) {
+// console.log(data);
+// console.log(options);
+// data = {
+//   "@context": [
+//     "https://www.w3.org/ns/activitystreams",
+//     "https://www.w3.org/ns/solid/notification/v1"
+//   ],
+//   "id": "urn:uuid:" + generateAttributeId(),
+//   "type": "Update",
+//   "object": "https://csarven.localhost:8443/foo.html",
+//   "state": "128f-MtYev",
+//   "published": "2021-08-05T01:01:49.550Z"
+// }
+
+  //TODO: Only process ns/solid/notifications/v1 JSON-LD context.
+  // return getGraphFromData(data, options).then(
+
+  if (data['@context'] && data.id && data.type && data.object && data.published) {
+    if (options.subjectURI != data.object) {
+      console.log('TODO: topic requested != message object ');
+    }
+
+    // if (data.type.startsWith('https://www.w3.org/ns/activitystreams#')) {
+      //TODO: Move this UI somewhere else
+
+      //TODO: See if createActivityHTML can be generalised/reusable.
+
+
+      Config.Subscription[data.object]['Notifications'] = Config.Subscription[data.object]['Notifications'] || {};
+      //TODO: Max notifications to store. FIFO
+      Config.Subscription[data.object]['Notifications'][data.id] = data;
+      // Config.Subscription[data.object]['Notifications'][data.id] = g;
+// console.log(Config.Subscription[data.object]['Notifications'])
+
+      var nTypes = (Array.isArray(data.type)) ? data.type : [data.type];
+      var types = '';
+      nTypes.forEach(t => {
+        types += types + '<dd><a href="' + t + '">' + t + '</a></dd>';
+      })
+
+      var message = [];
+      message.push('<details>');
+      message.push('<summary>Notification Received</summary>');
+      message.push('<dl>');
+      message.push('<dt>Identifier</dt><dd><a href="' + data.id  + '">' + data.id + '</a></dd>');
+      message.push('<dt>Types</dt>' + types);
+      message.push('<dt>Object</dt><dd><a href="' + data.object  + '">' + data.object + '</a></dd>');
+      message.push('<dt>Published</dt><dd><time>' + data.published + '</time></dd>');
+      message.push('</dl>');
+      message.push('</details>');
+      message = message.join('');
+
+      message = {
+        'content': message,
+        'type': 'info',
+        'timer': 3000
+      }
+      addMessageToLog(message, Config.MessageLog);
+      showActionMessage(document.body, message);
+
+      // return Promise.resolve(data);
+    // }
+  }
+}
+
+export function connectToWebSocket(url, data) {
+  function connect() {
+    return new Promise((resolve, reject) => {
+// console.log(data)
+      var protocols = [data.type];
+// protocols = ['solid-0.1'];
+// console.log(url, protocols)
+      var ws = new WebSocket(url);
+      var message;
+
+      ws.onopen = function() {
+        message = {'message': 'Connected to ' + url + ' (' + data.type + ').'};
+        console.log(message);
+// ws.send('sub ' + data.topic);
+
+        // ws.send(JSON.stringify({
+        // }));
+        resolve(ws);
+      };
+
+      ws.onclose = function(e) {
+        message = {'message': 'Socket to ' + url + ' is closed.'};
+        //TODO: Separate reconnect on connection dropping from intentional close.
+        // setTimeout(() => { connect(); }, 1000);
+        // var timeout = 250;
+        // setTimeout(connect, Math.min(10000,timeout+=timeout));
+
+        console.log(message, e.reason);
+      };
+
+      ws.onerror = function(err) {
+        console.error('Socket encountered error: ', err.message, 'Closing socket');
+        ws.close();
+
+        reject(err);
+      };
+
+      ws.onmessage = function(msg) {
+// console.log(msg)
+        var options = { 'subjectURI': data.topic }
+        processNotificationChannelMessage(msg.data, options);
+      };
+    });
+  }
+
+  return connect().then().catch((err) => {
+    console.log(err)
+  });
+}
+
+export function showHighlightStructuredData(node) {
+  if (!node) { return; }
+
+  var contextNode = selectArticleNode(document);
+  var checked = (contextNode.classList.contains('highlight-structure')) ? 'checked="checked"' : '';
+
+  var html = `
+    <section id="highlight-data" rel="schema:hasPart" resource="#highligh-data">
+      <h3 data-i18n="panel.higlight-data.h3" property="schema:name">${i18n.t('panel.higlight-data.h3.textContent')}</h3>
+      <ul>
+        <li><input id="highlight-structured-data" name="highlight-structured-data" type="checkbox" ${checked}/> <label data-i18n="panel.higlight-structured-data.label" for="highlight-structured-data">${i18n.t('panel.higlight-structured-data.label.textContent')}</label></li>
+      </ul>
+    </section>`;
+
+  sanitizeInsertAdjacentHTML(node, 'beforeend', html);
+
+  var structuredData = document.querySelector('#highlight-data')
+
+  structuredData.addEventListener('change', (e) => {
+    var input = e.target.closest('#highlight-structured-data');
+    if (input) {
+      if (input.checked) {
+        contextNode.classList.add('highlight-structure');
+      }
+      else {
+        contextNode.classList.remove('highlight-structure');
+      }
+    }
+  });
+}
+
+export function showListOfStuff(node) {
+  if (!node) { return; }
+
+  var disabledInput = '', s = [];
+  // if (!Config.EditorEnabled) {
+  //   disabledInput = ' disabled="disabled"';
+  // }
+
+  Object.keys(Config.ListOfStuff).forEach(id => {
+    var checkedInput = '';
+    var label = i18n.t(`panel.list-of-stuff.${id}.label.textContent`);
+    // var selector = Config.ListOfStuff[id].selector;
+
+    var item = document.getElementById(id);
+
+    if(item) {
+      checkedInput = ' checked="checked"';
+
+      // buildListOfStuff(id);
+    }
+
+    s.push(`<li><input id="l-o-s-${id}" type="checkbox"${disabledInput}${checkedInput} /><label data-i18n="panel.list-of-stuff.${id}.label" for="l-o-s-${id}">${label}</label></li>`);
+  });
+
+  if (s.length) {
+    sanitizeInsertAdjacentHTML(node, 'beforeend', `
+      <section id="list-of-stuff" rel="schema:hasPart" resource="#list-of-stuff">
+        <h3 data-i18n="panel.list-of-stuff.h3" property="schema:name">${i18n.t('panel.list-of-stuff.h3.textContent')}</h3>
+        <ul>${s.join('')}</ul>
+      </section>`);
+
+    // if (Config.EditorEnabled) {
+      document.getElementById('list-of-stuff').addEventListener('click', (e) => {
+        if (e.target.closest('input')) {
+          var id = e.target.id.slice(6);
+          if(!e.target.getAttribute('checked')) {
+            buildListOfStuff(id);
+            e.target.setAttribute('checked', 'checked');
+            window.location.hash = '#' + id;
+          }
+          else {
+            var tol = document.getElementById(id);
+            if(tol) {
+              tol.parentNode.removeChild(tol);
+
+              removeReferences();
+            }
+            e.target.removeAttribute('checked');
+            window.history.replaceState(null, null, window.location.pathname);
+          }
+        }
+      });
+    // }
+  }
+}
+
+export function showTableOfContents(node, sections, options) {
+  options = options || {}
+  var sortable = (Config.SortableList && Config.EditorEnabled) ? ' sortable' : '';
+
+  if (!node) { return; }
+
+  var toc = `
+  <section id="table-of-contents-i" rel="schema:hasPart" resource="#table-of-contents-i">
+    <h3 data-i18n="panel.list-of-stuff.table-of-contents.label" property="schema:name">${i18n.t(`panel.list-of-stuff.table-of-contents.label.textContent`)}</h3>
+    <ol class="toc${sortable}">`;
+  toc += getListOfSections(sections, {'sortable': Config.SortableList});
+  toc += '</ol></section>';
+
+  sanitizeInsertAdjacentHTML(node, 'beforeend', toc);
+}
+
+
+export function sortToC() {
+}
+
+export function getListOfSections(sections, options) {
+  options = options || {};
+  var s = '', attributeClass = '';
+  if (options.sortable == true) { attributeClass = ' class="sortable"'; }
+
+  for (var i = 0; i < sections.length; i++) {
+    var section = sections[i];
+    if(section.id) {
+      var heading = section.querySelector('h1, h2, h3, h4, h5, h6, header h1, header h2, header h3, header h4, header h5, header h6') || { 'textContent': section.id };
+      var currentHash = '';
+      var dataId = ' data-id="' + section.id +'"';
+
+      if (!options.raw) {
+        currentHash = (document.location.hash == '#' + section.id) ? ' class="selected"' : '';
+        attributeClass = '';
+      }
+
+      if (heading) {
+        s += '<li' + currentHash + dataId + '><a href="#' + section.id + '">' + heading.textContent + '</a>';
+        var subsections = section.parentNode.querySelectorAll('[id="' + section.id + '"] > div > section[rel*="hasPart"]:not([class~="slide"]), [id="' + section.id + '"] > section[rel*="hasPart"]:not([class~="slide"])');
+
+        if (subsections.length) {
+          s += '<ol'+ attributeClass +'>';
+          s += getListOfSections(subsections, options);
+          s += '</ol>';
+        }
+        s += '</li>';
+      }
+    }
+  }
+
+  return s;
+}
+
+export function buildListOfStuff(id) {
+  var s = '';
+
+  var documentURL = Config.DocumentURL;
+
+  var rootNode = selectArticleNode(document);
+
+  if(id == 'references'){
+    buildReferences();
+  }
+  else {
+    var label = i18n.t(`panel.list-of-stuff.${id}.label.textContent`);
+    var selector = Config.ListOfStuff[id].selector;
+    var titleSelector = Config.ListOfStuff[id].titleSelector;
+
+    var nodes = rootNode.querySelectorAll('*:not([class~="do"]) ' + selector);
+
+    if (id == 'table-of-contents' || id == 'list-of-concepts' || nodes.length) {
+      var tId = document.getElementById(id);
+
+      if(tId) { tId.parentNode.removeChild(tId); }
+
+      let nav = `<nav id="${id}" rel="schema:hasPart" resource="#${id}">`;
+      let section = `<section id="${id}" rel="schema:hasPart" resource="#${id}">`;
+      let heading = `<h2 data-i18n="panel.list-of-stuff.${id}.label" property="schema:name">${label}</h2>`;
+
+      switch(id) {
+        default:
+          s += `${nav}`;
+          s += `${heading}`;
+          s += '<div><ol class="toc">';
+          break;
+
+        case 'list-of-abbreviations':
+          s += `${section}`;
+          s += `${heading}`;
+          s += '<div><dl>';
+          break;
+
+        case 'list-of-quotations':
+          s += `${section}`;
+          s += `${heading}`;
+          s += '<div><ul>';
+          break;
+
+        case 'list-of-concepts':
+          s += `${section}`;
+          s += `${heading}`;
+          var d = Config.Resource[documentURL].citations || [];
+          if (d.length) {
+            s += '<div><p id="include-concepts"><button class="add" type="button">Include concepts</button> from <data value="' + d.length + '">' + d.length + '</data> external references.</p>';
+          }
+          s += '<dl>';
+          break;
+
+        case 'table-of-requirements':
+          s += `${section}`;
+          s += `${heading}`;
+          s += '<div><table>';
+          break;
+
+        case 'table-of-advisements':
+          s += `${section}`;
+          s += `${heading}`;
+          s += '<div><table>';
+          break;
+      }
+
+      if (id == 'table-of-contents') {
+        var articleNode = selectArticleNode(document);
+        s += getListOfSections(articleNode.querySelectorAll('section:not(section section)'), {'raw': true});
+      }
+      else {
+        //TODO: Perhaps table-of-requirements and table-of-advisements could be consolidated / generalised.
+
+        let specRequirements = Config.Resource[documentURL]?.spec?.requirement || {};
+        let specAdvisements = Config.Resource[documentURL]?.spec?.advisement || {};
+
+        if (id == 'table-of-requirements' && Object.keys(specRequirements).length) {
+//TODO: Sort by requirementSubject then requirementLevel? or offer controls on the table.
+
+          s += '<caption>Conformance Requirements and Test Coverage</caption>'
+          s += '<thead><tr><th colspan="3">Requirement</th></tr><tr><th>Subject</th><th>Level</th><th>Statement</th></tr></thead>';
+          s += '<tbody>';
+          Object.keys(specRequirements).forEach(i => {
+// console.log(Config.Resource[documentURL]['spec'][i])
+            var statement = specRequirements[i][ns.spec.statement.value] || i;
+            //FIXME: This selector is brittle.
+            // var requirementIRI = document.querySelector('#document-identifier [rel="owl:sameAs"]');
+            var requirementIRI = document.querySelector('#document-latest-published-version [rel~="rel:latest-version"]');
+            requirementIRI = (requirementIRI) ? requirementIRI.href : i;
+
+            requirementIRI = i.replace(stripFragmentFromString(i), requirementIRI);
+            statement = '<a href="' + requirementIRI + '">' + statement + '</a>';
+
+            var requirementSubjectIRI = specRequirements[i][ns.spec.requirementSubject.value];
+            var requirementSubjectLabel = requirementSubjectIRI || '<span class="warning">?</span>';
+            if (requirementSubjectLabel.startsWith('http')) {
+              requirementSubjectLabel = getFragmentFromString(requirementSubjectIRI) || getURLLastPath(requirementSubjectIRI) || requirementSubjectLabel;
+            }
+            var requirementSubject = '<a href="' + requirementSubjectIRI + '">' + requirementSubjectLabel + '</a>';
+
+            var requirementLevelIRI = specRequirements[i][ns.spec.requirementLevel.value];
+            var requirementLevelLabel = requirementLevelIRI || '<span class="warning">?</span>';
+            if (requirementLevelLabel.startsWith('http')) {
+              requirementLevelLabel = getFragmentFromString(requirementLevelIRI) || getURLLastPath(requirementLevelIRI) || requirementLevelLabel;
+            }
+            var requirementLevel = '<a href="' + requirementLevelIRI + '">' + requirementLevelLabel + '</a>';
+
+            s += '<tr about="' + requirementIRI + '">';
+            s += '<td>' + requirementSubject + '</td>';
+            s += '<td>' + requirementLevel + '</td>';
+            s += '<td>' + statement + '</td>';
+            s += '</tr>'
+          });
+          s += '</tbody>';
+        }
+        else if (id == 'table-of-advisements' && Object.keys(specAdvisements).length) {
+//TODO: Sort by advisementSubject then advisementLevel? or offer controls on the table.
+
+          s += '<caption>Non-normative Advisements</caption>'
+          s += '<thead><tr><th colspan="2">Advisement</th></tr><tr><th>Level</th><th>Statement</th></tr></thead>';
+          s += '<tbody>';
+          Object.keys(specAdvisements).forEach(i => {
+// console.log(specAdvisements[i])
+            var statement = specAdvisements[i][ns.spec.statement.value] || i;
+            //FIXME: This selector is brittle.
+            //TODO: Revisit this:
+            // var advisementIRI = document.querySelector('#document-identifier [rel="owl:sameAs"]');
+            var advisementIRI = document.querySelector('#document-latest-published-version [rel~="rel:latest-version"]');
+            advisementIRI = (advisementIRI) ? advisementIRI.href : i;
+
+            advisementIRI = i.replace(stripFragmentFromString(i), advisementIRI);
+            statement = '<a href="' + advisementIRI + '">' + statement + '</a>';
+
+            // var advisementSubjectIRI = specAdvisements[i][ns.spec.advisementSubject.value];
+            // var advisementSubjectLabel = advisementSubjectIRI || '<span class="warning">?</span>';
+            // if (advisementSubjectLabel.startsWith('http')) {
+            //   advisementSubjectLabel = getFragmentFromString(advisementSubjectIRI) || getURLLastPath(advisementSubjectIRI) || advisementSubjectLabel;
+            // }
+            // var advisementSubject = '<a href="' + advisementSubjectIRI + '">' + advisementSubjectLabel + '</a>';
+
+            var advisementLevelIRI = specAdvisements[i][ns.spec.advisementLevel.value];
+            var advisementLevelLabel = advisementLevelIRI || '<span class="warning">?</span>';
+            if (advisementLevelLabel.startsWith('http')) {
+              advisementLevelLabel = getFragmentFromString(advisementLevelIRI) || getURLLastPath(advisementLevelIRI) || advisementLevelLabel;
+            }
+            var advisementLevel = '<a href="' + advisementLevelIRI + '">' + advisementLevelLabel + '</a>';
+
+            s += '<tr about="' + advisementIRI + '">';
+            // s += '<td>' + advisementSubject + '</td>';
+            s += '<td>' + advisementLevel + '</td>';
+            s += '<td>' + statement + '</td>';
+            s += '</tr>'
+          });
+          s += '</tbody>';
+        }
+        else if (id == 'list-of-abbreviations') {
+          if (nodes.length) {
+            nodes = [].slice.call(nodes);
+            nodes.sort((a, b) => {
+              return a.textContent.toLowerCase().localeCompare(b.textContent.toLowerCase());
+            });
+          }
+
+          var processed = [];
+          for (var i = 0; i < nodes.length; i++) {
+            if (!processed.includes(nodes[i].textContent)) {
+              s += '<dt>' + nodes[i].textContent + '</dt>';
+              s += '<dd>' + nodes[i].getAttribute(titleSelector) + '</dd>';
+              processed.push(nodes[i].textContent);
+            }
+          }
+        }
+        else if (id == 'list-of-concepts') {
+// console.log(Config.Resource[documentURL]['skos'])
+          s += getDocumentConceptDefinitionsHTML(documentURL);
+        }
+        //list-of-figures, list-of-tables, list-of-quotations, table-of-requirements
+        else {
+          processed = [];
+          for (let i = 0; i < nodes.length; i++) {
+            var title, textContent;
+
+            if (id == 'list-of-quotations') {
+              title = nodes[i].getAttribute(titleSelector);
+            }
+            else {
+              title = nodes[i].querySelector(titleSelector);
+            }
+
+            if (title) {
+              if (id == 'list-of-quotations') {
+                textContent = removeSelectorFromNode(nodes[i], '.do').textContent;
+              }
+              else {
+                textContent = removeSelectorFromNode(title, '.do').textContent;
+              }
+
+              if (processed.indexOf(textContent) < 0) {
+                if (id == 'list-of-quotations') {
+                  s += '<li><q>' + textContent + '</q>, <a href="' + title + '">' + title + '</a></li>';
+                }
+                else if(nodes[i].id){
+                  s += '<li><a href="#' + nodes[i].id +'">' + textContent +'</a></li>';
+                }
+                else {
+                  s += '<li>' + textContent +'</li>';
+                }
+
+                processed.push(textContent);
+              }
+            }
+          }
+        }
+      }
+
+      switch(id) {
+        default:
+          s += '</ol></div>';
+          s += '</nav>';
+          break;
+
+        case 'list-of-abbreviations':
+          s += '</dl></div>';
+          s += '</section>';
+          break;
+
+        case 'list-of-quotations':
+          s += '</ul></div>';
+          s += '</section>';
+          break;
+
+        case 'list-of-concepts':
+          s += '</dl></div>';
+          s += '</section>';
+          break;
+
+        case 'table-of-requirements':
+          s += '</table></div>';
+          s += '</section>';
+          break;
+      }
+    }
+  }
+
+  insertDocumentLevelHTML(document, s, { id });
+
+  if (id == 'table-of-requirements') {
+    var options = {};
+    var testSuites = Config.Resource[documentURL].graph.out(ns.spec.testSuite).values;
+// testSuites = [];
+// console.log(testSuites)
+    if (testSuites.length) {
+      //TODO: Process all spec:testSuites
+      var url = testSuites[0];
+
+      getResourceGraph(url, null, options)
+        .then(({ graph: g }) => {
+          if (g) {
+            insertTestCoverageToTable(id, g);
+          }
+        })
+        .catch(reason => {
+console.log(reason);
+        });
+    }
+
+    var predecessorVersion = Config.Resource[documentURL].graph.out(ns.rel['predecessor-version']).values;
+// predecessorVersion = [];
+    if (predecessorVersion.length) {
+      url = predecessorVersion[0];
+
+      var sourceGraph = Config.Resource[documentURL].graph;
+      var sourceGraphURI = sourceGraph.term.value;
+// console.log(sourceGraphURI)
+      var buttonTextDiffRequirements = 'Diff requirements with the predecessor version';
+
+      var table = document.getElementById(id);
+      var thead = table.querySelector('thead');
+      sanitizeInsertAdjacentHTML(thead.querySelector('tr > th'), 'beforeend', '<button id="include-diff-requirements" class="do add" disabled="disabled" title="' + buttonTextDiffRequirements + '">' + Icon[".fas.fa-circle-notch.fa-spin.fa-fw"] + '</button>');
+
+      getResourceGraph(url, null, options)
+        .then(({ graph: targetGraph }) => {
+          if (targetGraph) {
+            var targetGraphURI = targetGraph.term.value;
+// console.log(targetGraphURI)
+
+            var buttonRD = document.getElementById('include-diff-requirements');
+            buttonRD.setHTMLUnsafe(domSanitize(Icon[".fas.fa-plus-minus"]));
+            buttonRD.disabled = false;
+
+            buttonRD.addEventListener('click', (e) => {
+              var button = e.target.closest('button');
+              if (button){
+                if (button.classList.contains('add')) {
+                  button.classList.remove('add');
+                  button.classList.add('remove');
+                  button.setAttribute('title', "Show requirements");
+                  button.setHTMLUnsafe(domSanitize(Icon[".fas.fa-list-check"]));
+
+                  if (!button.classList.contains('checked')) {
+                    diffRequirements(sourceGraph, targetGraph);
+                    button.classList.add('checked');
+                  }
+
+                  table.querySelectorAll('tbody tr').forEach(tr => {
+                    var sR = tr.getAttribute('about');
+                    var td = tr.querySelector('td:nth-child(3)');
+                    sR = sR.replace(stripFragmentFromString(sR), sourceGraphURI);
+                    var tR = targetGraphURI + '#' + getFragmentFromString(sR);
+                    td.setHTMLUnsafe(domSanitize(Config.Resource[sourceGraphURI].spec['requirement'][sR]['diff'][tR]['statement'])) || '';
+                  });
+                }
+                else if (button.classList.contains('remove')) {
+                  button.classList.remove('remove');
+                  button.classList.add('add');
+                  button.setAttribute('title', buttonTextDiffRequirements);
+                  button.setHTMLUnsafe(domSanitize(Icon[".fas.fa-plus-minus"]));
+
+                  table.querySelectorAll('tbody tr').forEach(tr => {
+                    var sR = tr.getAttribute('about');
+                    var td = tr.querySelector('td:nth-child(3)');
+                    var sourceRequirementURI = sourceGraphURI + '#' + getFragmentFromString(sR);
+                    var statement = Config.Resource[sourceGraphURI].spec['requirement'][sourceRequirementURI][ns.spec.statement.value] || sR;
+                    td.setHTMLUnsafe(domSanitize('<a href="' + sR + '">' + statement + '</a>'));
+                  });
+                }
+              }
+            });
+          }
+        });
+    }
+  }
+
+  if (id == 'list-of-concepts') {
+    document.getElementById(id).addEventListener('click', (e) => {
+      var button = e.target.closest('button.add');
+      if (button) {
+        button.disabled = true;
+        sanitizeInsertAdjacentHTML(button, 'beforeend', Icon[".fas.fa-circle-notch.fa-spin.fa-fw"]);
+
+        showExtendedConcepts();
+      }
+    })
+  }
+}
+
+//TODO: Review grapoi
+export function showExtendedConcepts() {
+  var documentURL = Config.DocumentURL;
+  var citationsList = Config.Resource[documentURL].citations;
+
+  var promises = [];
+  citationsList.forEach(url => {
+    // console.log(u);
+    // window.setTimeout(function () {
+      // var pIRI = getProxyableIRI(u);
+      promises.push(getResourceGraph(url));
+    // }, 1000)
+  });
+
+  var dataset = rdf.dataset();
+  var html = [];
+  var options = { 'resources': [] };
+
+  return Promise.allSettled(promises)
+    .then(results =>
+      results
+        .filter(r => r.status === 'fulfilled' && r.value?.graph)
+        .map(r => r.value.graph))
+    .then(graphs => {
+      graphs.forEach(g => {
+        if (g && g.out().terms.length){
+          var documentURL = g.term.value;
+          g = rdf.grapoi({dataset: g.dataset})
+// console.log(documentURL)
+// console.log(g)
+          Config.Resource[documentURL] = Config.Resource[documentURL] || {};
+          Config.Resource[documentURL]['graph'] = g;
+          Config.Resource[documentURL]['skos'] = getResourceInfoSKOS(g);
+          Config.Resource[documentURL]['title'] = getGraphLabel(g) || documentURL;
+
+          if (Config.Resource[documentURL]['skos']['graph'].out().terms.length) {
+            html.push(`
+              <section>
+                <h4><a href="${documentURL}">${Config.Resource[documentURL]['title']}</a></h4>
+                <div>
+                  <dl>${getDocumentConceptDefinitionsHTML(documentURL)}</dl>
+                </div>
+              </section>`);
+
+            dataset.addAll(Config.Resource[documentURL]['skos']['graph'].dataset);
+            options['resources'].push(documentURL);
+          }
+        }
+      });
+
+      var id = 'list-of-additional-concepts';
+      html = `
+        <section id="${id}" rel="schema:hasPart" resource="#${id}">
+          <h3 property="schema:name">Additional Concepts</h3>
+          <div>
+            <button class="graph" type="button">View Graph</button>
+            <figure></figure>${html.join('')}</div>
+        </section>`;
+
+      var aC = document.getElementById(id);
+      if (aC) {
+        aC.parentNode.removeChild(aC);
+      }
+
+      var loC = document.getElementById('list-of-concepts');
+
+      var ic = loC.querySelector('#include-concepts');
+      if (ic) { ic.parentNode.removeChild(ic); }
+
+      sanitizeInsertAdjacentHTML(loC.querySelector('div'), 'beforeend', html);
+
+      // insertDocumentLevelHTML(document, html, { 'id': id });
+
+      aC = document.getElementById(id);
+      window.history.replaceState(null, null, '#' + id);
+      aC.scrollIntoView();
+
+      var selector = '#' + id + ' figure';
+
+      aC.addEventListener('click', (e) => {
+        var button = e.target.closest('button.graph');
+        if (button) {
+          button.parentNode.removeChild(button);
+
+          // serializeGraph(dataset, { 'contentType': 'text/turtle' })
+          //   .then(data => {
+          ///FIXME: This Config.DocumentURL doesn't seem right other than what the visualisation's root node becomes?
+              options['subjectURI'] = Config.DocumentURL;
+              options['contentType'] = 'text/turtle';
+              //FIXME: For multiple graphs (fetched resources), options.subjectURI is the last item, so it is inaccurate
+              showVisualisationGraph(options.subjectURI, rdf.grapoi({ dataset }), selector, options);
+            // });
+        }
+      })
+
+// console.log(dataGraph)
+
+
+// console.log(Config.Resource)
+      return dataset;
+    });
+}
+
+
+// Browsers report an empty or unreliable file.type for .md/.xhtml, so infer from the extension
+function getFileMediaType(file) {
+  const type = (file.type || '').split(';')[0].toLowerCase().trim();
+  if (type) return type;
+
+  const ext = file.name.toLowerCase().match(/\.[^./\\]+$/)?.[0];
+  const byExtension = {
+    '.html': 'text/html',
+    '.htm': 'text/html',
+    '.xhtml': 'application/xhtml+xml',
+    '.md': 'text/markdown',
+    '.markdown': 'text/markdown',
+    '.svg': 'image/svg+xml',
+    '.csv': 'text/csv',
+    '.txt': 'text/plain'
+  };
+  return byExtension[ext] || 'text/plain';
+}
+
+// Read File objects and hand them to dokieli. Shared by the open dialog and the file launch handler.
+export function openFiles(fileList, options = {}) {
+  let files = Array.from(fileList);
+
+  let readers = files.map(file => file.text().then(content => ({
+    name: file.name,
+    type: getFileMediaType(file),
+    content
+  })));
+
+  return Promise.all(readers).then(results => {
+    let contentType = results.length === 1 ? results[0].type : "application/octet-stream";
+    let iris = results.map(r => 'file:' + r.name)
+
+    let filesUrls = iris.map((url) => `<a href="${url}" rel="noopener" target="_blank">${url}</a>`);
+    let urlsHtml = filesUrls.join(', ');
+    var message = `Opening ${urlsHtml}`;
+
+    const messageObject = {
+      'content': message,
+      'type': 'info',
+      'timer': 10000
+    }
+
+    addMessageToLog(messageObject, Config.MessageLog);
+    showActionMessage(document.body, messageObject);
+
+    return spawnDokieli(
+      document,
+      results,
+      contentType,
+      iris,
+      { 'init': true, ...options }
+    );
+  }).catch(err => {
+    console.error("Error reading files:", err);
+  });
+}
+
+export function openInputFile(e) {
+  return openFiles(e.target.files);
+}
+
+// PWA file handler: OS "Open with dokieli" for registered types (see app.webmanifest file_handlers)
+export function handleFileLaunch() {
+  if (!('launchQueue' in window) || !('LaunchParams' in window)) return;
+
+  window.launchQueue.setConsumer(async (launchParams) => {
+    if (!launchParams?.files?.length) return;
+    const files = await Promise.all(launchParams.files.map(handle => handle.getFile()));
+    openFiles(files);
+  });
+}
+
+export async function spawnDokieli(documentNode, data, contentTypes, iris, options = {}){
+  iris = Array.isArray(iris) ? iris : [iris];
+  contentTypes = Array.isArray(contentTypes) ? contentTypes : [contentTypes];
+
+  const isHttpIRI = isHttpOrHttpsProtocol(iris[0]);
+  const isFileIRI = isFileProtocol(iris[0]);
+
+  if (!isFileIRI) {
+    iris = sanitizeIRIs(iris);
+  }
+
+  const prefixes = Config.prefixStrings.document;
+
+  if (!isHttpIRI && !isFileIRI) {
+    const message = `Cannot open, not valid URL or file location.`;
+    const messageObject = {
+      'content': message,
+      'type': 'error',
+      'timer': 3000,
+    }
+    addMessageToLog({...messageObject, content: message}, Config.MessageLog);
+    showActionMessage(document.body, messageObject);
+
+    throw new Error(message);
+  }
+
+  let files = Array.isArray(data) ? data : [{
+    name: iris[0],
+    type: contentTypes[0].split(';')[0].toLowerCase().trim(),
+    content: data
+  }];
+
+  var tmpl = document.implementation.createHTMLDocument('template');
+  const isCsv = !!files.find((f) => f.type == "text/csv");
+  // console.log(tmpl);
+  if (files.length > 1 && isCsv) {
+    // check if one of the files is a metadata.json
+    const metadataFiles = [];
+    const csvFiles = [];
+
+    files.map((file) => {
+      if (file.type == 'application/json' || file.type == 'application/ld+json') {
+        file['url'] = file.name;
+        metadataFiles.push(file);
+      }
+      if (file.type === 'text/csv') {
+        csvFiles.push(file)
+      }
+    })
+
+    // handle multiple csv
+    const jsonObjects = csvFiles.map(csvFile => {
+      let tmp = csvStringToJson(csvFile.content);
+      tmp['url'] = csvFile.name;
+      return tmp;
+    })
+
+    //TODO: multiple metadata files
+    let metadata = metadataFiles[0];
+    if (metadata && metadata.content) {
+      metadata.content = JSON.parse(metadataFiles[0].content);
+    }
+
+    const htmlString = jsonToHtmlTableString(jsonObjects, metadata);
+
+    // console.log(fragmentFromString(`<main><article>${htmlString}</article></main>`))
+    // this works for urls but not files
+    // document.body.appendChild(fragmentFromString(`<main><article>${htmlString}</article></main>`));
+
+    // and this replaces the whole content
+    tmpl.body.appendChild(fragmentFromString(`<main><article>${htmlString}</article></main>`));
+  }
+
+  else {
+    switch(contentTypes[0]){
+      case 'text/html': case 'application/xhtml+xml':
+        // if multiple HTML files come in, just open the first for now
+        tmpl.documentElement.setHTMLUnsafe(files[0].content);
+        tmpl.body.setHTMLUnsafe(domSanitize(tmpl.body.getHTML()));
+        break;
+
+      case 'text/markdown': case 'text/plain':
+        // Parse markdown to an HTML document, mirroring the URL open path
+        tmpl.documentElement.setHTMLUnsafe(parseMarkdown(files[0].content, { createDocument: true }));
+        tmpl.body.setHTMLUnsafe(domSanitize(tmpl.body.getHTML()));
+        break;
+
+      case 'text/csv':
+        // console.error("Must provide a metadata file; single CSVs without metadata not supported yet");
+        // console.log("TODO: Single CSV case", iri, files);
+        let jsonObject = csvStringToJson(files[0].content); // we only have one for now
+        jsonObject['url'] = files[0].name;
+        jsonObject['name'] = files[0].name;
+        const htmlString = jsonToHtmlTableString([jsonObject], {});
+
+        tmpl.body.replaceChildren(fragmentFromString(`<main><article about="" typeof="schema:Article">${htmlString}</article></main>`));
+        break;
+
+      case 'application/gpx+xml':
+        // console.log(data)
+        const { generateGeoView } = await lazyImport(() => import(/* webpackChunkName: "geo" */ './geo.js'));
+        tmpl = await generateGeoView(files[0].content)
+        // FIXME: Tested with generateGeoView returning a Promise but somehow
+          .then(i => {
+            var id = 'geo';
+            var metadataBounds = document.querySelector('#' + id + ' figcaption a');
+            if (metadataBounds) {
+              var message = `Opened geo data at <a href="${metadataBounds.href}">${metadataBounds.textContent}</a>`;
+              message = {
+                'content': message,
+                'type': 'info',
+                'timer': 3000,
+              }
+              addMessageToLog(message, Config.MessageLog);
+              showActionMessage(document.body, message);
+
+              var w = document.getElementById(id);
+              window.history.pushState(null, null, '#' + id);
+              w.scrollIntoView();
+            }
+
+            return i;
+          });
+
+        break;
+
+      default:
+        let main = document.createElement('main');
+        let article = document.createElement('article');
+        main.appendChild(article);
+        // console.log(options)
+        for (const file of files) {
+          let iframe = document.createElement('iframe');
+          iframe.width = '1280'; iframe.height = '720';
+
+          let fromContentType = file.type;
+          let toContentType = file.type;
+          let canSerialize = true;
+
+          if (options.output) {
+            let cT = options.output;
+            cT = (cT) ? cT.split(';')[0].toLowerCase().trim() : cT;
+            toContentType = cT;
+
+            const allowedFromTypes = Config.MediaTypes.RDF.concat(Config.MediaTypes.Markup);
+            const hasSerializer = !!getRDFSerializer(toContentType);
+
+            if (allowedFromTypes.includes(fromContentType) && hasSerializer) {
+              file.content = await serializeData(file.content, fromContentType, toContentType);
+            }
+            else {
+              canSerialize = false;
+            }
+          }
+
+          // <pre type=&quot;' + contentType + '&quot; -- nice but `type` is undefined attribute for `pre`.at the moment. Create issue in WHATWG for fun/profit?
+          iframe.srcdoc = `<pre>${
+            toContentType === "application/ld+json"
+              ? htmlEncode(
+                  JSON.stringify(
+                    typeof file.content === "string"
+                      ? JSON.parse(file.content)
+                      : file.content,
+                    null,
+                    2
+                  )
+                )
+              : htmlEncode(file.content)
+          }</pre>`;
+
+          let dl = document.createElement('dl');
+          let id = generateAttributeId();
+          file['id'] = id;
+          dl.setAttribute('id', id);
+          dl.setAttribute('class', 'open-preview');
+          dl.setAttribute('rel', 'schema:hasPart');
+          dl.setAttribute('resource', `#${id}`);
+          // dl.setAttribyte('typeof', 'schema:CreativeWork');
+
+          let dt, dd, code, a;
+
+          //Source
+          dt = document.createElement('dt');
+          dt.textContent = 'Source';
+          dl.appendChild(dt);
+          dd = document.createElement('dd');
+          if (isFileIRI) {
+            code = document.createElement('code');
+            code.textContent = file.name.slice(5);
+            dd.appendChild(code);
+          }
+          else {
+            a = document.createElement('a');
+            a.setAttribute('href', file.name);
+            a.setAttribute('rel', 'noopener schema:contentUrl');
+            a.setAttribute('target', '_blank');
+            a.textContent = file.name;
+            dd.appendChild(a);
+          }
+          dl.appendChild(dd);
+
+          //Format
+          dt = document.createElement('dt');
+          dt.textContent = 'Format';
+          dl.appendChild(dt);
+          dd = document.createElement('dd');
+          dd.setAttribute('property', 'schema:encodingFormat');
+          code = document.createElement('code');
+          code.textContent = (canSerialize) ? toContentType : fromContentType;
+          dd.appendChild(code);
+          dl.appendChild(dd);
+
+          //Content
+          dt = document.createElement('dt');
+          dt.textContent = 'Content';
+          dl.appendChild(dt);
+          dd = document.createElement('dd');
+          dd.appendChild(iframe);
+
+          //Button
+          const button = document.createElement('button');
+          button.setAttribute('class', 'export');
+          button.setAttribute('data-i18n', 'dialog.open-document.export.button');
+          button.setAttribute('title', i18n.t('dialog.open-document.export.button.title'));
+          button.setAttribute('type', 'button');
+          button.textContent = i18n.t('dialog.open-document.export.button.textContent');
+          dd.appendChild(button);
+          dl.appendChild(dd);
+
+          article.appendChild(dl);
+        };
+
+        tmpl.body.appendChild(main);
+
+        break;
+    }
+  }
+
+  if (options.defaultStylesheet) {
+    var documentCss = document.querySelectorAll('head link[rel~="stylesheet"][href]');
+
+    let hasDokieliCss = false;
+
+    documentCss.forEach(node => {
+      const href = node.href;
+      const isBasicCss = href === 'https://dokie.li/media/css/basic.css';
+      const isDokieliCss = href === 'https://dokie.li/media/css/dokieli.css';
+
+      node.setAttribute('href', href);
+
+      if (!isBasicCss && !isDokieliCss) {
+        node.setAttribute('disabled', 'disabled');
+        node.classList.add('do');
+      }
+      else {
+        node.setAttribute('rel', 'stylesheet');
+        hasDokieliCss = true;
+      }
+    });
+
+    if (!hasDokieliCss) {
+      sanitizeInsertAdjacentHTML(document.querySelector('head'), 'beforeend', `
+        <link href="https://dokie.li/media/css/basic.css" media="all" rel="stylesheet" title="Basic" />
+        <link href="https://dokie.li/media/css/dokieli.css" media="all" rel="stylesheet" />`);
+    }
+  }
+
+  var documentScript = document.querySelectorAll('head script[src]');
+  documentScript.forEach(node => {
+    node.setAttribute('src', node.src);
+  })
+
+  if (options.init === true && isHttpIRI && contentTypes[0] == 'text/html') {
+    var baseElements = document.querySelectorAll('head base');
+    baseElements.forEach(baseElement => {
+      baseElement.remove();
+    });
+
+    var baseEl = document.createElement('base');
+    baseEl.setAttribute('class', 'do');
+    baseEl.setAttribute('href', iris[0]);
+    document.querySelector('head').prepend(baseEl);
+
+    if (!History.prototype.__dokieliBasePatched) {
+      const patch = (name) => {
+        const orig = History.prototype[name];
+        History.prototype[name] = function (state, title, url) {
+          if (url != null && typeof url === 'string') {
+            try { url = new URL(url, window.location.href).href; } catch {}
+          }
+          return orig.call(this, state, title, url);
+        };
+      };
+      patch('replaceState');
+      patch('pushState');
+      History.prototype.__dokieliBasePatched = true;
+    }
+    //TODO: Setting the base URL with `base` seems to work correctly, i.e., link base is opened document's URL, and simpler than updating some of the elements' href/src/data attributes. Which approach may be better depends on actions afterwards, e.g., Save As (perhaps other features as well) may need to remove the base and go with the user selection.
+    // var nodes = tmpl.querySelectorAll('head link, [src], object[data]');
+    // nodes = rewriteBaseURL(nodes, {'baseURLType': 'base-url-absolute', 'iri': iri});
+  }
+
+  if (contentTypes[0] == 'application/gpx+xml') {
+    options['init'] = false;
+
+    //XXX: Should this be taken care by ufpdating the document.documentElement and then running init(iri) ? If I'm asking, then probably yes.
+    var asideOpenDocument = document.getElementById('open-document');
+    if (asideOpenDocument) {
+      asideOpenDocument.parentNode.removeChild(asideOpenDocument);
+    }
+    setMenuButtonDisabled('.resource-open');
+    hideDocumentMenu();
+  }
+  else if (options.init === true) { // && !isFileIRI ?
+    // window.open(iri, '_blank');
+
+    //TODO: Which approach?
+    // var restrictedNodes = Array.from(document.body.querySelectorAll('.do:not(.copy-to-clipboard):not(.robustlinks):not(.ref):not(.delete):not(#document-action-message)'));
+    // var restrictedNodes = [document.getElementById('document-menu'), document.getElementById('document-editor'), document.getElementById('document-action-message')];
+    // restrictedNodes.forEach(node => {
+    //   tmpl.body.appendChild(node);
+    // });
+
+    const tmplBody = tmpl.body.cloneNode(true);
+    tmplBody.setAttribute('prefix', prefixes);
+
+    const customStyle = tmpl.head.querySelector('style#dokieli-custom-style');
+    if (customStyle) {
+      const existing = document.getElementById('dokieli-custom-style');
+      if (existing) existing.remove();
+      document.head.appendChild(customStyle.cloneNode(true));
+    }
+
+    document.documentElement.replaceChild(tmplBody, document.body);
+
+    let openPreview = document.querySelectorAll('.open-preview');
+
+    openPreview.forEach((preview) => {
+      preview.addEventListener('click', e => {
+        if (e.target.closest('button.export')) {
+          var oP = e.target.closest('.open-preview');
+          var mediaType = oP.querySelector('dd[rel="schema:encodingFormat"]').textContent || 'text/plain';
+          var iframe = oP.querySelector('iframe');
+          let content = iframe.srcdoc;
+
+          var options = {
+            subjectURI: 'http://example.org/' + preview.id,
+            mediaType,
+            filenameExtension: Config.FileExtensions[mediaType]
+          }
+    
+          exportAsDocument(content, options);
+        }
+      })
+    });
+
+    initDocumentMenu({loading: false});
+    // if (!Config.Editor.EditorEnabled) {
+    //   Config.Editor.init(Config.Editor.mode, null, options);
+    // } else {
+    //   Config.Editor.toggleMode(Config.Editor.mode)
+    // }
+    // console.log(Config.Editor.mode)    
+
+    // Config.Editor.init(Config.Editor.mode, null, options);
+    // console.log(Config.Editor)    
+    Config.Editor.init(null, null, options);
+
+    resolveAuthenticatedImages(document.body);
+
+    //FIXME. Call initDocumentActions (TODO: create document-actions.js)
+    showFragment();
+    initCopyToClipboard();
+    // showRobustLinksDecoration();
+    // processPotentialAction();
+    // processActivateAction();
+    // highlightItems();
+    // showAsTabs();
+    initSlideshow();
+    // setDocRefType();
+    // initCurrentStylesheet();
+    // focusNote();
+
+    const { initEncryptedDocument, initShowNotificationSources } = await import('./init.js');
+    await initEncryptedDocument();
+    initShowNotificationSources();
+
+    // hideDocumentMenu();
+    return;
+  }
+
+  //XXX: This is used in cases options.init is false or undefined
+  return tmpl.documentElement.cloneNode(true);
+
+  // console.log('//TODO: Handle server returning wrong or unknown Response/Content-Type for the Request/Accept');
+}
+
+function getPassphraseToggleHTML() {
+  const label = i18n.t('encryption.show-passphrase.title');
+  const icon = Icon['.fas.fa-eye'].replace('<svg ', '<svg aria-hidden="true" ');
+  return `<button type="button" class="toggle-passphrase" data-i18n="encryption.show-passphrase" aria-pressed="false" aria-label="${label}" title="${label}">${icon}</button>`;
+}
+
+function initPassphraseToggles(container) {
+  container.querySelectorAll('button.toggle-passphrase').forEach(button => {
+    button.addEventListener('click', () => {
+      const input = button.previousElementSibling;
+      if (input?.nodeName !== 'INPUT') return;
+      const show = input.type === 'password';
+      input.type = show ? 'text' : 'password';
+      button.setAttribute('aria-pressed', String(show));
+      const baseKey = show ? 'encryption.hide-passphrase' : 'encryption.show-passphrase';
+      button.setAttribute('data-i18n', baseKey);
+      const label = i18n.t(`${baseKey}.title`);
+      button.setAttribute('aria-label', label);
+      button.setAttribute('title', label);
+      const icon = Icon[show ? '.fas.fa-eye-slash' : '.fas.fa-eye'].replace('<svg ', '<svg aria-hidden="true" ');
+      button.setHTMLUnsafe(domSanitize(icon));
+      input.focus();
+    });
+  });
+}
+
+// New passphrase for the first key on the device, the existing one otherwise
+export async function showSigningSetup(onSuccess) {
+  if (document.getElementById('signing-setup') || signingSetupOpening) return;
+
+  // hasAnyKeys can reach the network, so a second click would open a second dialog
+  signingSetupOpening = true;
+  let reusePassphrase;
+  try {
+    reusePassphrase = await hasAnyKeys();
+  }
+  finally {
+    signingSetupOpening = false;
+  }
+  const buttonClose = getButtonHTML({ button: 'close', buttonClass: 'close', iconSize: 'fa-2x' });
+  const confirmField = reusePassphrase ? '' : `
+          <li>
+            <label for="signing-passphrase-confirm" data-i18n="signing-setup.passphrase-confirm-label">${i18n.t('signing-setup.passphrase-confirm-label.textContent')}</label>
+            <input id="signing-passphrase-confirm" type="password" autocomplete="new-password" minlength="12" required />${getPassphraseToggleHTML()}
+          </li>`;
+
+  const html = `
+    <aside aria-labelledby="signing-setup-label" class="do on" dir="${Config.User.UI.LanguageDir}" id="signing-setup" lang="${Config.User.UI.Language}" xml:lang="${Config.User.UI.Language}">
+      <h2 id="signing-setup-label" data-i18n="signing-setup.heading">${i18n.t('signing-setup.heading.textContent')} ${Config.Button.Info.Sign}</h2>
+      ${buttonClose}
+      <div class="info"></div>
+      <p data-i18n="${reusePassphrase ? 'signing-setup.passphrase-existing' : 'signing-setup.passphrase-new'}">${i18n.t(reusePassphrase ? 'signing-setup.passphrase-existing.textContent' : 'signing-setup.passphrase-new.textContent')}</p>
+      <form id="signing-setup-form">
+        <ul>
+          <li>
+            <label for="signing-passphrase" data-i18n="signing-setup.passphrase-label">${i18n.t('signing-setup.passphrase-label.textContent')}</label>
+            <input id="signing-passphrase" type="password" autocomplete="${reusePassphrase ? 'current-password' : 'new-password'}" minlength="12" required />${getPassphraseToggleHTML()}
+          </li>${confirmField}
+        </ul>
+        <button type="submit" data-i18n="signing-setup.submit-button">${i18n.t('signing-setup.submit-button.textContent')}</button>
+      </form>
+    </aside>`;
+
+  document.body.appendChild(fragmentFromString(html));
+
+  const aside = document.getElementById('signing-setup');
+  const info = aside.querySelector('div.info');
+  const form = aside.querySelector('#signing-setup-form');
+  const passInput = form.querySelector('#signing-passphrase');
+
+  initPassphraseToggles(form);
+
+  form.addEventListener('submit', async e => {
+    e.preventDefault();
+    const submit = form.querySelector('button[type="submit"]');
+    const pass = passInput.value;
+
+    if (!reusePassphrase && pass !== form.querySelector('#signing-passphrase-confirm').value) {
+      setKeyStatus(info, i18n.t('encryption-setup.passphrases-mismatch.textContent'), 'error');
+      return;
+    }
+    if (pass.length < 12) {
+      setKeyStatus(info, i18n.t('encryption-setup.passphrase-too-short.textContent'), 'error');
+      return;
+    }
+
+    submit.disabled = true;
+    setKeyStatus(info, i18n.t('signing-setup.generating.textContent'), 'info');
+
+    try {
+      // A different passphrase would leave the keys unlockable only one at a time
+      if (reusePassphrase && !await verifyPassphrase(pass)) {
+        setKeyStatus(info, i18n.t('signing-setup.passphrase-mismatch-existing.textContent'), 'error');
+        submit.disabled = false;
+        return;
+      }
+
+      await createKeystore(pass, ASSERTION);
+      Config.User.Keys.Signing.Enabled = true;
+      Config.User.Keys.Signing.KeyId = getSessionKid(ASSERTION);
+
+      form.remove();
+      aside.querySelector('p[data-i18n^="signing-setup.passphrase-"]')?.remove();
+      setKeyStatus(info, i18n.t('signing-setup.success.textContent'), 'success');
+      appendKeyLocation(info, Config.User.Keys.Signing);
+
+      if (Config.User.Keys.Signing.StorageSyncFailed) {
+        sanitizeInsertAdjacentHTML(info, 'beforeend', `<p class="warning" data-i18n="encryption-setup.storage-sync-failed">${i18n.t('encryption-setup.storage-sync-failed.textContent')}</p>`);
+      }
+      else {
+        try {
+          await publishPublicKeyToProfile(ASSERTION);
+        }
+        catch (err) {
+          console.warn('dokieli: signing key profile publication failed; signing still works locally', err);
+        }
+      }
+
+      // Only point where the key is known to be new, and may be the user's only copy
+      sanitizeInsertAdjacentHTML(info, 'beforeend',
+        `<p data-i18n="encryption-setup.download-description">${i18n.t('encryption-setup.download-description.textContent')}</p>
+         <p><button class="download-signing-key" data-i18n="encryption-setup.download-button" type="button">${i18n.t('encryption-setup.download-button.textContent')}</button></p>`);
+
+      const newKid = getSessionKid(ASSERTION);
+      const downloadButton = info.querySelector('button.download-signing-key');
+      downloadButton.addEventListener('click', () => runKeyDownload(info, downloadButton, newKid));
+
+      onSuccess?.();
+    }
+    catch (err) {
+      reportKeyError(info, 'signing-setup.error.textContent', err);
+      submit.disabled = false;
+    }
+  });
+}
+
+export function showEncryptionSetup(onSuccess) {
+  if (document.getElementById('encryption-setup')) return;
+
+  const buttonClose = getButtonHTML({ button: 'close', buttonClass: 'close', iconSize: 'fa-2x' });
+
+  const html = `
+    <aside aria-labelledby="encryption-setup-label" class="do on" dir="${Config.User.UI.LanguageDir}" id="encryption-setup" lang="${Config.User.UI.Language}" xml:lang="${Config.User.UI.Language}">
+      <h2 id="encryption-setup-label" data-i18n="encryption-setup.heading">${i18n.t('encryption-setup.heading.textContent')} ${Config.Button.Info.Encrypt}</h2>
+      ${buttonClose}
+      <div class="info"></div>
+      <p data-i18n="encryption-setup.description">${i18n.t('encryption-setup.description.textContent')}</p>
+      <form id="encryption-setup-form">
+        <ul>
+          <li>
+            <label for="encryption-passphrase" data-i18n="encryption-setup.passphrase-label">${i18n.t('encryption-setup.passphrase-label.textContent')}</label>
+            <input id="encryption-passphrase" type="password" autocomplete="new-password" minlength="12" required />${getPassphraseToggleHTML()}
+          </li>
+          <li>
+            <label for="encryption-passphrase-confirm" data-i18n="encryption-setup.passphrase-confirm-label">${i18n.t('encryption-setup.passphrase-confirm-label.textContent')}</label>
+            <input id="encryption-passphrase-confirm" type="password" autocomplete="new-password" minlength="12" required />${getPassphraseToggleHTML()}
+          </li>
+        </ul>
+        <button type="submit" data-i18n="encryption-setup.submit-button" disabled="">${i18n.t('encryption-setup.submit-button.textContent')}</button>
+      </form>
+    </aside>`;
+
+  document.body.appendChild(fragmentFromString(html));
+
+  const aside = document.getElementById('encryption-setup');
+  const info = aside.querySelector('div.info');
+  const form = aside.querySelector('#encryption-setup-form');
+
+  initPassphraseToggles(form);
+
+  const passInput = form.querySelector('#encryption-passphrase');
+  const confirmInput = form.querySelector('#encryption-passphrase-confirm');
+  const submitButton = form.querySelector('button[type="submit"]');
+  const updateMatchState = () => {
+    confirmInput.classList.remove('passphrase-match', 'passphrase-mismatch');
+    const match = confirmInput.value.length && passInput.value === confirmInput.value;
+    submitButton.disabled = !match;
+    if (!confirmInput.value.length) return;
+    confirmInput.classList.add(match ? 'passphrase-match' : 'passphrase-mismatch');
+  };
+  passInput.addEventListener('input', updateMatchState);
+  confirmInput.addEventListener('input', updateMatchState);
+
+  form.addEventListener('submit', async e => {
+    e.preventDefault();
+    const pass = form.querySelector('#encryption-passphrase').value;
+    const confirm = form.querySelector('#encryption-passphrase-confirm').value;
+
+    if (pass !== confirm) {
+      info.textContent = i18n.t('encryption-setup.passphrases-mismatch.textContent');
+      return;
+    }
+    if (pass.length < 12) {
+      info.textContent = i18n.t('encryption-setup.passphrase-too-short.textContent');
+      return;
+    }
+
+    form.querySelector('button[type="submit"]').disabled = true;
+    aside.querySelector('p').remove();
+    form.remove();
+    const generatingMsg = document.createElement('p');
+    generatingMsg.setAttribute('data-i18n', 'encryption-setup.generating');
+    generatingMsg.textContent = i18n.t('encryption-setup.generating.textContent');
+    info.appendChild(generatingMsg);
+
+    try {
+      await createKeystore(pass);
+      Config.User.Keys.Encryption.Enabled = true;
+      Config.User.Keys.Encryption.KeyId = getSessionKid();
+      generatingMsg.remove();
+      const successMsg = document.createElement('p');
+      successMsg.setAttribute('data-i18n', 'encryption-setup.success');
+      successMsg.textContent = i18n.t('encryption-setup.success.textContent');
+      info.appendChild(successMsg);
+
+      appendKeyLocation(info, Config.User.Keys.Encryption);
+
+      // Only point where the key is known to be new, and may be the user's only copy
+      sanitizeInsertAdjacentHTML(info, 'beforeend',
+        `<p data-i18n="encryption-setup.download-description">${i18n.t('encryption-setup.download-description.textContent')}</p>
+         <p><button class="download-encryption-keys" data-i18n="encryption-setup.download-button" type="button">${i18n.t('encryption-setup.download-button.textContent')}</button></p>`);
+
+      const newKid = getSessionKid();
+      const downloadButton = info.querySelector('button.download-encryption-keys');
+      downloadButton.addEventListener('click', () => runKeyDownload(info, downloadButton, newKid));
+
+      clearPendingEncryptedQueues();
+      onSuccess?.();
+      if (Config.User.Keys.Encryption.StorageSyncFailed) {
+        // Defer profile publication until the keystore reaches storage, on a later unlock
+        const syncMsg = document.createElement('p');
+        syncMsg.setAttribute('class', 'warning');
+        syncMsg.setAttribute('data-i18n', 'encryption-setup.storage-sync-failed');
+        syncMsg.textContent = i18n.t('encryption-setup.storage-sync-failed.textContent');
+        info.appendChild(syncMsg);
+      }
+      else {
+        try {
+          await publishPublicKeyToProfile();
+        } catch (e) {
+          console.warn('dokieli: public key profile publication failed; encryption still works locally', e);
+        }
+      }
+    } catch (err) {
+      generatingMsg.remove();
+      // No data-i18n: the message carries dynamic error detail
+      const errorMsg = document.createElement('p');
+      errorMsg.textContent = i18n.t('encryption-setup.error.textContent') + ' ' + err.message;
+      info.appendChild(errorMsg);
+      form.querySelector('button[type="submit"]').disabled = false;
+    }
+  });
+}
+
+export function showKeyExport() {
+  if (document.getElementById('key-export')) return;
+
+  const buttonClose = getButtonHTML({ button: 'close', buttonClass: 'close', iconSize: 'fa-2x' });
+
+  const html = `
+    <aside aria-labelledby="key-export-label" class="do on" dir="${Config.User.UI.LanguageDir}" id="key-export" lang="${Config.User.UI.Language}" xml:lang="${Config.User.UI.Language}">
+      <h2 id="key-export-label" data-i18n="key-export.heading">${i18n.t('key-export.heading.textContent')} ${Config.Button.Info.Keys}</h2>
+      ${buttonClose}
+      <div class="info"></div>
+      <form id="key-export-form">
+        <ul class="save-as-cards">
+          <li>
+            <input type="radio" id="key-export-backup" name="key-export-format" value="backup" checked="checked" />
+            <label for="key-export-backup">
+              ${Icon['.fas.fa-download']}
+              <span class="save-as-card-text">
+                <strong data-i18n="key-export.backup.label.strong">${i18n.t('key-export.backup.label.strong.textContent')}</strong>
+                <span data-i18n="key-export.backup.desc.span">${i18n.t('key-export.backup.desc.span.textContent')}</span>
+              </span>
+              ${Icon['.fas.fa-check']}
+            </label>
+          </li>
+          <li>
+            <input type="radio" id="key-export-pem" name="key-export-format" value="pem" />
+            <label for="key-export-pem">
+              ${Icon['.fas.fa-file']}
+              <span class="save-as-card-text">
+                <strong data-i18n="key-export.pem.label.strong">${i18n.t('key-export.pem.label.strong.textContent')}</strong>
+                <span data-i18n="key-export.pem.desc.span">${i18n.t('key-export.pem.desc.span.textContent')}</span>
+              </span>
+              ${Icon['.fas.fa-check']}
+            </label>
+          </li>
+        </ul>
+        <p class="key-export-key-row" hidden="">
+          <label for="key-export-key" data-i18n="key-export.key-label">${i18n.t('key-export.key-label.textContent')}</label>
+          <select id="key-export-key"></select>
+        </p>
+        <p class="key-export-passphrase-row" hidden="">
+          <label for="key-export-passphrase" data-i18n="key-export.passphrase-label">${i18n.t('key-export.passphrase-label.textContent')}</label>
+          <input id="key-export-passphrase" type="password" autocomplete="current-password" />${getPassphraseToggleHTML()}
+        </p>
+        <button type="submit" data-i18n="key-export.submit-button">${i18n.t('key-export.submit-button.textContent')}</button>
+      </form>
+    </aside>`;
+
+  document.body.appendChild(fragmentFromString(html));
+
+  const aside = document.getElementById('key-export');
+  const info = aside.querySelector('div.info');
+  const form = aside.querySelector('#key-export-form');
+  const passphraseRow = form.querySelector('.key-export-passphrase-row');
+  const passphraseInput = form.querySelector('#key-export-passphrase');
+  const keyRow = form.querySelector('.key-export-key-row');
+  const keySelect = form.querySelector('#key-export-key');
+
+  initPassphraseToggles(form);
+
+  // Only the bare key needs unwrapping; the backup is already encrypted
+  const updateFormatFields = () => {
+    const isPEM = form.querySelector('input[name="key-export-format"]:checked').value === 'pem';
+    passphraseRow.hidden = !isPEM;
+    passphraseInput.required = isPEM;
+    keyRow.hidden = !isPEM || keySelect.options.length < 2;
+  };
+
+  // The listing arrives after the dialog, so re-evaluate once it does
+  listKeys()
+    .then(keys => {
+      for (const { kid, purpose } of keys) {
+        const option = document.createElement('option');
+        option.value = kid;
+        option.textContent = `${i18n.t(purpose === ASSERTION ? 'key-export.key-signing.textContent' : 'key-export.key-encryption.textContent')} (${kid.slice(0, 8)})`;
+        keySelect.appendChild(option);
+      }
+      updateFormatFields();
+    })
+    .catch(e => console.warn('dokieli: could not list keys for export', e));
+
+  form.querySelectorAll('input[name="key-export-format"]').forEach(radio => {
+    radio.addEventListener('change', () => {
+      updateFormatFields();
+      info.replaceChildren();
+    });
+  });
+
+  form.addEventListener('submit', async e => {
+    e.preventDefault();
+    const submit = form.querySelector('button[type="submit"]');
+    submit.disabled = true;
+    info.replaceChildren();
+
+    try {
+      if (form.querySelector('input[name="key-export-format"]:checked').value === 'backup') {
+        const count = await downloadKeyBackup();
+        setKeyStatus(info, i18n.t(count === 1 ? 'menu.encryption.download-ready.textContent' : 'menu.encryption.download-ready-many.textContent'));
+      }
+      else {
+        const keyPair = await exportKeyPair(passphraseInput.value, keySelect.value || undefined);
+        const name = `dokieli-key-${keyPair.kid.slice(0, 8)}`;
+        downloadBlobAsFile(createZipBlob([
+          { name: `${name}.pem`, content: keyPair.privateKeyPEM },
+          { name: `${name}.pub.pem`, content: keyPair.publicKeyPEM }
+        ]), `${name}.zip`);
+        setKeyStatus(info, i18n.t('key-export.pem-ready.textContent'), 'warning');
+      }
+    }
+    catch (err) {
+      reportKeyError(info, 'key-export.error.textContent', err);
+    }
+
+    submit.disabled = false;
+  });
+}
+
+// Accepts the wrapped backup document or a bare private key PEM
+export function showKeyImport() {
+  document.getElementById('key-export')?.remove();
+  if (document.getElementById('key-import')) return;
+
+  const buttonClose = getButtonHTML({ button: 'close', buttonClass: 'close', iconSize: 'fa-2x' });
+
+  const html = `
+    <aside aria-labelledby="key-import-label" class="do on" dir="${Config.User.UI.LanguageDir}" id="key-import" lang="${Config.User.UI.Language}" xml:lang="${Config.User.UI.Language}">
+      <h2 id="key-import-label" data-i18n="key-import.heading">${i18n.t('key-import.heading.textContent')} ${Config.Button.Info.Keys}</h2>
+      ${buttonClose}
+      <div class="info"></div>
+      <p data-i18n="key-import.description">${i18n.t('key-import.description.textContent')}</p>
+      <form id="key-import-form">
+        <ul>
+          <li>
+            <label for="key-import-file" data-i18n="key-import.file-label">${i18n.t('key-import.file-label.textContent')}</label>
+            <input id="key-import-file" type="file" accept=".json,.jsonld,.pem,.zip,application/json,application/ld+json,application/zip" required="" />
+          </li>
+        </ul>
+        <p class="key-import-passphrase-row" hidden="">
+          <span data-i18n="key-import.passphrase-description">${i18n.t('key-import.passphrase-description.textContent')}</span>
+          <label for="key-import-passphrase" data-i18n="key-import.passphrase-label">${i18n.t('key-import.passphrase-label.textContent')}</label>
+          <input id="key-import-passphrase" type="password" autocomplete="new-password" minlength="12" />${getPassphraseToggleHTML()}
+        </p>
+        <button type="submit" data-i18n="key-import.submit-button">${i18n.t('key-import.submit-button.textContent')}</button>
+      </form>
+    </aside>`;
+
+  document.body.appendChild(fragmentFromString(html));
+
+  const aside = document.getElementById('key-import');
+  const info = aside.querySelector('div.info');
+  const form = aside.querySelector('#key-import-form');
+  const fileInput = form.querySelector('#key-import-file');
+  const passphraseRow = form.querySelector('.key-import-passphrase-row');
+  const passphraseInput = form.querySelector('#key-import-passphrase');
+
+  initPassphraseToggles(form);
+
+  let fileText = '';
+  let isPEM = false;
+
+  fileInput.addEventListener('change', async () => {
+    info.replaceChildren();
+    fileText = '';
+    isPEM = false;
+
+    const file = fileInput.files?.[0];
+    if (file) {
+      try {
+        const buffer = await file.arrayBuffer();
+        const bytes = new Uint8Array(buffer);
+        // The private key alone rebuilds both, so pick it out of the pair
+        if (bytes[0] === 0x50 && bytes[1] === 0x4b) {
+          const entries = readZipEntries(buffer);
+          const found = entries.find(e => e.text.includes('-----BEGIN PRIVATE KEY-----')) || entries.find(e => e.name.endsWith('.json'));
+          if (!found) throw new Error('No key file inside this zip.');
+          fileText = found.text;
+        }
+        else {
+          fileText = new TextDecoder().decode(bytes);
+        }
+        isPEM = fileText.trimStart().startsWith('-----BEGIN');
+      }
+      catch (err) {
+        reportKeyError(info, 'menu.encryption.import-failed.textContent', err);
+      }
+    }
+
+    passphraseRow.hidden = !isPEM;
+    passphraseInput.required = isPEM;
+  });
+
+  form.addEventListener('submit', async e => {
+    e.preventDefault();
+    const submit = form.querySelector('button[type="submit"]');
+    submit.disabled = true;
+    info.replaceChildren();
+
+    try {
+      const result = isPEM
+        ? await importPrivateKeyPEM(fileText, passphraseInput.value)
+        : await importKeyDocuments(JSON.parse(fileText));
+      setKeyStatus(info, i18n.t(!result.added ? 'menu.encryption.import-known.textContent'
+        : result.local ? 'menu.encryption.import-local.textContent'
+        : 'menu.encryption.import-success.textContent'));
+    }
+    catch (err) {
+      reportKeyError(info, 'menu.encryption.import-failed.textContent', err);
+    }
+
+    submit.disabled = false;
+  });
+}
+
+export function showEncryptionUnlock(onSuccess) {
+  if (document.getElementById('encryption-unlock')) return;
+
+  const buttonClose = getButtonHTML({ button: 'close', buttonClass: 'close', iconSize: 'fa-2x' });
+
+  const html = `
+    <aside aria-labelledby="encryption-unlock-label" class="do on" dir="${Config.User.UI.LanguageDir}" id="encryption-unlock" lang="${Config.User.UI.Language}" xml:lang="${Config.User.UI.Language}">
+      <h2 id="encryption-unlock-label" data-i18n="encryption-unlock.heading">${i18n.t('encryption-unlock.heading.textContent')} ${Config.Button.Info.Encrypt}</h2>
+      ${buttonClose}
+      <div class="info"></div>
+      <p data-i18n="encryption-unlock.description">${i18n.t('encryption-unlock.description.textContent')}</p>
+      <form id="encryption-unlock-form">
+        <ul>
+          <li>
+            <label for="encryption-unlock-passphrase" data-i18n="encryption-unlock.passphrase-label">${i18n.t('encryption-unlock.passphrase-label.textContent')}</label>
+            <input id="encryption-unlock-passphrase" type="password" autocomplete="current-password" required />${getPassphraseToggleHTML()}
+            <button type="submit" data-i18n="encryption-unlock.submit-button">${i18n.t('encryption-unlock.submit-button.textContent')}</button>
+          </li>
+        </ul>
+        <p><button class="setup-encryption" data-i18n="encryption-unlock.setup-link" type="button">${i18n.t('encryption-unlock.setup-link.textContent')}</button></p>
+      </form>
+    </aside>`;
+
+  document.body.appendChild(fragmentFromString(html));
+
+  const aside = document.getElementById('encryption-unlock');
+  const info = aside.querySelector('div.info');
+  const form = aside.querySelector('#encryption-unlock-form');
+
+  initPassphraseToggles(form);
+
+  aside.querySelector('button.setup-encryption').addEventListener('click', () => {
+    aside.remove();
+    showEncryptionSetup(onSuccess);
+  });
+
+  form.addEventListener('submit', async e => {
+    e.preventDefault();
+    const pass = form.querySelector('#encryption-unlock-passphrase').value;
+    form.querySelector('button[type="submit"]').disabled = true;
+    info.textContent = i18n.t('encryption-unlock.unlocking.textContent');
+
+    try {
+      await unlockKeystore(pass);
+      Config.User.Keys.Encryption.Enabled = true;
+      Config.User.Keys.Encryption.KeyId = getSessionKid();
+
+      const { decryptArticleInPlace } = await import('./init.js');
+      await decryptArticleInPlace();
+      await processPendingEncryptedNotes();
+
+      try {
+        await publishPublicKeyToProfile();
+      } catch (e) {
+        console.warn('dokieli: public key profile publication failed; encryption still works locally', e);
+      }
+
+      onSuccess?.();
+      info.textContent = i18n.t('encryption-unlock.unlocked.textContent');
+      setTimeout(() => aside.remove(), 800);
+    } catch (err) {
+      setKeyStatus(info, i18n.t('encryption-unlock.error.textContent'), 'error');
+      // May be a missing keystore rather than a wrong passphrase
+      appendKeyImportOffer(info);
+      form.querySelector('button[type="submit"]').disabled = false;
+    }
+  });
+}

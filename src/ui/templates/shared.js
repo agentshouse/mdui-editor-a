@@ -1,0 +1,96 @@
+/*!
+Copyright 2012-2026 Sarven Capadisli <https://csarven.ca/>
+Copyright 2023-2026 Virginia Balseiro <https://virginiabalseiro.com/>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+import Config from '../../config.js';
+import { htmlEncode } from '../../utils/sanitization.js';
+import { fragmentFromString } from '../../utils/html.js';
+import { getResourceTypeOptionsHTML, RESOURCE_TYPES } from './registries.js';
+import { registerEditorParseTransform } from './documentTransforms.js';
+
+// Helpers shared by document templates; template-specific markup stays in each template's module.
+
+export function isAuthorMode() {
+  return Config.Editor?.mode === 'author';
+}
+
+// Null unless the author editor is live (template mutations must go through PM).
+export function pmEditor() {
+  return Config.Editor?.authorToolbarView?.editorView ? Config.Editor : null;
+}
+
+// House adaptation: template factories return markup; the host owns mounting and title.
+export function prepareDocumentForTemplate() {}
+export function replaceDocumentBody(html) {
+  const root = fragmentFromString(html);
+  return root.querySelector('article')?.innerHTML || '';
+}
+
+// RDFa section: heading + schema:description container; attrs = extra attribute string for the section element.
+export function sectionHTML({ id, level = 2, heading, content = '', className = '', attrs = '', rel = 'schema:hasPart', headingProperty = 'schema:name' }) {
+  const classAttr = className ? ` class="${className}"` : '';
+  return `<section${classAttr} id="${id}" inlist="" rel="${rel}" resource="#${id}"${attrs}><h${level} property="${headingProperty}">${heading}</h${level}><div datatype="rdf:HTML" property="schema:description">${content}</div></section>`;
+}
+
+// Note block: <div class="note"> with a "Note: <title>" heading.
+export function noteHTML({ id, level = 3, title, content = '' }) {
+  return `<div class="note" id="${id}" inlist="" rel="schema:hasPart" resource="#${id}"><h${level} property="schema:name"><span>Note</span>: ${title}</h${level}><div datatype="rdf:HTML" property="schema:description">${content}</div></div>`;
+}
+
+// One Document Type select; data-select wires it into the editor's select
+// persistence (tableTools syncs the chosen option into ProseMirror state).
+export function documentTypeSelectHTML(typeIri = '', label = null) {
+  // A type outside the registry keeps its own option, so it survives the round trip.
+  const extra = typeIri && !RESOURCE_TYPES[typeIri]
+    ? `<option selected="selected" value="${htmlEncode(typeIri, { mode: 'attribute' })}">${htmlEncode(label || typeIri)}</option>`
+    : '';
+  return `<select data-select="document-type">${extra}${getResourceTypeOptionsHTML({ selected: typeIri })}</select>`;
+}
+
+// Matches an rdf:type link or, in author mode, a Document Type select.
+export function hasDocumentType(root, pattern) {
+  const links = Array.from(root.querySelectorAll('[rel~="rdf:type"]'));
+  if (links.some(el => pattern.test(`${el.getAttribute('href') || ''} ${el.getAttribute('resource') || ''}`))) return true;
+  return Array.from(root.querySelectorAll('select[data-select="document-type"]')).some(select => {
+    const value = select.getAttribute('data-value') ?? (select.value || select.querySelector('option[selected]')?.getAttribute('value'));
+    return pattern.test(value || '');
+  });
+}
+
+// Author entry: each rdf:type entry in the Document Type dl becomes a select.
+// The exit conversion back to anchors lives in normalizeDocumentTypeMarkup.
+function transformDocumentTypeEntries(root) {
+  root?.querySelectorAll?.('#document-type dd').forEach((dd) => {
+    if (dd.querySelector('select[data-select="document-type"]')) return;
+    const a = dd.querySelector('a[rel~="rdf:type"]');
+    if (!a) return;
+    dd.replaceChildren(fragmentFromString(`<p>${documentTypeSelectHTML(a.getAttribute('href'), a.textContent.trim())}</p>`));
+  });
+}
+registerEditorParseTransform(transformDocumentTypeEntries);
+
+// "More details about this document" block. entries: [{ id, dt, dds: [innerHTML], className? }]
+export function documentDetailsHTML(entries, { id = null, summary = 'More details about this document' } = {}) {
+  const dls = entries.map(({ id, dt, dds, className }) => `  <dl${className ? ` class="${className}"` : ''} id="${id}">
+    <dt>${dt}</dt>
+${dds.map(dd => `    <dd>${dd}</dd>`).join('\n')}
+  </dl>`).join('\n');
+
+  return `<details${id ? ` id="${id}"` : ''} open="">
+  <summary>${summary}</summary>
+${dls}
+</details>`;
+}

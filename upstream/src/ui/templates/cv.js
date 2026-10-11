@@ -1,0 +1,944 @@
+/*!
+Copyright 2012-2026 Sarven Capadisli <https://csarven.ca/>
+Copyright 2023-2026 Virginia Balseiro <https://virginiabalseiro.com/>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+import Config from '../../config.js';
+import { fragmentFromString, selectArticleNode } from '../../utils/html.js';
+import { slugify } from '../../editor/plugins/autoId.js';
+import { registerDocumentTransform, registerEditorParseTransform } from '../../utils/documentTransforms.js';
+import { i18n } from '../../i18n.js';
+import { generateAttributeId } from '../../util.js';
+import { getCountryOptionsHTML, showLocationSuggestions, showSkillSuggestions, setupAutocomplete } from '../../doc.js';
+import { getWikidataResults, getEscoResults } from '../../graph.js';
+import { expandTerm, getPrefixes, collectTerms } from '../../utils/rdfa.js';
+import { isAuthorMode, pmEditor, prepareDocumentForTemplate, replaceDocumentBody, documentDetailsHTML, hasDocumentType } from './shared.js';
+import { registerSectionsTemplate, buildSectionsNav, refreshSectionsNav, addSection as addTemplateSection, removeSection as removeTemplateSection, injectSectionsTOC, stripSectionsTOC } from './sections.js';
+import { headingLabel } from '../toc.js';
+
+// Sections are identified from their entries' RDFa (see classifySection), then from
+// data-cv-section. The marker is saved: it is the only identifier that survives a retitle.
+
+const SECTIONS = {
+  summary: {
+    label: 'Summary',
+    entryHTML: () => paragraphHTML({ template: 'cv', type: 'summary' })
+  },
+  experience: {
+    label: 'Experience',
+    entryHTML: () => eventHTML({ template: 'cv', type: 'experience' })
+  },
+  skills: {
+    label: 'Skills',
+    entryHTML: () => skillHTML({ template: 'cv', type: 'skills' })
+  },
+  education: {
+    label: 'Education',
+    entryHTML:() => eventHTML({ template: 'cv', type: 'education' })
+  },
+  talks: {
+    label: 'Presentations and Talks',
+    entryHTML: () => eventHTML({ template: 'cv', type: 'talks' })
+  },
+  'scholarly-communication': {
+    label: 'Scholarly Communication',
+    entryHTML: () => contributionHTML({ template: 'cv', type: 'scholarly-communication' })
+  },
+  'technical-contributions': {
+    label: 'Technical Contributions',
+    entryHTML: () => contributionHTML({ template: 'cv', type: 'technical-contributions' })
+  },
+  awards: {
+    label: 'Awards',
+    entryHTML: () => awardHTML({ template: 'cv', type: 'awards' })
+  },
+  credentials: {
+    label: 'Credentials',
+    entryHTML: () => credentialHTML({ template: 'cv', type: 'credentials' })
+  },
+}
+
+// Placeheld in a new CV; the rest are offered as "+ add" in the nav.
+const DEFAULT_SECTIONS = ['summary', 'experience', 'skills'];
+
+// Simple list sections seeded with one placeholder <li>; richer sections start empty and rely on "+ add".
+const SEED_ENTRY = new Set(['scholarly-communication', 'technical-contributions', 'awards', 'credentials']);
+
+let clickHandlerAttached = false;
+let modeHandlerAttached = false;
+let authHandlerAttached = false;
+
+function getSection(type) {
+  return SECTIONS[type] || null;
+}
+
+// Localized section label; SECTIONS[type].label stays the English reference for slugging.
+function sectionLabel(type) {
+  return i18n.t(`cv.section.${type}.label`);
+}
+
+function getCVRoot() {
+  return document.querySelector('main > article');
+}
+
+// RDFa terms that identify a section by its entries; scholarly-communication and technical-contributions are indistinguishable by RDFa and fall back to marker/heading slug.
+const SECTION_SIGNAL_TERMS = [
+  ['experience', 'typeof', 'schema:BusinessEvent'],
+  ['education', 'typeof', 'schema:EducationEvent'],
+  ['talks', 'typeof', 'schema:ConferenceEvent'],
+  ['skills', 'property', 'schema:skills'],
+  ['awards', 'property', 'schema:award'],
+  ['credentials', 'rel', 'schema:hasCredential'],
+  ['summary', 'property', 'schema:abstract'],
+];
+
+let signalCache = null;
+function sectionSignals() {
+  if (!signalCache) {
+    const prefixes = getPrefixes();
+    signalCache = SECTION_SIGNAL_TERMS.map(([type, attr, term]) => ({ type, attr, iri: expandTerm(term, prefixes) }));
+  }
+  return signalCache;
+}
+
+// Heading-text slug -> section type, the last-resort fallback (legacy CVs, stripped markers).
+let labelSlugCache = null;
+function labelSlugToType() {
+  if (!labelSlugCache) {
+    labelSlugCache = {};
+    Object.entries(SECTIONS).forEach(([type, s]) => {
+      labelSlugCache[type] = type;
+      labelSlugCache[slugify(s.label)] = type;
+    });
+  }
+  return labelSlugCache;
+}
+
+// Classify a section by RDFa term, then marker, then heading slug; tree-agnostic so DOM and ProseMirror share it.
+export function classifySection({ terms, marker, headingText } = {}) {
+  for (const sig of sectionSignals()) {
+    if (terms?.[sig.attr]?.has(sig.iri)) return sig.type;
+  }
+  if (marker && SECTIONS[marker]) return marker;
+  const slug = headingText ? slugify(headingText.trim()) : '';
+  if (slug && labelSlugToType()[slug]) return labelSlugToType()[slug];
+  return null;
+}
+
+// DOM section classifier: gather the subtree's RDFa terms, marker, and heading text, then classify.
+function getSectionType(section) {
+  if (!section) return null;
+  const terms = collectTerms(
+    (cb) => section.querySelectorAll('[typeof],[property],[rel],[rev]').forEach(cb),
+    (el, name) => el.getAttribute(name)
+  );
+  const heading = section.querySelector(':scope > h1, :scope > h2, :scope > h3, :scope > h4, :scope > h5, :scope > h6');
+  // headingLabel drops generated bits (bdi.secno, self-link) so numbering never leaks into the slug.
+  return classifySection({ terms, marker: section.getAttribute('data-cv-section'), headingText: headingLabel(heading) });
+}
+
+// type -> section element, in document order (first match wins per type).
+function sectionIndex(root) {
+  const map = new Map();
+  const content = root?.querySelector('#content');
+  if (!content) return map;
+  content.querySelectorAll(':scope > section').forEach((section) => {
+    const type = getSectionType(section);
+    if (type && !map.has(type)) map.set(type, section);
+  });
+  return map;
+}
+
+function findSection(root, type) {
+  return sectionIndex(root).get(type) || null;
+}
+
+function sectionHTML(type) {
+  const s = getSection(type);
+  if (!s) {
+    var e = `Section type ${type} not found.`;
+    console.log(e);
+    return `<div class="error"></div>`;
+  };
+
+  let html = '';
+
+  const webid = Config.User?.IRI;
+  const about = webid ? ` about="${webid}"` : '';
+
+  switch(type) {
+    default: {
+      const seed = SEED_ENTRY.has(type) ? s.entryHTML() : '';
+      const rels = webid ? itemRelationsAttr(type) : '';
+      html = `<div datatype="rdf:HTML" property="schema:description"><ul${about}${rels}>${seed}</ul></div>`;
+      break;
+    }
+    case 'summary':
+      html = `<div datatype="rdf:HTML" property="schema:abstract"><p></p></div>`;
+      break;
+  }
+
+  return `
+    <section id="${type}" data-cv-section="${type}" rel="schema:hasPart" resource="#${type}">
+      <h2 property="schema:name">${sectionLabel(type)}</h2>
+      ${html}
+    </section>`;
+}
+
+// Default sections, inlined by the template so they exist before PM mounts.
+export function defaultContentHTML() {
+  return `<div id="content">${DEFAULT_SECTIONS.map(sectionHTML).join('')}</div>`;
+}
+
+// Back-fill the data-cv-section marker on legacy CVs from the section id.
+function migrateSectionMarkers(root) {
+  if (!root || !isCV(root)) return;
+  const byLabelSlug = {};
+  Object.entries(SECTIONS).forEach(([type, s]) => { byLabelSlug[slugify(s.label)] = type; });
+  root.querySelectorAll('#content > section').forEach((section) => {
+    if (section.getAttribute('data-cv-section')) return;
+    const id = section.getAttribute('id') || '';
+    const type = SECTIONS[id] ? id : byLabelSlug[id];
+    if (type) section.setAttribute('data-cv-section', type);
+  });
+}
+registerEditorParseTransform(migrateSectionMarkers);
+
+function isCV(root) {
+  return hasDocumentType(root, /CurriculumVitae/);
+}
+
+// The CV's section-management config, running through the generic machinery in sections.js.
+const cvSections = registerSectionsTemplate({
+  templateId: 'cv',
+  getRoot: getCVRoot,
+  isDoc: isCV,
+  sections: SECTIONS,
+  sectionLabel,
+  sectionHTML,
+  sectionEntries: (root) => {
+    const entries = new Map();
+    sectionIndex(root).forEach((el, type) => entries.set(type, { id: el.id || type }));
+    return entries;
+  },
+  removeLabel: (type) => i18n.t('cv.button.remove-section.aria-label', { label: sectionLabel(type) }),
+  tocId: 'toc',
+  markerAttribute: 'data-cv-section',
+});
+
+// Present sections (type -> { id }) override DOM probing (e.g. read from the PM doc).
+export function buildTOC(root, presentEntries = null, doc = null) {
+  return buildSectionsNav(cvSections, root, presentEntries, doc);
+}
+
+function refreshTOC(root) {
+  refreshSectionsNav(cvSections, root);
+}
+
+export function addSection(root, type) {
+  addTemplateSection(cvSections, root, type);
+}
+
+export function removeSection(root, type) {
+  removeTemplateSection(cvSections, root, type);
+}
+
+registerDocumentTransform((doc) => injectSectionsTOC(cvSections, doc));
+registerEditorParseTransform((root) => stripSectionsTOC(cvSections, root));
+
+function paragraphHTML() {
+  return `<p property="schema:description" datatype="rdf:HTML"><br /></p>`;
+}
+
+function contributionHTML(options = {}) {
+  const ph = options.type === 'technical-contributions'
+    ? i18n.t('cv.placeholder.technical-contribution')
+    : i18n.t('cv.placeholder.scholarly-communication');
+  return `<li><p data-placeholder="${ph}"></p></li>`;
+}
+
+export function skillInputHTML({ title = '', uri = '' } = {}) {
+  const id = generateAttributeId();
+  const esc = (s) => (s || '').replace(/"/g, '&quot;');
+  const data = uri ? `data-entity="${esc(uri)}"` : '';
+  return `<div class="autocomplete"><input data-autocomplete="skill" name="${id}-skill" placeholder="${i18n.t('cv.placeholder.skill')}" value="${esc(title)}" ${data} type="text" /></div>`;
+}
+
+function skillHTML() {
+  return `<li>
+  <dl>
+    <dt data-placeholder="${i18n.t('cv.placeholder.category-name')}"></dt>
+    <dd>${skillInputHTML()}</dd>
+  </dl>
+</li>`;
+}
+
+function awardHTML() {
+  return `<li property="schema:award" datatype="rdf:HTML"><p data-placeholder="${i18n.t('cv.placeholder.award')}"></p></li>`;
+}
+
+function credentialHTML() {
+  return `<li><p data-placeholder="${i18n.t('cv.placeholder.credential')}"></p></li>`;
+}
+
+// Person-relation sections: the rel/rev lives on the <ul> alongside about, and only when signed in.
+const ITEM_RELATIONS = {
+  'credentials': { rel: 'schema:hasCredential' },
+  'scholarly-communication': { rev: 'schema:contributor', rel: 'foaf:made' },
+  'technical-contributions': { rev: 'schema:contributor' },
+};
+
+// The rel/rev attribute string for a section's <ul>, '' when it has no person-relation; callers gate on sign-in.
+function itemRelationsAttr(type) {
+  const rels = ITEM_RELATIONS[type];
+  return rels ? Object.entries(rels).map(([k, v]) => ` ${k}="${v}"`).join('') : '';
+}
+
+//TODO Move this to somewhere else as it is not CV specific
+function eventHTML(options = {}) {
+  //TODO: Review article and slideshow rels b/c they may not be entirely accurate. Add other templates later.
+  const templateEventRel = {
+    article: 'schema:hasPart',
+    cv: 'schema:performerIn',
+    slideshow: 'bibo:presentedAt',
+  };
+  const eventRel = templateEventRel[options.template] ?? 'schema:hasPart';
+
+  const eventType = EVENT_TYPE_BY_SECTION[options.type] ?? 'schema:Event';
+
+  const eventId = generateAttributeId();
+  const fields = EVENT_FIELDS_ORDER.map((key) => eventFieldHTML(key, eventId, options.type)).join('\n    ');
+
+  return `<li><dl id="${eventId}" rel="${eventRel}" resource="#${eventId}" typeof="${eventType}">
+    ${fields}
+  </dl></li>`;
+}
+
+const EVENT_FIELDS_ORDER = ['name', 'organizer', 'location', 'date', 'description'];
+
+// Fallback selectors to detect an existing field by its dd's RDFa, for documents saved before the event-* dt classes.
+const EVENT_FIELD_DD_SELECTOR = {
+  name: ':scope > dd[property~="schema:name"]',
+  organizer: ':scope > dd[rel~="schema:organizer"]',
+  location: ':scope > dd[rel~="schema:location"]',
+  date: 'time[property~="schema:startDate"], input[data-property~="schema:startDate"]',
+  description: ':scope > dd[property~="schema:description"]',
+};
+
+// Section type -> RDFa event subtype; schema:Event is the generic fallback.
+const EVENT_TYPE_BY_SECTION = {
+  experience: 'schema:BusinessEvent',
+  education: 'schema:EducationEvent',
+  talks: 'schema:ConferenceEvent',
+};
+
+// Reverse map: RDFa event subtype -> section type (for restoreEventFields).
+const EVENT_SECTION_BY_TYPE = Object.fromEntries(
+  Object.entries(EVENT_TYPE_BY_SECTION).map(([s, t]) => [t, s])
+);
+
+// Section type -> i18n placeholder key prefix (talks -> 'talk').
+const EVENT_PLACEHOLDER_PREFIX = {
+  experience: 'experience',
+  education: 'education',
+  talks: 'talk',
+};
+
+// Matches any event dl regardless of subtype, so prune/restore cover every event-based section.
+const EVENT_SELECTOR = ['schema:Event', ...Object.values(EVENT_TYPE_BY_SECTION)]
+  .map(t => `dl[typeof~="${t}"]`).join(', ');
+
+// One editable dt/dd pair of an event; shared by eventHTML and restoreEventFields.
+function eventFieldHTML(key, eventId, sectionType = 'experience') {
+  const prefix = EVENT_PLACEHOLDER_PREFIX[sectionType] ?? 'experience';
+  switch (key) {
+    case 'name':
+      return `<dt class="event-name" data-i18n="event.name.dt">${i18n.t('event.name.dt.textContent')}</dt>
+    <dd property="schema:name"><p data-placeholder="${i18n.t(`cv.placeholder.${prefix}-name`)}"></p></dd>`;
+
+    case 'organizer':
+      return `<dt class="event-organizer" data-i18n="event.organization.dt">${i18n.t('event.organization.dt.textContent')}</dt>
+    <dd rel="schema:organizer" resource="#${generateAttributeId()}" typeof="schema:Organization">
+      <p class="event-organization-name" data-placeholder="${i18n.t('cv.placeholder.organization')}"></p>
+      <p class="event-organization-department-name" data-placeholder="${i18n.t('cv.placeholder.department')}"></p>
+    </dd>`;
+
+    case 'location':
+      return `<dt class="event-location" data-i18n="event.location.dt">${i18n.t('event.location.dt.textContent')}</dt>
+    <dd rel="schema:location" typeof="schema:Place"><div class="autocomplete" rel="schema:address"><input name="${eventId}-event-location" placeholder="${i18n.t('cv.placeholder.location')}" value="" type="text" /></div></dd>`;
+
+    case 'date':
+      return `<dt class="event-date" data-i18n="event.date.dt">${i18n.t('event.date.dt.textContent')}</dt>
+    <dd>
+      <label contenteditable="false" for="event-start-date" data-i18n="event.date.start-date.label">${i18n.t('event.date.start-date.label.textContent')}</label><input contenteditable="false" data-i18n="event.date.start-date.input" data-property="schema:startDate" draggable="false" type="date" value="" /><label contenteditable="false" for="event-end-date" data-i18n="event.date.end-date.label">${i18n.t('event.date.end-date.label.textContent')}</label><input data-i18n="event.date.end-date.input" data-property="schema:endDate" draggable="false" type="date" value="" />
+    </dd>`;
+
+    case 'description':
+      return `<dt class="event-description" data-i18n="event.description.dt">${i18n.t('event.description.dt.textContent')}</dt>
+    <dd datatype="rdf:HTML" property="schema:description"><p data-placeholder="${i18n.t(`cv.placeholder.${prefix}-description`)}"></p></dd>`;
+  }
+  return '';
+}
+
+// Save hook: collapse the editable date inputs back into <time>start</time>–<time>end</time>.
+function transformDateInputs(doc) {
+  const article = selectArticleNode(doc);
+  if (!article || !isCV(article)) return;
+
+  const toTime = (input) => {
+    const value = input.getAttribute('value') || '';
+    const time = doc.createElement('time');
+    time.setAttribute('datatype', 'xsd:date');
+    const property = input.getAttribute('data-property');
+    if (property) time.setAttribute('property', property);
+    if (value) {
+      time.setAttribute('content', value);
+      time.setAttribute('datetime', value);
+    }
+    time.textContent = value;
+    return time;
+  };
+
+  article.querySelectorAll('dd').forEach((dd) => {
+    const inputs = dd.querySelectorAll('input[type="date"]');
+    if (!inputs.length) return;
+    const times = Array.from(inputs, toTime);
+    dd.replaceChildren(...times.flatMap((t, i) => (i ? [doc.createTextNode('–'), t] : [t])));
+  });
+}
+
+registerDocumentTransform(transformDateInputs);
+
+// Editor hook (inverse): expand published <time> date pairs back into the editable label+input form.
+function dateInputHTML(kind, value) {
+  const property = kind === 'start' ? 'schema:startDate' : 'schema:endDate';
+  return `<label for="event-${kind}-date" data-i18n="event.date.${kind}-date.label">${i18n.t(`event.date.${kind}-date.label.textContent`)}</label><input data-i18n="event.date.${kind}-date.input" data-property="${property}" draggable="false" type="date" value="${value}" />`;
+}
+
+function transformDatesToInputs(root) {
+  if (!root || !isCV(root)) return;
+
+  const valueOf = (t) => t ? (t.getAttribute('content') || t.getAttribute('datetime') || t.textContent.trim()) : '';
+
+  root.querySelectorAll('dd').forEach((dd) => {
+    const start = dd.querySelector(':scope > time[property="schema:startDate"]');
+    const end = dd.querySelector(':scope > time[property="schema:endDate"]');
+    if (!start && !end) return;
+    let html = dateInputHTML('start', valueOf(start));
+    if (end) html += dateInputHTML('end', valueOf(end));
+    dd.replaceChildren(fragmentFromString(html));
+  });
+}
+
+registerEditorParseTransform(transformDatesToInputs);
+
+
+// Save/read hook: collapse the editable country <select> into an <abbr title="Switzerland">CH</abbr>.
+function transformCountrySelects(doc) {
+  const article = selectArticleNode(doc);
+  if (!article || !isCV(article)) return;
+
+  article.querySelectorAll('select[id$="-country"]').forEach((select) => {
+    const code = select.getAttribute('data-value') ||
+      (select.querySelector('option[selected]') || select.querySelector('option[value]:not([value=""])'))?.getAttribute('value') || '';
+    if (!code) { select.remove(); return; }
+    const option = select.querySelector(`option[value="${code}"]`);
+    const name = option ? (option.textContent.trim() || option.getAttribute('title') || '') : '';
+    //TODO: Change this to <span without using country code
+    const abbr = doc.createElement('abbr');
+    abbr.setAttribute('property', 'schema:addressCountry');
+    if (name) abbr.setAttribute('title', name);
+    abbr.textContent = code;
+    select.replaceWith(abbr);
+  });
+}
+
+registerDocumentTransform(transformCountrySelects);
+
+// Editor hook (inverse): expand a published country <abbr> back into the editable <select>.
+function countrySelectHTML(code) {
+  const id = `${generateAttributeId()}-country`;
+  return `<select id="${id}" name="${id}">${getCountryOptionsHTML({ selected: code })}</select>`;
+}
+
+function transformCountriesToSelects(root) {
+  if (!root || !isCV(root)) return;
+
+  root.querySelectorAll('abbr[property="schema:addressCountry"]').forEach((abbr) => {
+    const code = abbr.textContent.trim();
+    abbr.replaceWith(fragmentFromString(countrySelectHTML(code)));
+  });
+}
+
+registerEditorParseTransform(transformCountriesToSelects);
+
+// Location autocomplete -> published address markup.
+function transformLocationInputs(doc) {
+  const article = selectArticleNode(doc);
+  if (!article || !isCV(article)) return;
+
+  article.querySelectorAll('.autocomplete').forEach((wrapper) => {
+    const input = wrapper.querySelector('input[name$="-event-location"]');
+    if (!input) return;
+    const label = (input.value || input.getAttribute('value') || '').trim();
+    const entity = input.getAttribute('data-entity') || '';
+    const locationType = input.getAttribute('data-location-type') || 'addressLocality';
+    const regionCode = input.getAttribute('data-region-code') || '';
+    const regionName = input.getAttribute('data-region-name') || '';
+    const countryCode = input.getAttribute('data-country-code') || '';
+    const countryName = input.getAttribute('data-country-name') || '';
+
+    const address = doc.createElement('span');
+    const rel = wrapper.getAttribute('rel');
+    if (rel) address.setAttribute('rel', rel);
+
+    if (locationType === 'addressLocality') {
+      const span = doc.createElement('span');
+      span.setAttribute('property', 'schema:addressLocality');
+      span.textContent = label;
+      address.appendChild(span);
+      if (regionCode) {
+        address.appendChild(doc.createTextNode(', '));
+        const abbr = doc.createElement('abbr');
+        abbr.setAttribute('property', 'schema:addressRegion');
+        if (regionName) abbr.setAttribute('title', regionName);
+        abbr.textContent = regionCode;
+        address.appendChild(abbr);
+      }
+      if (countryCode) {
+        address.appendChild(doc.createTextNode(', '));
+        const abbr = doc.createElement('abbr');
+        abbr.setAttribute('property', 'schema:addressCountry');
+        if (countryName) abbr.setAttribute('title', countryName);
+        abbr.textContent = countryCode;
+        address.appendChild(abbr);
+      }
+    } else if (locationType === 'addressRegion') {
+      if (regionCode) {
+        const abbr = doc.createElement('abbr');
+        abbr.setAttribute('property', 'schema:addressRegion');
+        if (regionName) abbr.setAttribute('title', regionName);
+        abbr.textContent = regionCode;
+        address.appendChild(abbr);
+      } else {
+        const span = doc.createElement('span');
+        span.setAttribute('property', 'schema:addressRegion');
+        span.textContent = label;
+        address.appendChild(span);
+      }
+      if (countryCode) {
+        address.appendChild(doc.createTextNode(', '));
+        const abbr = doc.createElement('abbr');
+        abbr.setAttribute('property', 'schema:addressCountry');
+        if (countryName) abbr.setAttribute('title', countryName);
+        abbr.textContent = countryCode;
+        address.appendChild(abbr);
+      }
+    } else {
+      if (countryCode) {
+        const abbr = doc.createElement('abbr');
+        abbr.setAttribute('property', 'schema:addressCountry');
+        if (countryName) abbr.setAttribute('title', countryName);
+        abbr.textContent = countryCode;
+        address.appendChild(abbr);
+      } else {
+        const span = doc.createElement('span');
+        span.setAttribute('property', 'schema:addressCountry');
+        span.textContent = label;
+        address.appendChild(span);
+      }
+    }
+    const dd = wrapper.closest('dd');
+    if (dd && entity) dd.setAttribute('resource', entity);
+    wrapper.replaceWith(address);
+  });
+}
+
+registerDocumentTransform(transformLocationInputs);
+
+// Inverse: published address -> editable autocomplete.
+function locationInputHTML({ label = '', entity = '', locationType = '', regionCode = '', regionName = '', countryCode = '', countryName = '' } = {}) {
+  const id = generateAttributeId();
+  const esc = (s) => (s || '').replace(/"/g, '&quot;');
+  const data = [
+    entity && `data-entity="${esc(entity)}"`,
+    locationType && `data-location-type="${esc(locationType)}"`,
+    regionCode && `data-region-code="${esc(regionCode)}"`,
+    regionName && `data-region-name="${esc(regionName)}"`,
+    countryCode && `data-country-code="${esc(countryCode)}"`,
+    countryName && `data-country-name="${esc(countryName)}"`,
+  ].filter(Boolean).join(' ');
+  return `<div class="autocomplete" rel="schema:address"><input name="${id}-event-location" placeholder="${i18n.t('cv.placeholder.location')}" value="${esc(label)}" ${data} type="text" /></div>`;
+}
+
+function transformLocationsToInputs(root) {
+  if (!root || !isCV(root)) return;
+
+  root.querySelectorAll('span[rel~="schema:address"]').forEach((address) => {
+    const locality = address.querySelector('[property~="schema:addressLocality"]');
+    const region = address.querySelector('[property~="schema:addressRegion"]');
+    const country = address.querySelector('[property~="schema:addressCountry"]');
+    const dd = address.closest('dd');
+
+    let locationType, label;
+    if (locality) {
+      locationType = 'addressLocality';
+      label = locality.textContent.trim();
+    } else if (region) {
+      locationType = 'addressRegion';
+      label = region.getAttribute('title') || region.textContent.trim();
+    } else {
+      locationType = 'addressCountry';
+      label = country ? (country.getAttribute('title') || country.textContent.trim()) : '';
+    }
+
+    address.replaceWith(fragmentFromString(locationInputHTML({
+      label,
+      entity: dd ? (dd.getAttribute('resource') || '') : '',
+      locationType,
+      regionCode: region ? region.textContent.trim() : '',
+      regionName: region ? (region.getAttribute('title') || '') : '',
+      countryCode: country ? country.textContent.trim() : '',
+      countryName: country ? (country.getAttribute('title') || '') : '',
+    })));
+  });
+}
+
+registerEditorParseTransform(transformLocationsToInputs);
+
+// Skill autocomplete -> published markup.
+function transformSkillInputs(doc) {
+  const article = selectArticleNode(doc);
+  if (!article || !isCV(article)) return;
+
+  article.querySelectorAll('.autocomplete').forEach((wrapper) => {
+    const input = wrapper.querySelector('input[data-autocomplete="skill"]');
+    if (!input) return;
+    const title = (input.value || input.getAttribute('value') || '').trim();
+    const uri = input.getAttribute('data-entity') || '';
+    if (!title) { wrapper.remove(); return; }
+    if (uri) {
+      const a = doc.createElement('a');
+      a.setAttribute('property', 'schema:skills');
+      a.setAttribute('href', uri);
+      a.textContent = title;
+      wrapper.replaceWith(a);
+    } else {
+      const span = doc.createElement('span');
+      span.setAttribute('property', 'schema:skills');
+      span.textContent = title;
+      wrapper.replaceWith(span);
+    }
+  });
+}
+
+registerDocumentTransform(transformSkillInputs);
+
+// Inverse: published skill -> editable autocomplete.
+function transformSkillsToInputs(root) {
+  if (!root || !isCV(root)) return;
+
+  root.querySelectorAll('[property~="schema:skills"]').forEach((el) => {
+    const title = el.textContent.trim();
+    const uri = el.tagName === 'A' ? (el.getAttribute('href') || '') : '';
+    el.replaceWith(fragmentFromString(skillInputHTML({ title, uri })));
+  });
+}
+
+registerEditorParseTransform(transformSkillsToInputs);
+
+// Organizer/department anchors -> published semantic attributes + department span wrapper.
+function transformOrganizerInputs(doc) {
+  const article = selectArticleNode(doc);
+  if (!article || !isCV(article)) return;
+
+  article.querySelectorAll('p.event-organization-name').forEach((p) => {
+    const a = p.querySelector('a');
+    if (a) {
+      a.setAttribute('property', 'schema:name');
+      a.setAttribute('rel', 'schema:url');
+    }
+    p.replaceWith(...Array.from(p.childNodes));
+  });
+
+  article.querySelectorAll('p.event-organization-department-name').forEach((p) => {
+    const a = p.querySelector('a');
+    if (a) {
+      a.setAttribute('property', 'schema:name');
+      a.setAttribute('rel', 'schema:url');
+    }
+    const span = doc.createElement('span');
+    span.setAttribute('rel', 'schema:department');
+    span.setAttribute('resource', `#${generateAttributeId()}`);
+    span.append(...Array.from(p.childNodes));
+    p.replaceWith(doc.createTextNode(' '), span);
+  });
+}
+
+registerDocumentTransform(transformOrganizerInputs);
+
+// Inverse: strip the semantic attributes and unwrap the department span on re-edit.
+function transformOrganizerToInputs(root) {
+  if (!root || !isCV(root)) return;
+
+  root.querySelectorAll('dd[rel~="schema:organizer"]').forEach((dd) => {
+    const deptSpan = dd.querySelector(':scope > span[rel~="schema:department"]');
+
+    const deptP = document.createElement('p');
+    deptP.className = 'event-organization-department-name';
+    deptP.setAttribute('data-placeholder', 'Department');
+    if (deptSpan) {
+      const a = deptSpan.querySelector('a');
+      if (a) { a.removeAttribute('property'); a.removeAttribute('rel'); }
+      deptP.append(...Array.from(deptSpan.childNodes));
+      deptSpan.remove();
+    }
+
+    const orgP = document.createElement('p');
+    orgP.className = 'event-organization-name';
+    orgP.setAttribute('data-placeholder', 'Organizer');
+    const orgA = dd.querySelector(':scope > a');
+    if (orgA) { orgA.removeAttribute('property'); orgA.removeAttribute('rel'); }
+    orgP.append(...Array.from(dd.childNodes));
+
+    dd.append(orgP, deptP);
+  });
+}
+
+registerEditorParseTransform(transformOrganizerToInputs);
+
+// data-placeholder is an editor-only hint for empty fields; drop it in read mode.
+function removePlaceholders(doc) {
+  const article = selectArticleNode(doc);
+  if (!article) return;
+  article.querySelectorAll('[data-placeholder]').forEach(el => el.removeAttribute('data-placeholder'));
+}
+
+// Inverse: re-add the editor-only hints on entering author mode; event fields are handled by restoreEventFields.
+const PLACEHOLDERS = [
+  ['[data-cv-section="skills"] dl > dt', 'Category name'],
+];
+
+function addPlaceholders(root) {
+  if (!root || !isCV(root)) return;
+  PLACEHOLDERS.forEach(([selector, text]) => {
+    root.querySelectorAll(selector).forEach(el => {
+      if (!el.getAttribute('data-placeholder')) el.setAttribute('data-placeholder', text);
+    });
+  });
+}
+
+registerEditorParseTransform(addPlaceholders);
+
+// On author switch, re-add any missing event field (dt/dd pair) in canonical order with its placeholder.
+function restoreEventFields(root) {
+  if (!root || !isCV(root)) return;
+  root.querySelectorAll(EVENT_SELECTOR).forEach((dl) => {
+    const eventId = dl.getAttribute('id') || generateAttributeId();
+    const typeofTokens = (dl.getAttribute('typeof') || '').split(/\s+/);
+    const sectionType = typeofTokens.map(t => EVENT_SECTION_BY_TYPE[t]).find(Boolean) ?? 'experience';
+    EVENT_FIELDS_ORDER.forEach((key, idx) => {
+      if (dl.querySelector(`:scope > dt.event-${key}`) || dl.querySelector(EVENT_FIELD_DD_SELECTOR[key])) return;
+      let anchor = null;
+      for (let j = idx + 1; j < EVENT_FIELDS_ORDER.length; j++) {
+        anchor = dl.querySelector(`:scope > dt.event-${EVENT_FIELDS_ORDER[j]}`);
+        if (anchor) break;
+      }
+      const frag = fragmentFromString(eventFieldHTML(key, eventId, sectionType));
+      if (anchor) anchor.before(frag); else dl.append(frag);
+    });
+  });
+}
+
+registerEditorParseTransform(restoreEventFields);
+
+// True when an event <dd> carries no real value, ignoring label chrome and always-present separators.
+function isEventFieldEmpty(dd) {
+  const clone = dd.cloneNode(true);
+  clone.querySelectorAll('label').forEach(el => el.remove());
+  if (clone.textContent.replace(/[\s,–—-]+/g, '')) return false;
+  if (clone.querySelector('img, iframe, audio, video, svg, object, embed')) return false;
+  if (Array.from(clone.querySelectorAll('input')).some(i => (i.getAttribute('value') || '').trim())) return false;
+  if (Array.from(clone.querySelectorAll('time')).some(t => (t.getAttribute('datetime') || t.textContent).trim())) return false;
+  return true;
+}
+
+// Drop empty event fields (dt/dd pairs and orphan dts); restoreEventFields re-adds them on the next author switch.
+function pruneEmptyEventFields(dl) {
+  Array.from(dl.children).forEach((dt) => {
+    if (dt.tagName !== 'DT') return;
+    const dd = dt.nextElementSibling;
+    const hasDd = dd && dd.tagName === 'DD';
+    if (!hasDd || isEventFieldEmpty(dd)) {
+      dt.remove();
+      if (hasDd) dd.remove();
+    }
+  });
+}
+
+// Drop completely empty items; loops so emptying children can empty parents.
+function pruneEmptyItems(doc) {
+  const article = selectArticleNode(doc);
+  if (!article) return;
+
+  // Event entries: prune each empty field, then drop the whole <li> if nothing is left.
+  article.querySelectorAll(EVENT_SELECTOR).forEach((dl) => {
+    pruneEmptyEventFields(dl);
+    const clone = dl.cloneNode(true);
+    clone.querySelectorAll('dt, label').forEach(el => el.remove());
+    const text = clone.textContent.replace(/[\s,–—-]+/g, '');
+    if (!text && !clone.querySelector('img, iframe, audio, video, svg')) {
+      (dl.closest('li') || dl).remove();
+    }
+  });
+
+  const keep = 'img, hr, input, time, iframe, audio, video, svg, object, embed';
+  const isEmpty = (el) => !el.textContent.trim() && !el.querySelector(keep);
+  // p[rel] is scoped to award/credential entries, not event fields that must survive as editable.
+  const selector = '[data-cv-section="skills"] dl dd, [data-cv-section="skills"] dl, li, p[property~="schema:award"], p[rel~="schema:hasCredential"]';
+  let changed = true;
+  while (changed) {
+    changed = false;
+    article.querySelectorAll(selector).forEach((el) => {
+      if (isEmpty(el)) { el.remove(); changed = true; }
+    });
+  }
+}
+
+registerDocumentTransform(pruneEmptyItems);
+
+export function setTemplateNewCV(mode, options) {
+  // TODO: Remove aria-label when content is updated
+  prepareDocumentForTemplate();
+  replaceDocumentBody(`<main><article about="" dir="auto"><h1 aria-label="${i18n.t('editor.new.h1.aria-label')}" property="schema:name"></h1></article></main>`);
+
+  //TODO: i18n
+  let userDetails = {
+    IRI: Config.User.IRI || 'https://example.org/profile/card#me',
+    Name: Config.User.Name || 'Your Name',
+    Email: Config.User.Email || 'you@example.org',
+  };
+
+  const documentDetails = documentDetailsHTML([
+    { id: 'document-identifier', dt: 'Identifier', dds: [`<a href="${Config.DocumentURL}">${Config.DocumentURL}</a>`] },
+    { id: 'document-authors', dt: 'Author', dds: [`<a href="${userDetails.IRI}" rel="schema:creator schema:publisher schema:author" typeof="schema:Person">${userDetails.Name}</a>`] },
+    { id: 'document-primary-topic', dt: 'Topic', dds: [`
+      <p><a href="${userDetails.IRI}" rel="foaf:primaryTopic">${userDetails.Name}</a></p>
+      <dl>
+        <dt>WebID</dt>
+        <dd><a href="${userDetails.IRI}">${userDetails.IRI}</a></dd>
+        <dt>Email</dt>
+        <dd><a href="mailto:${userDetails.Email}">${userDetails.Email}</a></dd>
+      </dl>`] },
+    { id: 'document-type', dt: 'Document Type', dds: [
+      `<a href="http://xmlns.com/foaf/0.1/PersonalProfileDocument" rel="rdf:type">Personal Profile Document</a>`,
+      `<a href="http://w3id.org/roh#CurriculumVitae" rel="rdf:type">Curriculum Vitae</a>`,
+    ] },
+  ]);
+
+  const article = document.querySelector('main > article');
+  article.appendChild(fragmentFromString(documentDetails));
+  article.appendChild(fragmentFromString(defaultContentHTML()));
+}
+
+// Render the nav and wire add/remove. Safe to call repeatedly.
+export function initCV() {
+  const root = getCVRoot();
+  if (!root || !isCV(root)) return;
+
+  refreshTOC(root);
+
+  if (!clickHandlerAttached) {
+    clickHandlerAttached = true;
+    // Section add/remove is handled by the generic sections.js click handler.
+    document.addEventListener('click', (e) => {
+      const root = getCVRoot();
+      if (!root) return;
+      const addEntry = e.target.closest('.cv-entry-add');
+      if (addEntry) {
+        const type = addEntry.dataset.type;
+        const sectionId = addEntry.dataset.sectionId;
+        const entryHTML = SECTIONS[type]?.entryHTML;
+        if (entryHTML && sectionId) {
+          pmEditor()?.insertFragmentAtEndOfChild(`#${sectionId}`, 'ul', fragmentFromString(entryHTML()));
+        }
+        return;
+      }
+
+    });
+
+    setupAutocomplete('input[name$="-event-location"]', getWikidataResults, showLocationSuggestions, {
+      listId: 'cv-location-suggestions',
+      debounceMs: 1000,
+    });
+
+    setupAutocomplete('input[data-autocomplete="skill"]', getEscoResults, showSkillSuggestions, {
+      listId: 'cv-skill-suggestions',
+      debounceMs: 300,
+    });
+  }
+
+  if (!authHandlerAttached) {
+    authHandlerAttached = true;
+    document.addEventListener('dokieli:auth-ready', () => {
+      const iri = Config.User?.IRI;
+      if (!iri) return;
+      const root = getCVRoot();
+      if (!root || !isCV(root)) return;
+      const editor = pmEditor();
+      if (editor) {
+        editor.setOriginalAttributeOnDescendants('#content', 'ul', 'about', iri);
+      } else {
+        root.querySelectorAll('#content > section ul').forEach(ul => {
+          if (!ul.getAttribute('about')) ul.setAttribute('about', iri);
+        });
+      }
+
+      // Person-relation sections: set rel/rev on the section's <ul>, like about.
+      Object.entries(ITEM_RELATIONS).forEach(([type, rels]) => {
+        const section = findSection(root, type);
+        if (!section) return;
+        Object.entries(rels).forEach(([attr, val]) => {
+          if (editor) {
+            if (section.id) editor.setOriginalAttributeOnDescendants(`#${section.id}`, 'ul', attr, val);
+          } else {
+            section.querySelectorAll(':scope > div > ul').forEach(ul => {
+              if (!ul.getAttribute(attr)) ul.setAttribute(attr, val);
+            });
+          }
+        });
+      });
+    });
+  }
+
+  if (!modeHandlerAttached) {
+    modeHandlerAttached = true;
+    window.addEventListener('dokieli:editor-mode-changed', (e) => {
+      const root = getCVRoot();
+      if (!root || !isCV(root)) return;
+      // Leaving author mode: collapse the live DOM's editable inputs, as on save.
+      if (e.detail?.mode !== 'author') {
+        transformDateInputs(document);
+        transformCountrySelects(document);
+        transformLocationInputs(document);
+        transformSkillInputs(document);
+        transformOrganizerInputs(document);
+        removePlaceholders(document);
+        pruneEmptyItems(document);
+      }
+      refreshTOC(root);
+  });
+  }
+}

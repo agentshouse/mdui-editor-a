@@ -1,0 +1,1342 @@
+/*!
+Copyright 2012-2026 Sarven Capadisli <https://csarven.ca/>
+Copyright 2023-2026 Virginia Balseiro <https://virginiabalseiro.com/>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+import { schema } from "../schema/base.js"
+import { NodeSelection } from "prosemirror-state"
+import { Icon } from "../../ui/icons.js"
+import { getButtonHTML, updateButtons } from "../../ui/buttons.js"
+import { getAnnotationInboxLocationHTML, getAnnotationLocationHTML, getDocument, getLanguageOptionsHTML, getLicenseOptionsHTML, getReferenceLabel } from "../../doc.js";
+import { cloneSelection, selectionToTextQuote, setSelectionFromTextQuote, getSelectedParentElement } from "../utils/annotation.js";
+import { applyMarksFromTextQuote, applyMarkFromSelector } from "@dokieli/web-annotation";
+import { fragmentFromString, getDocumentContentNode, selectArticleNode } from "../../utils/html.js";
+import { isUnlocked, hasKeystore } from '../../keystore.js';
+import { isPublicRead } from '../../access.js';
+import { getLinkRelation } from "../../graph.js";
+import Config from "../../config.js";
+import { i18n } from "../../i18n.js";
+
+const ns = Config.ns;
+
+// Keep in sync with the matching @media blocks in dokieli.css and basic.css
+export const COMPACT_LAYOUT_QUERY = '(max-width: 768px)';
+
+export class ToolbarView {
+  constructor(mode, buttons, editorView) {
+    this.mode = mode;
+    this.toolbarCommands = this.getToolbarCommands();
+
+    this.toolbarPopups = this.getToolbarPopups()
+    this.selection = null;
+
+    this.buttons = buttons.map(button => {
+      return { 
+        button, 
+        command: this.toolbarCommands[button], 
+        dom: () => fragmentFromString(getButtonHTML({ button })).firstChild 
+      } 
+    })
+
+    this.populateForms = this.getPopulateForms();
+
+    // Default empty formHandlers, listeners (subclasses should override)
+    this.formHandlers = this.getFormHandlers();
+
+    this.formLegends = this.getFormLegends();
+    this.formPlaceholders = this.getFormPlaceholders();
+
+    // Bind event handlers
+    this.bindFormHandlers();
+
+    this.formEventListeners = this.getFormEventListeners();
+    this.toolbarButtonEventListeners = this.getFormEventListeners();
+    this.toolbarButtonClickHandlers = this.getToolbarButtonClickHandlers();
+
+    // for PM stuff
+    this.editorView = editorView;
+
+    // for DOM stuff
+    this.documentBody = editorView?.dom.parentNode ?? document.body;
+
+    this.dom = document.createElement("div");
+    this.dom.id = 'document-editor';
+    this.dom.className = 'do editor-toolbar editor-form-view-transition';
+    this.dom.setAttribute('lang', Config.User.UI.Language);
+    this.dom.setAttribute('xml:lang', Config.User.UI.Language);
+    this.dom.setAttribute('dir', Config.User.UI.LanguageDir);
+
+    this.compactLayoutQuery = window.matchMedia?.(COMPACT_LAYOUT_QUERY) ?? null;
+    this.isCompactLayout = this.compactLayoutQuery?.matches ?? false;
+
+    this.addToolbar();
+
+    this.selectionHandler = (e) => this.selectionUpdate(editorView);
+
+    this.updateToolbarVisibilityHandler = (e) => this.updateToolbarVisibility(e);
+
+    // Touch selection never fires mouseup; debounced since selectionchange fires per character
+    this.selectionChangeHandler = () => {
+      clearTimeout(this.selectionChangeTimer);
+      this.selectionChangeTimer = setTimeout(() => this.selectionUpdate(editorView), 150);
+    };
+
+    document.removeEventListener("keyup", this.selectionHandler);
+    document.removeEventListener("mouseup", this.selectionHandler);
+    document.removeEventListener("selectionchange", this.selectionChangeHandler);
+    document.removeEventListener("touchend", this.selectionChangeHandler);
+
+    document.addEventListener("keyup", this.selectionHandler);
+    document.addEventListener("mouseup", this.selectionHandler);
+
+    if (this.isCompactLayout) {
+      document.addEventListener("selectionchange", this.selectionChangeHandler);
+      document.addEventListener("touchend", this.selectionChangeHandler);
+    }
+
+    this.updateToolbarVisibility = this.updateToolbarVisibility.bind(this);
+    this.formClickHandler = this.formClickHandler.bind(this);
+    this.selectionUpdate = this.selectionUpdate.bind(this);
+    // this.cleanupToolbar = this.cleanupToolbar.bind(this);
+    // this.clearToolbarForm = this.clearToolbarForm.bind(this);
+
+    // On touch, mousedown arrives after the tap has already collapsed the selection
+    document.removeEventListener("pointerdown", this.updateToolbarVisibilityHandler);
+    document.addEventListener("pointerdown", this.updateToolbarVisibilityHandler);
+
+    this.preserveSelectionHandler = (e) => {
+      if (e.target.closest('input, textarea, select, [contenteditable="true"]')) return;
+      // Keep the selection when pressing buttons; popup text stays selectable
+      if (e.target.closest('.editor-form') && !e.target.closest('button')) return;
+      e.preventDefault();
+    };
+    this.dom.addEventListener("mousedown", this.preserveSelectionHandler);
+
+    if (this.isCompactLayout) {
+      this.trackViewportInset();
+    }
+
+    // Markup is shared; CSS restyles it at the breakpoint, only behavior switches here
+    this.compactLayoutChangeHandler = (e) => {
+      const selection = window.getSelection();
+      const wasOpen = this.dom.classList.contains('editor-form-active');
+      const keepOpen = wasOpen && !!selection?.rangeCount && !selection.isCollapsed;
+
+      this.isCompactLayout = e.matches;
+
+      if (e.matches) {
+        document.addEventListener("selectionchange", this.selectionChangeHandler);
+        document.addEventListener("touchend", this.selectionChangeHandler);
+        this.trackViewportInset();
+      }
+      else {
+        document.removeEventListener("selectionchange", this.selectionChangeHandler);
+        document.removeEventListener("touchend", this.selectionChangeHandler);
+        this.stopTrackingViewportInset();
+        ['bottom', 'left', 'width', 'top', 'right'].forEach(p => this.dom.style.removeProperty(p));
+        this.dom.querySelectorAll('.editor-form, .editor-dropdown-panel').forEach(el => {
+          el.style.removeProperty('max-height');
+        });
+      }
+
+      this.updateCompactPresentation();
+
+      if (keepOpen) {
+        this.selectionUpdate(this.editorView);
+      }
+    };
+    this.compactLayoutQuery?.addEventListener('change', this.compactLayoutChangeHandler);
+
+    this.updateCompactPresentation();
+  }
+
+  // Presentation CSS cannot express, e.g. option text; subclasses override
+  updateCompactPresentation() {}
+
+  initializeButtons(buttons) {
+    buttons.forEach(({ button, command, dom }) => {
+        const buttonNode = this.createButtonNode(button, dom);
+        const listItem = document.createElement("li");
+        listItem.appendChild(buttonNode);
+        this.ul.appendChild(listItem);
+
+        this.updateButtonState(schema, buttonNode, button, this.editorView);
+        this.setupPopup(button);
+        this.attachButtonHandler(buttonNode, button, command);
+    });
+  }
+
+  createButtonNode(button, domFunction) {
+    const buttonNode = domFunction();
+    buttonNode.id = 'editor-button-' + button;
+    return buttonNode;
+  }
+
+  setupPopup(button) {
+    const formControlsHTML = this.toolbarPopups[button]; // returns a function that builds the form HTML
+    if (!formControlsHTML) return;
+
+    const toolbarForm = document.createElement('form');
+    toolbarForm.classList.add('editor-form');
+    toolbarForm.id = 'editor-form-' + button;
+    toolbarForm.appendChild(fragmentFromString(`${formControlsHTML({ button, legend: this.formLegends[button], placeholder: this.formPlaceholders[button] })}`));
+
+    this.dom.appendChild(toolbarForm);
+
+    if (this.formEventListeners[button]) {
+      this.formEventListeners[button].forEach(({ event, callback }) => {
+        toolbarForm.addEventListener(event, callback);
+      });
+    }
+
+    const disclosures = FORM_DISCLOSURES
+      .map(([toggleSelector, fieldsSelector]) => ({
+        toggle: toolbarForm.querySelector(toggleSelector),
+        fields: toolbarForm.querySelector(fieldsSelector),
+      }))
+      .filter(({ toggle, fields }) => toggle && fields);
+
+    const setDisclosure = ({ toggle, fields }, open) => {
+      toggle.setAttribute('aria-expanded', String(open));
+      toggle.classList.toggle('editor-form-icon-toggle-active', open);
+      fields.hidden = !open;
+    };
+
+    setupIconToggleTitles(toolbarForm);
+
+    disclosures.forEach((disclosure) => {
+      disclosure.toggle.addEventListener('click', (e) => {
+        e.preventDefault();
+        const open = disclosure.toggle.getAttribute('aria-expanded') !== 'true';
+        // Sections are exclusive: opening one closes the other
+        disclosures.forEach((other) => setDisclosure(other, other === disclosure && open));
+        if (open) {
+          disclosure.fields.querySelector('input, select, textarea')?.focus();
+        }
+      });
+    });
+  }
+
+  // Touch taps can collapse the selection before the handler runs; author mode is ProseMirror's
+  restoreLostSelection() {
+      if (this.mode !== 'social' || !this.selectionTextQuote) return;
+      const selection = window.getSelection();
+      if (selection?.rangeCount && !selection.isCollapsed) return;
+      const article = selectArticleNode(document);
+      if (article) setSelectionFromTextQuote(article, this.selectionTextQuote);
+  }
+
+  attachButtonHandler(buttonNode, button, command) {
+      const custom = this.toolbarButtonClickHandlers[button];
+      const handler = custom ? ((e) => { this.restoreLostSelection(); return custom(e); }) : ((e) => {
+          this.restoreLostSelection();
+          e.preventDefault();
+          e.stopPropagation();
+          if (this.signInRequired(button)) {
+              this.checkAnnotationServiceUpdateForm(button);
+          }
+
+          this.toggleButtonState(buttonNode, button, command);
+          this.handlePopups(button);
+      });
+
+      buttonNode.addEventListener("click", handler);
+  }
+
+  toggleButtonState(buttonNode, button, command) {
+      this.closeAllDropdowns();
+      this.editorView?.focus();
+      buttonNode.classList.toggle('editor-button-active');
+
+      if (command) {
+          command(this.editorView.state, this.editorView.dispatch, this.editorView);
+      }
+
+      this.buttons.forEach(({ button: btn }) => {
+          const btnNode = this.dom.querySelector(`#editor-button-${btn}`);
+          if (!this.toolbarPopups[btn]) {
+              this.updateButtonState(schema, btnNode, btn, this.editorView);
+          } else if (btn !== button) {
+              btnNode.classList.remove('editor-button-active');
+          }
+      });
+  }
+
+  handlePopups(button) {
+      if (!this.toolbarPopups[button]) return;
+
+      const toolbarForm = this.dom.querySelector(`#editor-form-${button}`);
+      this.closeOtherPopups(button);
+
+      if (this.populateForms[button]) {
+        const state = this.editorView?.state;
+        this.populateForms[button](button, toolbarForm, state);
+      }
+      
+      toolbarForm.classList.toggle('editor-form-active');
+
+      this.positionPopup(toolbarForm);
+
+      const formContent = toolbarForm.querySelector(`textarea#${button}-content`);
+      const formFirstInput = toolbarForm.querySelector('input');
+      const formFirstSelect = toolbarForm.querySelector('select');
+
+      if (formContent) {
+        formContent.focus();
+      }
+      else if (formFirstInput) {
+        formFirstInput.focus();
+      } 
+      else if (formFirstSelect) {
+        formFirstSelect.focus();
+      }
+
+      const lastClickedButton = this.dom.querySelector(`#editor-button-${button}`);
+      
+      const handleEscKey = (event) => {
+        if (event.key === "Escape") {
+          this.clearToolbarForm(toolbarForm);
+          this.clearToolbarButton(button);
+          document.removeEventListener("keydown", handleEscKey);
+          lastClickedButton.focus();
+        }
+      }
+      document.addEventListener("keydown", handleEscKey);
+  }
+
+  closeOtherPopups(activeButton) {
+      this.buttons.forEach(({ button: b }) => {
+          if (b !== activeButton && this.toolbarPopups[b]) {
+              this.dom.querySelector(`#editor-form-${b}`).classList.remove('editor-form-active');
+          }
+      });
+  }
+
+  // position:fixed uses the layout viewport, which ignores the soft keyboard and horizontal overflow
+  trackViewportInset() {
+      const vv = window.visualViewport;
+      if (!vv) return;
+
+      const apply = () => {
+        if (!this.isCompactLayout) return;
+        const inset = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+        this.dom.style.setProperty('bottom', `${inset}px`, 'important');
+        this.dom.style.setProperty('left', `${vv.offsetLeft}px`, 'important');
+        this.dom.style.setProperty('width', `${vv.width}px`, 'important');
+
+        // Popups inherit the toolbar's width; the cap keeps them above the keyboard
+        const availableHeight = Math.max(180, vv.height - this.dom.offsetHeight - 12);
+        this.dom.querySelectorAll('.editor-form, .editor-dropdown-panel').forEach(el => {
+          el.style.setProperty('max-height', `${availableHeight}px`, 'important');
+        });
+
+        // Slash menu is a body child at the cursor; pin it above the bar and keyboard
+        const slashMenu = document.getElementById('document-slashmenu');
+        if (slashMenu) {
+          slashMenu.style.setProperty('bottom', `${inset + this.dom.offsetHeight}px`, 'important');
+          slashMenu.style.setProperty('left', `${vv.offsetLeft}px`, 'important');
+          slashMenu.style.setProperty('width', `${vv.width}px`, 'important');
+          slashMenu.style.setProperty('max-height', `${availableHeight}px`, 'important');
+        }
+      };
+
+      if (!this.viewportInsetHandler) {
+        this.viewportInsetHandler = apply;
+        vv.addEventListener('resize', this.viewportInsetHandler);
+        vv.addEventListener('scroll', this.viewportInsetHandler);
+      }
+
+      apply();
+  }
+
+  stopTrackingViewportInset() {
+      if (!this.viewportInsetHandler || !window.visualViewport) return;
+      window.visualViewport.removeEventListener('resize', this.viewportInsetHandler);
+      window.visualViewport.removeEventListener('scroll', this.viewportInsetHandler);
+      this.viewportInsetHandler = null;
+  }
+
+  positionPopup(toolbarForm) {
+      // Reapply popup sizing: clearToolbarForm strips the inline styles on close
+      if (this.isCompactLayout) {
+        this.trackViewportInset();
+        return;
+      }
+      const margin = 10;
+      const toolbarHeight = this.dom.offsetHeight;
+      const toolbarWidth = this.dom.offsetWidth;
+
+      const toolbarRect = this.dom.getBoundingClientRect();
+      const formWidth = toolbarForm.offsetWidth;
+      const centeredLeft = toolbarRect.left + (toolbarWidth / 2) - (formWidth / 2);
+      const clampedLeft = Math.max(margin, Math.min(centeredLeft, window.innerWidth - formWidth - margin));
+      toolbarForm.style.left = `${clampedLeft - toolbarRect.left}px`;
+      toolbarForm.style.right = 'initial';
+
+      const selection = window.getSelection();
+      if (!selection || !selection.rangeCount) {
+          toolbarForm.style.top = `${toolbarHeight + margin / 2}px`;
+          return;
+      }
+
+      const range = selection.getRangeAt(0);
+      const selectionPosition = range.getBoundingClientRect();
+
+      if ((selectionPosition.top >= toolbarHeight + margin * 2) && (window.innerHeight - selectionPosition.bottom >= toolbarForm.offsetHeight + margin * 2)) {
+          toolbarForm.style.top = `${toolbarHeight + selectionPosition.height + margin * 1.5}px`;
+      } else if (selectionPosition.top >= toolbarHeight + toolbarForm.offsetHeight  + margin * 2) {
+          toolbarForm.style.top = `-${toolbarForm.offsetHeight + margin / 2}px`;
+      } else {
+          toolbarForm.style.top = `${toolbarHeight + margin / 2}px`;
+      }
+  }
+
+  // TODO: define default behavior for all of these methods
+
+  replaceSelectionWithFragment() {
+
+  }
+
+  getSelectionAsHTML() {
+
+  }
+
+  
+  getToolbarPopups() {
+    return {}
+  }
+
+  getToolbarCommands() {
+    return {}
+  }
+
+  getFormHandlers() {
+    return [];
+  }
+
+  getFormLegends() {
+    return {};
+  }
+
+  getFormPlaceholders() {
+    return {};
+  }
+
+  bindFormHandlers() {
+    this.getFormHandlers().forEach(handler => {
+      this[handler.name] = handler.fn.bind(this);
+    });
+  }
+
+  getToolbarButtonClickHandlers() {
+    return {}
+  }
+
+  getFormEventListeners() {
+    return {};
+  }
+
+  updateToolbarVisibility() {
+    return;
+  }
+
+  addToolbar() {
+    const documentEditor = document.getElementById('document-editor');
+
+    if (documentEditor) {
+      documentEditor.remove();
+    }
+
+    // Full reset, otherwise rebuilding duplicates the dropdown panels
+    this.dom.replaceChildren();
+
+    this.ul = document.createElement('ul');
+    this.ul.classList.add('editor-form-actions');
+    this.dom.appendChild(this.ul);
+    document.body.appendChild(this.dom);
+
+    this.beforeButtons();
+    this.initializeButtons(this.buttons);
+    this.afterButtons();
+  }
+
+  beforeButtons() {}
+
+  afterButtons() {
+    this.getSubmenuButtons().forEach(button => {
+      const li = this.dom.querySelector(`#editor-button-${button}`)?.closest('li');
+      if (li) li.classList.add('editor-submenu-button');
+    });
+
+    this.initializeDropdownMenus(this.getDropdownMenus());
+
+    const modeToggle = this.getModeToggle();
+    if (modeToggle) this.addModeToggleButton(modeToggle);
+  }
+
+  getSubmenuButtons() { return []; }
+
+  getDropdownMenus() { return {}; }
+
+  getModeToggle() { return null; }
+
+  initializeDropdownMenus(dropdowns) {
+    Object.entries(dropdowns).forEach(([name, config]) => {
+      const li = document.createElement('li');
+      li.className = 'editor-dropdown-menu';
+
+      const trigger = document.createElement('button');
+      trigger.id = `editor-dropdown-trigger-${name}`;
+      trigger.className = 'editor-dropdown-trigger';
+      trigger.type = 'button';
+      trigger.setAttribute('title', config.title || config.label);
+      trigger.setAttribute('aria-haspopup', 'menu');
+      trigger.setAttribute('aria-expanded', 'false');
+      trigger.setAttribute('aria-controls', `editor-dropdown-panel-${name}`);
+
+      if (config.icon) {
+        trigger.appendChild(fragmentFromString(config.icon));
+      } else {
+        const triggerLabel = document.createElement('span');
+        triggerLabel.textContent = config.label;
+        trigger.appendChild(triggerLabel);
+      }
+      trigger.appendChild(fragmentFromString(`<span class="editor-dropdown-trigger-caret">${Icon['.fas.fa-caret-down']}</span>`));
+
+      const panel = document.createElement('ul');
+      panel.className = 'editor-dropdown-panel';
+      panel.id = `editor-dropdown-panel-${name}`;
+
+      if (config.sectionLabel) {
+        const sectionLi = document.createElement('li');
+        sectionLi.className = 'editor-dropdown-section-label';
+        sectionLi.textContent = config.sectionLabel;
+        panel.appendChild(sectionLi);
+      }
+
+      config.items.forEach(item => {
+        if (item.section) {
+          const sectionLi = document.createElement('li');
+          sectionLi.className = 'editor-dropdown-section-label';
+          sectionLi.textContent = item.section;
+          panel.appendChild(sectionLi);
+        }
+
+        const itemLi = document.createElement('li');
+        const itemBtn = document.createElement('button');
+        itemBtn.type = 'button';
+        itemBtn.className = 'editor-dropdown-item';
+
+        if (item.icon) {
+          itemBtn.appendChild(fragmentFromString(item.icon));
+          itemBtn.querySelector('svg')?.setAttribute('aria-hidden', 'true');
+        }
+        else {
+          const iconPlaceholder = document.createElement('span');
+          iconPlaceholder.className = 'editor-dropdown-item-icon-placeholder';
+          iconPlaceholder.setAttribute('aria-hidden', 'true');
+          itemBtn.appendChild(iconPlaceholder);
+        }
+
+        const textSpan = document.createElement('span');
+        textSpan.className = 'editor-dropdown-item-text';
+        const labelSpan = document.createElement('span');
+        labelSpan.className = 'editor-dropdown-item-label';
+        labelSpan.textContent = item.label;
+        textSpan.appendChild(labelSpan);
+        if (item.description) {
+          const descSpan = document.createElement('span');
+          descSpan.className = 'editor-dropdown-item-desc';
+          descSpan.textContent = item.description;
+          textSpan.appendChild(descSpan);
+        }
+        itemBtn.appendChild(textSpan);
+
+        itemBtn.addEventListener('mousedown', (e) => e.preventDefault());
+        itemBtn.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          panel.classList.remove('editor-dropdown-panel-active');
+          trigger.classList.remove('editor-button-active');
+          item.action();
+        });
+
+        itemLi.appendChild(itemBtn);
+        panel.appendChild(itemLi);
+      });
+
+      trigger.addEventListener('mousedown', (e) => e.preventDefault());
+      trigger.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (document.activeElement && this.dom.contains(document.activeElement)) {
+          document.activeElement.blur();
+        }
+        const isActive = panel.classList.contains('editor-dropdown-panel-active');
+        this.closeAllDropdowns();
+        if (!isActive) {
+          panel.classList.add('editor-dropdown-panel-active');
+          trigger.classList.add('editor-button-active');
+          trigger.setAttribute('aria-expanded', 'true');
+          this.positionDropdownPanel(trigger, panel);
+        }
+      });
+
+      li.appendChild(trigger);
+      this.ul.appendChild(li);
+      this.dom.appendChild(panel);
+    });
+  }
+
+  positionDropdownPanel(trigger, panel) {
+    if (this.isCompactLayout) {
+      this.trackViewportInset();
+      return;
+    }
+    const triggerRect = trigger.getBoundingClientRect();
+    const toolbarRect = this.dom.getBoundingClientRect();
+    let left = triggerRect.left - toolbarRect.left;
+    const maxLeft = toolbarRect.width - panel.offsetWidth;
+    panel.style.left = `${Math.max(0, Math.min(left, maxLeft))}px`;
+    panel.style.top = `${this.dom.offsetHeight}px`;
+  }
+
+  addModeToggleButton({ label, targetMode, icon }) {
+    const li = document.createElement('li');
+    li.className = 'editor-mode-toggle';
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'editor-mode-toggle-btn';
+    btn.setAttribute('title', label);
+    btn.setAttribute('aria-label', label);
+    const iconMarkup = Icon[icon] || icon;
+    if (iconMarkup) {
+      btn.appendChild(fragmentFromString(iconMarkup));
+    }
+    const labelSpan = document.createElement('span');
+    labelSpan.className = 'editor-mode-toggle-label';
+    labelSpan.textContent = label;
+    btn.appendChild(labelSpan);
+    btn.addEventListener('mousedown', (e) => e.preventDefault());
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.switchMode(targetMode);
+    });
+
+    li.appendChild(btn);
+    this.ul.appendChild(li);
+  }
+
+  switchMode(targetMode) {
+      const sel = window.getSelection();
+      const article = selectArticleNode(document);
+      const textQuote = (sel?.rangeCount && article) ? selectionToTextQuote(article, sel) : null;
+
+      const restoreSelection = () => {
+        const newArticle = selectArticleNode(document);
+        if (newArticle) setSelectionFromTextQuote(newArticle, textQuote);
+        const toolbarView = targetMode === 'author'
+          ? Config.Editor.authorToolbarView
+          : Config.Editor.socialToolbarView;
+        toolbarView?.selectionUpdate(null);
+      };
+
+      // Author mode mounts PM with an empty Yjs-backed doc; content arrives async via localProvider.whenSynced. Wait for editor-ready before restoring selection.
+      if (textQuote && targetMode === 'author') {
+        window.addEventListener('dokieli:editor-ready', restoreSelection, { once: true });
+      }
+
+      Config.Editor.toggleEditor(targetMode);
+      if (targetMode === 'author') {
+        import('../../sync.js').then(({ enableAutoSave }) => {
+          enableAutoSave(Config.DocumentURL, { method: 'IndexedDB' });
+        });
+      }
+
+      if (textQuote && targetMode !== 'author') {
+        requestAnimationFrame(restoreSelection);
+      }
+  }
+
+  closeAllDropdowns() {
+    this.dom.querySelectorAll('.editor-dropdown-panel').forEach(p => {
+      p.classList.remove('editor-dropdown-panel-active');
+    });
+    this.dom.querySelectorAll('.editor-dropdown-trigger').forEach(t => {
+      t.classList.remove('editor-button-active');
+      t.setAttribute('aria-expanded', 'false');
+    });
+    // Also close any open popup forms
+    this.dom.querySelectorAll('.editor-form.editor-form-active').forEach(f => {
+      f.classList.remove('editor-form-active');
+    });
+  }
+
+  getPopulateForms() {
+    return {};
+  }
+
+  signInRequired(button) {
+    return;
+  }
+
+  // hides toolbar, updates state of all buttons, hides and resets all forms.
+  cleanupToolbar() {
+    this.dom.classList.remove("editor-form-active");
+    this.closeAllDropdowns();
+
+// update buttons
+    this.buttons.forEach(({button}) => {
+      this.clearToolbarButton(button);
+// clear forms
+      if (this.toolbarPopups[button]) {
+        const toolbarForm = document.querySelector('#editor-form-' + button + '.editor-form-active');
+        if (toolbarForm) {
+          this.clearToolbarForm(toolbarForm);
+        }
+      }
+    })
+  }
+
+  //TODO: Clear active buttons where applicable (not active marks) after clicking away, hide popups. one fn to clear eveything.
+  //FIXME: select text from right to left of a paragraph. while still click is held, let go on the left outside of the selected text. the selection disappears.
+  updateToolbarVisibility() {
+    return;
+  }
+
+  updateButtonState () {
+    return;
+  }
+
+
+  isSelectionInDoNode() {
+    const selection = window.getSelection();
+    if (!selection.rangeCount) return false;
+    const range = selection.getRangeAt(0);
+    const selectedParentElement = getSelectedParentElement(range);
+    const closestDo = selectedParentElement.closest('.do');
+    if (!closestDo) return false;
+    // image nodeView wraps <img> in .do chrome; don't let it block the toolbar
+    if (closestDo.classList.contains('editor-image-resize')) return false;
+    return true;
+  }
+  
+  // Called when there is a state change, e.g., added something to the DOM or selection change.
+  update(view) {
+    return;
+  }
+
+  // check for selection changes to position toolbar and attach event listeners to the popups, which need to have the latest selection
+  selectionUpdate(view) {
+    // const handleSelectionEnd = () => {
+      if (this.isSelectionInDoNode()) {
+        return;
+      }
+
+      // Repositioning while a popup is open moves controls out from under the pointer
+      if (this.dom.querySelector('.editor-form.editor-form-active')) {
+        return;
+      }
+
+      const selection = window.getSelection();
+      const isSelection = selection && !selection.isCollapsed;
+      const pmSelection = this.editorView?.state?.selection;
+      const isNodeSelection = pmSelection instanceof NodeSelection;
+
+      if (!isSelection && !isNodeSelection) {
+        return;
+      }
+
+      if (isSelection && (!selection.rangeCount || selection.toString().charCodeAt(0) === 10)) {
+        return;
+      }
+
+      // img selections report toString() === ""; only bail if the range also has no width/height
+      if (isSelection && !isNodeSelection && selection.toString().length === 0) {
+        const probeRect = selection.getRangeAt(0).getBoundingClientRect();
+        if (probeRect.width === 0 && probeRect.height === 0) {
+          return;
+        }
+      }
+
+
+      // Cross-node selections are supported: the annotation uses a RangeSelector
+      // (XPath start/end refined by TextQuotes) so start and end may be in
+      // different parents. No same-parent restriction here.
+
+      if (isSelection) {
+        this.selection = cloneSelection();
+        const article = selectArticleNode(document);
+        this.selectionTextQuote = article ? selectionToTextQuote(article, selection) : null;
+      }
+
+      //Get information on the selection to position the toolbar.
+      let selectedPosition;
+      if (isSelection) {
+        const range = selection.getRangeAt(0);
+        selectedPosition = range.getBoundingClientRect();
+      } else {
+        const nodeDom = this.editorView.nodeDOM(pmSelection.from);
+        const rectSource = (nodeDom && nodeDom.getBoundingClientRect) ? nodeDom : nodeDom?.parentElement;
+        if (!rectSource) return;
+        selectedPosition = rectSource.getBoundingClientRect();
+      }
+      const toolbarHeight = this.dom.offsetHeight;
+      const toolbarWidth = this.dom.offsetWidth;
+      const margin = 10;
+
+      const firstFocusable = this.dom.querySelector(
+        'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      );
+      const shouldFocus = !!(!this.dom.classList.contains("editor-form-active") && firstFocusable !== document.activeElement);
+
+      // Display the toolbar
+      // TODO: do not change visibility if the selection is within a .do element (except the annotation maybe?)
+      this.dom.classList.add("editor-form-active");
+
+      // sync block-type select with the current selection
+      if (this.blocktypeSelect && this.editorView && this.getBlockTypeKey) {
+        this.blocktypeSelect.value = this.getBlockTypeKey(this.editorView.state);
+      }
+
+      if (this.isCompactLayout) {
+        this.dom.classList.remove("toolbar-arrow-over", "toolbar-arrow-under");
+        this.dom.style.removeProperty('top');
+        this.dom.style.removeProperty('right');
+        this.trackViewportInset();
+      }
+      else {
+
+      const rawLeft = selectedPosition.left + (selectedPosition.width / 2) - (toolbarWidth / 2);
+      const clampedLeft = Math.max(0, Math.min(rawLeft, window.innerWidth - toolbarWidth));
+
+      // Find the containing block for position: absolute (offsetParent is unreliable).
+      let originLeft = -window.scrollX;
+      let originTop = -window.scrollY;
+      for (let a = this.dom.parentElement; a; a = a.parentElement) {
+        if (getComputedStyle(a).position !== 'static') {
+          const r = a.getBoundingClientRect();
+          originLeft = r.left;
+          originTop = r.top;
+          break;
+        }
+      }
+
+      this.dom.style.left = `${clampedLeft - originLeft}px`;
+
+      // Cleanup the arrow from previous toolbar poisitioning
+      this.dom.classList.remove("toolbar-arrow-over", "toolbar-arrow-under");
+
+      //Normally we want to position the toolbar above the selection, otherwise below the selection.
+      //Put the toolbar above the selection if there is enough space in the viewport above the position of the selected text's rectangle.
+
+      //1 & 2
+      if (selectedPosition.top >= toolbarHeight + (margin * 2)) {
+        this.dom.style.top = `${selectedPosition.top - originTop - toolbarHeight - margin}px`;
+        //This is just the arrow below the toolbar pointing at the selection.
+        this.dom.classList.add("toolbar-arrow-under");
+      }
+      //Put the toolbar below the selection.
+      // 3
+      else {
+        this.dom.style.top = `${selectedPosition.bottom - originTop + margin}px`;
+        this.dom.classList.add("toolbar-arrow-over");
+      }
+
+      this.dom.style.right = 'initial';
+      }
+    // }
+
+
+    if (shouldFocus) {
+      const handleTab = (event) => {
+        
+        if (event.key === "Tab") {
+          const toolbarForms = document.querySelectorAll(`.editor-form`);
+          const activeForm = Array.from(toolbarForms).filter(form => form.classList.contains('editor-form-active'))[0];
+  
+          if (activeForm) {
+            return;
+          }
+          event.preventDefault(); 
+          const focusedButton = this.dom.querySelector('.editor-form-active');
+
+          // if (!focusedButton) {
+          //   firstFocusable?.focus();
+          // }
+          if (shouldFocus && firstFocusable) {
+            firstFocusable.focus();
+          }
+
+          document.removeEventListener("keydown", handleTab);
+        }
+      };
+      document.addEventListener("keydown", handleTab);
+    }
+
+    // Dedupe: selectionUpdate runs on every selection change; stale handlers from a destroyed editorView crash PM at null.matchesNode.
+    if (this.handleEscKey) {
+      document.removeEventListener("keydown", this.handleEscKey);
+    }
+    this.handleEscKey = (event) => {
+      if (event.key === "Escape") {
+        const toolbarForms = document.querySelectorAll(`.editor-form`);
+        const activeForm = Array.from(toolbarForms).filter(form => form.classList.contains('editor-form-active'))[0];
+
+        if (activeForm) {
+          return;
+        }
+        this.dom.classList.remove("editor-form-active");
+        this.clearSelection();
+        document.removeEventListener("keydown", this.handleEscKey);
+        this.handleEscKey = null;
+      }
+    };
+
+    document.addEventListener("keydown", this.handleEscKey);
+  }
+
+  clearToolbarButton(button) {
+    const btnNode = this.dom.querySelector(`#${'editor-button-' + button}`);
+
+    if (this.toolbarPopups[button]) {
+      //Clean up all or any that's active.
+      btnNode.classList.remove('editor-button-active');
+    }
+
+    //Checks if the other buttons are connected to an applied node/mark, then make active.
+    this.updateButtonState(schema, btnNode, button, this.editorView);
+
+  }
+
+  clearToolbarForm(toolbarForm) {
+    toolbarForm.classList.remove('editor-form-active');
+    toolbarForm.removeAttribute('style');
+    toolbarForm.reset();
+
+    FORM_DISCLOSURES.forEach(([toggleSelector, fieldsSelector]) => {
+      const toggle = toolbarForm.querySelector(toggleSelector);
+      const fields = toolbarForm.querySelector(fieldsSelector);
+      if (!toggle || !fields) return;
+      toggle.setAttribute('aria-expanded', 'false');
+      toggle.classList.remove('editor-form-icon-toggle-active');
+      fields.hidden = true;
+    });
+    // TOD
+    // if (toolbarForm is editor mode) {
+    // this.editorView.focus();
+    // }
+  }
+
+  formClickHandler(e, button) {
+    var buttonNode = e.target.closest('button');
+
+    // Info, help-back and location setup buttons are handled by document-level delegates; let them bubble
+    if (buttonNode?.classList.contains('info') || buttonNode?.classList.contains('do-info-back') || buttonNode?.classList.contains('setup-annotation-location')) return;
+
+    if (buttonNode) {
+      var buttonClasses = buttonNode.classList;
+      
+      if (buttonNode.type !== 'submit') {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+
+      if (buttonClasses.contains('editor-form-cancel')) {
+        const toolbarForm = buttonNode.closest('form');
+        this.clearToolbarForm(toolbarForm);
+        this.clearToolbarButton(button);
+      }
+
+    }
+
+    const encryptLabel = e.target.closest('label.editor-form-encrypt-label');
+    if (encryptLabel) {
+      e.preventDefault();
+      const form = encryptLabel.closest('form');
+      const checkbox = form?.querySelector('input.editor-form-encrypt');
+      if (!checkbox) return;
+
+      if (checkbox.checked) {
+        checkbox.checked = false;
+      } else if (isUnlocked()) {
+        checkbox.checked = true;
+      } else {
+        hasKeystore().then(exists => {
+          import('../../dialog.js').then(({ showEncryptionSetup, showEncryptionUnlock }) => {
+            const activate = () => { checkbox.checked = true; };
+            if (exists) {
+              showEncryptionUnlock(activate);
+            } else {
+              showEncryptionSetup(activate);
+            }
+          });
+        });
+      }
+    }
+  }
+
+
+  signInRequired(button) {
+    const buttons = {
+      approve: true,
+      disapprove: true,
+      specificity: true,
+      bookmark: true,
+      comment: true
+    }
+
+    return buttons[button];
+  }
+
+  checkAnnotationServiceUpdateForm(action) {
+    const documentOptions = {
+      ...Config.DOMProcessing,
+      //sanitize: in this context, seems low risk.
+      normalize: true
+    };
+
+    getLinkRelation(ns.oa.annotationService.value, null, getDocument(null, documentOptions))
+      .then(url => {
+        Config.AnnotationService = url[0];
+        updateAnnotationServiceForm(action);
+      })
+      .catch(async reason => {
+        //TODO signinRequired
+        // this check should be on the submit handler
+        if (this.signInRequired(action) && !Config.User.IRI) {
+          // Imported here so toolbar.js doesn't statically depend on auth.js,
+          // which reaches back to this module's subclass via editor.js.
+          const { showUserIdentityInput } = await import('../../auth.js');
+          showUserIdentityInput();
+        }
+        else {
+          updateAnnotationServiceForm(action);
+        }
+      });
+  }
+
+  showSelectorFromLocation(containerNode) {
+    var motivatedBy = 'oa:highlighting';
+    var selector = getSelectorFromLocation(document.location);
+
+    if (!selector) { return; }
+
+    // TextQuoteSelector marks every match; other selectors mark the resolved range
+    var isTextQuote = selector.type == 'TextQuoteSelector';
+
+    if (isTextQuote && !(selector.exact && selector.exact.length)) { return; }
+
+    //XXX: TODO: Copied from showAnnotation
+
+    var refId = document.location.hash.substring(1);
+
+    //XXX: If already highlighted, don't run again.
+    if (document.getElementById(refId)) { return; }
+
+    var refLabel = getReferenceLabel(motivatedBy);
+
+    containerNode = containerNode || getDocumentContentNode(document);
+
+    var docRefType = '<sup class="ref-highlighting"><a rel="oa:hasTarget" href="#' + refId + '">' + refLabel + '</a></sup>';
+
+    var markOptions = { 'annotationUrl': '#' + refId, 'id': refId, 'className': 'ref do', 'reference': docRefType, 'excludeMatchesIn': '#document-notifications' };
+
+    if (isTextQuote) {
+      applyMarksFromTextQuote(containerNode, selector, markOptions);
+    }
+    else {
+      applyMarkFromSelector(containerNode, selector, markOptions);
+    }
+  }
+
+  destroy() {
+    //this.dom is #document-toolbar
+    //TODO: Also remove itself
+    if (!this.documentBody.querySelector('#document-editor')) {
+      return;
+    }
+    this.documentBody.removeChild(this.dom);
+    clearTimeout(this.selectionChangeTimer);
+    document.removeEventListener("keyup", this.selectionHandler);
+    document.removeEventListener("mouseup", this.selectionHandler);
+    document.removeEventListener("selectionchange", this.selectionChangeHandler);
+    document.removeEventListener("touchend", this.selectionChangeHandler);
+    document.removeEventListener("pointerdown", this.updateToolbarVisibilityHandler);
+    this.dom.removeEventListener("mousedown", this.preserveSelectionHandler);
+    this.compactLayoutQuery?.removeEventListener('change', this.compactLayoutChangeHandler);
+    this.stopTrackingViewportInset();
+    if (this.handleEscKey) {
+      document.removeEventListener("keydown", this.handleEscKey);
+      this.handleEscKey = null;
+    }
+  }
+}
+
+// Consider putting this elsewhere or making it part of the class
+// Non-essential fields live here, revealed by the footer's + toggle
+export function advancedFieldsHTML(content) {
+  return `<div class="editor-form-advanced" hidden="">${content}</div>`;
+}
+
+export function formFooterHTML({ action = 'post', advanced = true, controls = '', submitDisabled = '' } = {}) {
+  return `
+    <div class="editor-form-footer">
+      <span class="editor-form-footer-controls">
+        ${advanced ? `<button class="editor-form-icon-toggle editor-form-advanced-toggle" type="button" aria-expanded="false" aria-label="More options" title="More options">${Icon['.fas.fa-plus'] || '+'}<span class="editor-form-advanced-toggle-caret">${Icon['.fas.fa-caret-down']}</span></button>` : ''}
+        ${controls}
+      </span>
+      <span class="editor-form-footer-actions">
+        <button class="editor-form-cancel" data-i18n="editor.toolbar.form.cancel.button" type="button">${i18n.t('editor.toolbar.form.cancel.button.textContent')}</button>
+        <button class="editor-form-submit" data-i18n="editor.toolbar.form.${action}.button" type="submit"${submitDisabled}>${i18n.t(`editor.toolbar.form.${action}.button.textContent`)}</button>
+      </span>
+    </div>
+  `;
+}
+
+// Toggle pairs wired by setupPopup and reset by clearToolbarForm
+const FORM_DISCLOSURES = [
+  ['.editor-form-advanced-toggle', '.editor-form-advanced'],
+  ['.editor-form-sources-toggle', '.editor-form-sources'],
+];
+
+export function annotateFormControls(options) {
+  const locationHTML = getAnnotationLocationHTML(options.button);
+  // When location options exist but none are pre-checked, start with submit disabled.
+  const submitDisabled = (locationHTML.includes('type="checkbox"') && !locationHTML.includes('checked="checked"')) ? ' disabled=""' : '';
+  return `
+    <fieldset>
+      <legend><span data-i18n="editor.toolbar.${options.button}.form.legend">${options.legend}</span> <span class="editor-form-required-note"><span class="required">*</span> <span data-i18n="info.required">${i18n.t("info.required.textContent")}</span></span></legend>
+      <label class="editor-form-visually-hidden" data-i18n="editor.toolbar.note.form.label" for="${options.button}-content">${i18n.t('editor.toolbar.note.form.label.textContent')}</label>
+      <span class="editor-form-required-field">
+      <textarea class="editor-form-textarea" cols="20" data-i18n="editor.toolbar.${options.button}.form.textarea" dir="auto" id="${options.button}-content" name="${options.button}-content" placeholder="${options.placeholder}" required="" rows="5"></textarea>
+      <span class="required" aria-hidden="true">*</span>
+      </span>
+      ${advancedFieldsHTML(`
+      <label data-i18n="tags.label" for="${options.button}-tagging">${i18n.t('tags.label.textContent')}</label> <input class="editor-form-input" id="${options.button}-tagging" name="${options.button}-tagging" data-i18n="tags.input" placeholder="${i18n.t('tags.input.placeholder')}" type="text" />
+      <label data-i18n="language.label" for="${options.button}-language">${i18n.t('language.label.textContent')}</label>
+      <select class="editor-form-select" id="${options.button}-language" name="${options.button}-language">${getLanguageOptionsHTML()}</select>
+      <label data-i18n="license.label" for="${options.button}-license">${i18n.t('license.label.textContent')}</label>
+      <select class="editor-form-select" id="${options.button}-license" name="${options.button}-license">${getLicenseOptionsHTML()}</select>
+      <span class="annotation-location-selection">${locationHTML}</span>
+      <span class="annotation-inbox-selection">${getAnnotationInboxLocationHTML(options.button)}</span>
+      `)}
+      ${formFooterHTML({ action: 'post', submitDisabled, controls: `
+      <span class="annotation-access">
+        <input type="checkbox" class="editor-form-access" id="${options.button}-access-public" name="${options.button}-access-public" role="switch" value="true"${isPublicRead(Config.DocumentURL) ? ' checked="checked"' : ''} aria-label="${i18n.t('annotation-access.label.textContent')}" />
+        <label class="editor-form-icon-toggle editor-form-access-label" for="${options.button}-access-public">${Icon['.fas.fa-eye-slash']}${Icon['.fas.fa-globe']}</label>
+      </span>
+      <span class="annotation-encrypt">
+        <input type="checkbox" class="editor-form-encrypt" id="${options.button}-encrypt" name="${options.button}-encrypt" role="switch" value="true"${isUnlocked() ? ' checked="checked"' : ''} aria-label="${i18n.t('annotation-encrypt.label.textContent')}" />
+        <label class="editor-form-icon-toggle editor-form-encrypt-label" for="${options.button}-encrypt">${Icon['.fas.fa-lock-open']}${Icon['.fas.fa-lock']}</label>
+      </span>
+      ` })}
+    </fieldset>
+  `
+}
+
+// Disable the annotate form's submit while no storage location is checked.
+export function updateAnnotateSubmitState(fieldset) {
+  if (!fieldset) return;
+  const submit = fieldset.querySelector('.editor-form-submit');
+  const checkboxes = fieldset.querySelectorAll('.annotation-location-selection input[type="checkbox"]');
+  if (!submit || !checkboxes.length) return;
+  submit.disabled = !Array.from(checkboxes).some(c => c.checked);
+}
+
+// Nanopub is public: as the only storage it locks the toggle to public; with private it shows a warning.
+export function updateNanopubAccess(fieldset) {
+  const access = fieldset?.querySelector('.editor-form-access');
+  if (!access) return;
+  const locations = Array.from(fieldset.querySelectorAll('.annotation-location-selection input[type="checkbox"]'));
+  const nanopub = locations.find(c => c.name.endsWith('-annotation-location-nanopub-network'));
+  const others = locations.filter(c => c !== nanopub && c.checked);
+  const onlyNanopub = !!nanopub?.checked && !others.length;
+  const label = fieldset.querySelector(`label[for="${access.id}"]`);
+  const locked = access.getAttribute('aria-disabled') === 'true';
+
+  if (onlyNanopub) {
+    if (!locked) {
+      access.dataset.wasChecked = String(access.checked);
+      access.setAttribute('aria-disabled', 'true');
+    }
+    // A form reset makes it private; keep it public.
+    if (!access.checked) {
+      access.checked = true;
+      access.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    if (label) label.title = i18n.t('annotation-access.nanopub-only.title');
+  }
+  else if (!onlyNanopub && locked) {
+    access.removeAttribute('aria-disabled');
+    const wasChecked = access.dataset.wasChecked === 'true';
+    delete access.dataset.wasChecked;
+    // The change event updates the toggle title and the notify default.
+    if (access.checked !== wasChecked) access.checked = wasChecked;
+    access.dispatchEvent(new Event('change', { bubbles: true }));
+    return;
+  }
+
+  const warn = !!nanopub?.checked && others.length > 0 && !access.checked;
+  const existing = fieldset.querySelector('.editor-form-nanopub-warning');
+  if (warn && !existing) {
+    fieldset.querySelector('.editor-form-footer')?.insertAdjacentHTML('beforebegin',
+      `<p class="editor-form-nanopub-warning" role="status">${Icon['.fas.fa-triangle-exclamation']}<span>${i18n.t('annotation-access.nanopub-public.textContent')}</span></p>`);
+  }
+  else if (!warn && existing) {
+    existing.remove();
+  }
+}
+
+// Access and encrypt toggle titles announce state and the notify-default coupling
+export function setupIconToggleTitles(container) {
+  [
+    ['.editor-form-access', 'annotation-access'],
+    ['.editor-form-encrypt', 'annotation-encrypt'],
+  ].forEach(([selector, keyBase]) => {
+    const input = container.querySelector(selector);
+    const switchLabel = input && container.querySelector(`label[for="${input.id}"]`);
+    if (!input || !switchLabel) return;
+    const syncTitle = () => { switchLabel.title = i18n.t(`${keyBase}.toggle.${input.checked ? 'on' : 'off'}.title`); };
+    input.addEventListener('change', syncTitle);
+    syncTitle();
+  });
+}
+
+// Notify follows the access and encrypt toggles until the user sets it directly
+export function syncNotifyInboxDefault(fieldset, options = {}) {
+  const notifyInputs = fieldset?.querySelectorAll('.editor-form-notify-inbox');
+  if (!notifyInputs?.length) return;
+  const access = fieldset.querySelector('.editor-form-access');
+  const encrypt = fieldset.querySelector('.editor-form-encrypt');
+  notifyInputs.forEach(notify => {
+    if (options.reset) delete notify.dataset.userSet;
+    if (notify.dataset.userSet) return;
+    notify.checked = !!access?.checked && !encrypt?.checked;
+  });
+}
+
+if (typeof document !== 'undefined') {
+  document.addEventListener('change', (e) => {
+    const cb = e.target.closest && e.target.closest('.annotation-location-selection input[type="checkbox"]');
+    if (cb) updateAnnotateSubmitState(cb.closest('fieldset'));
+
+    const notify = e.target.closest && e.target.closest('.editor-form-notify-inbox');
+    if (notify) notify.dataset.userSet = 'true';
+
+    const accessOrEncrypt = e.target.closest && e.target.closest('.editor-form-access, .editor-form-encrypt');
+    if (accessOrEncrypt) syncNotifyInboxDefault(accessOrEncrypt.closest('fieldset, [data-notify-scope]'));
+
+    if (cb || e.target.closest?.('.editor-form-access')) updateNanopubAccess(e.target.closest('fieldset'));
+  });
+
+  // A locked access toggle doesn't switch to private.
+  document.addEventListener('click', (e) => {
+    const label = e.target.closest?.('.editor-form-access-label');
+    const access = e.target.closest?.('.editor-form-access') || (label && document.getElementById(label.htmlFor));
+    if (access?.getAttribute('aria-disabled') === 'true') e.preventDefault();
+  }, true);
+}
+
+// Each popup uses its own action so input ids stay unique
+function formAction(node, fallback) {
+  return node.closest('form')?.id?.replace(/^editor-form-/, '') || fallback;
+}
+
+export function updateAnnotationServiceForm(action) {
+  var annotationServices = document.querySelectorAll('.do.editor-toolbar .annotation-location-selection');
+  for (var i = 0; i < annotationServices.length; i++) {
+    annotationServices[i].replaceChildren(fragmentFromString(getAnnotationLocationHTML(formAction(annotationServices[i], action))));
+    updateAnnotateSubmitState(annotationServices[i].closest('fieldset'));
+    updateNanopubAccess(annotationServices[i].closest('fieldset'));
+  }
+};
+
+export function updateAnnotationInboxForm(action) {
+  var annotationInbox = document.querySelectorAll('.do.editor-toolbar .annotation-inbox-selection');
+  for (var i = 0; i < annotationInbox.length; i++) {
+    annotationInbox[i].replaceChildren(fragmentFromString(getAnnotationInboxLocationHTML(formAction(annotationInbox[i], action))));
+  }
+};
+
+export function getSelectorFromLocation(location) {
+  const matches = location.hash.match(/^#(selector\(.*\))$/);
+
+  if (matches) {
+    return parseFunctionalSelector(matches[1]);
+  }
+}
+
+// Parses the functional selector(...) fragment syntax of Selectors and States,
+// with nested selector(...) values for refinedBy, startSelector, and endSelector.
+// Examples:
+//   selector(type=TextQuoteSelector,prefix=dokieli%20is%20a%20,exact=clientside%20editor)
+//   selector(type=TextPositionSelector,start=299,end=323)
+//   selector(type=XPathSelector,value=//section[@id%3D'introduction']//p[1])
+//   selector(type=FragmentSelector,value=summary)
+//   selector(type=FragmentSelector,value=features,refinedBy=selector(type=TextQuoteSelector,exact=Share%20articles))
+//   selector(type=RangeSelector,startSelector=selector(type=XPathSelector,value=//section[@id%3D'introduction']//p[1]),endSelector=selector(type=XPathSelector,value=//section[@id%3D'introduction']//p[2]))
+//   selector(type=RangeSelector,startSelector=selector(type=TextQuoteSelector,exact=browser-based%20tool),endSelector=selector(type=TextQuoteSelector,exact=Share%20articles))
+function parseFunctionalSelector(input) {
+  if (!input.startsWith('selector(') || !input.endsWith(')')) { return undefined; }
+
+  var selector = {};
+  var fields = splitTopLevelFields(input.slice('selector('.length, -1));
+
+  fields.forEach(field => {
+    var eq = field.indexOf('=');
+    if (eq < 1) { return; }
+    var key = field.slice(0, eq);
+    var value = field.slice(eq + 1);
+
+    if (value.startsWith('selector(')) {
+      value = parseFunctionalSelector(value);
+    }
+    else if (key == 'start' || key == 'end') {
+      value = parseInt(value, 10);
+      if (isNaN(value)) { return; }
+    }
+    else {
+      try { value = decodeURIComponent(value); } catch { /* keep value as is */ }
+    }
+
+    if (value !== undefined) {
+      selector[key] = value;
+    }
+  })
+
+  return selector.type ? selector : undefined;
+}
+
+// Splits comma-separated fields, ignoring commas inside nested selector(…)
+function splitTopLevelFields(input) {
+  var fields = [];
+  var depth = 0, start = 0;
+
+  for (var i = 0; i < input.length; i++) {
+    var c = input[i];
+    if (c == '(') { depth++; }
+    else if (c == ')') { depth--; }
+    else if (c == ',' && depth === 0) {
+      fields.push(input.slice(start, i));
+      start = i + 1;
+    }
+  }
+  fields.push(input.slice(start));
+
+  return fields;
+}

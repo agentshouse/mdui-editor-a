@@ -1,0 +1,722 @@
+/*!
+Copyright 2012-2026 Sarven Capadisli <https://csarven.ca/>
+Copyright 2023-2026 Virginia Balseiro <https://virginiabalseiro.com/>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+import Config from './config.js'
+import { generateAttributeId } from './util.js'
+import { getProxyableIRI, currentLocation } from './uri.js'
+import { domSanitize } from './utils/sanitization.js'
+
+const DEFAULT_CONTENT_TYPE = 'text/html; charset=utf-8'
+const LDP_RESOURCE = '<http://www.w3.org/ns/ldp#Resource>; rel="type"'
+
+function authFetch(url, options) {
+  const request = new Request(url, options);
+  return Config['Session']?.authFetch(request)
+}
+
+function setAcceptRDFTypes(options = {}) {
+  const excludeMarkup = options.excludeMarkup || false;
+
+  //Filter RDF media types by optionally excluding markup media types
+  return Config.MediaTypes.RDF.filter(i => !excludeMarkup || Config.MediaTypes.Markup.indexOf(i) === -1)
+    .map(i => {
+      //Set query values
+      return Config.MediaTypes.Markup.indexOf(i) > -1 ? `${i};q=0.9` : i;
+    })
+    .join(',');
+}
+
+export async function getMultipleResources(resources, options = {}) {
+  //TODO: copied from getResourceGraph. Refactor
+  let headers;
+  let wildCard = options.excludeMarkup ? '' : ',*/*;q=0.1';
+  let defaultHeaders = {'Accept': setAcceptRDFTypes(options) + wildCard}
+  headers = headers || defaultHeaders
+  if (!('Accept' in headers)) {
+    headers['Accept'] = defaultHeaders['Accept'];
+  }
+
+  return await Promise.all(
+    resources.map(async (url) => {
+      const response = await getResource(url, headers);
+
+      const contentType = response.headers.get("content-type") || 'application/octet-stream';
+
+      const result = {
+        // name: options.filename ? url.split('/').pop(): url,
+        name: url,
+        type: contentType.split(';')[0].toLowerCase().trim(),
+      }
+
+      switch (contentType) {
+        default:
+          result['content'] = await response.text();
+          break;
+
+        case 'application/json':
+        case 'application/ld+json':
+        case 'application/activity+json':
+          result['content'] = JSON.stringify(await response.json());
+          break;
+      }
+
+      return result;
+    })
+  );
+}
+
+
+// I want HTTP COPY and I want it now!
+function copyResource (fromURL, toURL, options = {}) {
+  let headers = { 'Accept': '*/*' }
+  let contentType
+
+  if (!fromURL || !toURL) {
+    return Promise.reject(new Error('Missing fromURL or toURL in copyResource'))
+  }
+
+  return getResource(fromURL, headers, options)
+    .then(response => {
+      contentType = response.headers.get('Content-Type')
+      contentType = (contentType) ? contentType.split(';')[0].trim() : 'text/plain';
+
+      return (Config.MediaTypes.Binary.includes(contentType))
+        ? response.arrayBuffer()
+        : response.text()
+    })
+    .then(contents => {
+      //XXX: Should this sanitize (domSanitize(contents)) or copy resource as is?
+      return putResource(toURL, contents, contentType, null, options)
+    })
+}
+
+/**
+ * deleteResource
+ *
+ * @param url {string}
+ * @param options {object}
+ *
+ * @returns {Promise<Response>}
+ */
+function deleteResource (url, options = {}) {
+  const _fetch = Config['Session']?.isActive ? authFetch : fetch;
+
+  if (!url) {
+    return Promise.reject(new Error('Cannot DELETE resource - missing url'))
+  }
+
+  if (options.withCredentials) {
+    options.credentials = 'include'
+  }
+
+  options.method = 'DELETE'
+
+  return _fetch(url, options)
+
+    .then(response => {
+      if (!response.ok) {  // not a 2xx level response
+        let error = new Error('Error deleting resource: ' +
+          response.status + ' ' + response.statusText)
+        error.status = response.status
+        error.response = response
+
+        throw error
+      }
+
+      return response
+    })
+}
+
+function getAcceptPostPreference (url) {
+  const pIRI = getProxyableIRI(url)
+// console.trace()
+  return getResourceOptions(pIRI, {'header': 'Accept-Post'})
+    .catch(error => {
+//      console.log(error)
+      return {'headers': 'application/ld+json'}
+    })
+    .then(result => {
+      let header = result.headers.trim().split(/\s*,\s*/);
+
+      if (header.includes('text/html') || header.includes('application/xhtml+xml')) {
+        return 'text/html';
+      }
+      else if (header.includes('application/ld+json') || header.includes('application/json') || header.includes('application/activity+json') || header.includes('*/*')) {
+        return 'application/ld+json';
+      }
+      else if (header.includes('text/turtle')) {
+        return 'text/turtle';
+      }
+      else if (header.includes('application/n-triples')) {
+        return 'application/n-triples';
+      }
+      else if (header.includes('application/n-quads')) {
+        return 'application/n-quads';
+      }
+      else if (header.includes('text/n3')) {
+        return 'text/n3';
+      }
+      else {
+        console.log('Accept-Post contains unrecognised media-range; ' + result.headers);
+        return result.headers;
+      }
+    })
+}
+
+function getAcceptPatchPreference (url) {
+  const pIRI = url || getProxyableIRI(url)
+
+  return getResourceOptions(pIRI, {'header': 'Accept-Patch'})
+    .catch(error => {
+//      console.log(error)
+      return {'headers': 'text/n3'}
+    })
+    .then(result => {
+      let header = result.headers.trim().split(/\s*,\s*/)
+
+      if (header.indexOf('text/html') > -1 || header.indexOf('application/xhtml+xml') > -1) {
+        return 'text/html'
+      } else if (header.indexOf('text/n3') > -1 || header.indexOf('*/*') > -1) {
+        return 'text/n3'
+      } else if (header.indexOf('application/sparql-update') > -1) {
+        return 'application/sparql-update'
+      } else {
+        console.log('Accept-Patch contains unrecognised media-range; ' + result.headers)
+        return result.headers
+      }
+    })
+}
+
+function getAcceptPutPreference (url) {
+  const pIRI = url || getProxyableIRI(url)
+
+  return getResourceOptions(pIRI, {'header': 'Accept-Put'})
+    .catch(error => {
+//      console.log(error)
+      return {'headers': 'text/html'}
+    })
+    .then(result => {
+      let header = result.headers.trim().split(/\s*,\s*/)
+
+      if (header.indexOf('text/html') > -1 || header.indexOf('application/xhtml+xml') > -1) {
+        return 'text/html'
+      } else if (header.indexOf('text/turtle') > -1 || header.indexOf('*/*') > -1) {
+        return 'text/turtle'
+      } else if (header.indexOf('application/ld+json') > -1 || header.indexOf('application/json') > -1) {
+        return 'application/ld+json'
+      } else {
+        console.log('Accept-Patch contains unrecognised media-range; ' + result.headers)
+        return result.headers
+      }
+    })
+}
+
+
+/**
+ * getResource
+ *
+ * @param url {string}
+ *
+ * @param headers {object}
+ * @param [headers.accept='text/turtle'] {string}
+ *
+ * @param options {object}
+ *
+ * @returns {Promise<string>|Promise<ArrayBuffer>}
+ */
+function getResource (url, headers = {}, options = {}) {
+  const _fetch = Config['Session']?.isActive ? authFetch : fetch;
+
+  url = url || Config.DocumentURL || currentLocation()
+// console.log(url)
+  if (url.startsWith('file:')){
+    return;
+  }
+
+  options.method = ('method' in options && options.method == 'HEAD') ? 'HEAD' : 'GET'
+
+  if (!headers['Accept'] && options.method !== 'HEAD') {
+    headers['Accept'] = '*/*'
+  }
+
+  if (options.noCache) {
+    options.cache = 'no-cache'
+    headers['Cache-Control'] = 'no-cache'
+  }
+
+  if (options.noStore) {
+    options.cache = 'no-store'
+    headers['Cache-Control'] = 'no-store'
+  }
+
+  if (options.withCredentials) {
+    options.credentials = 'include'
+  }
+
+  options.headers = Object.assign({}, headers)
+
+  const controller = new AbortController();
+  const timeout = options.timeout || Config.HttpTimeout;
+  const id = setTimeout(() => controller.abort(), timeout);
+  options.signal = controller.signal;
+
+  return _fetch(url, options)
+    .finally(() => clearTimeout(id))
+    .catch(error => {
+      if (error.name === 'AbortError') {
+        throw new Error(`Request timed out after ${timeout}ms`, { cause: error });
+      }
+      //XXX: When CORS preflight request returns 405, error is an object but neither an instance of Error nor Response.
+
+// console.log(options)
+// console.log(error)
+// console.error(error)
+
+      if (error?.status == 405) {
+// console.log('status: 405', error)
+        throw error
+      }
+      else if (error?.status == 401) {
+        if (options.hasRetriedWithCredentials) {
+          throw new Error('401 retries failed', { cause: error });
+        }
+        options.hasRetriedWithCredentials = true
+        options.credentials = 'include'
+        return getResource(url, headers, options)
+      }
+      else {
+        if (options.proxyForced) {
+          throw new Error('Cannot fetch proxied URL: ' + url);
+        }
+        if (options.noProxy) {
+          throw new Error('Error fetching resource', { cause: error });
+        }
+        var pIRI = getProxyableIRI(url, {'forceProxy': true});
+
+        if (pIRI !== url) {
+          options['proxyForced'] = true;
+          return getResource(pIRI, headers, options);
+        }
+        else {
+          throw new Error('Error fetching resource', { cause: error });
+        }
+      }
+
+      // throw error
+    })
+    .then(response => {
+      if (!response.ok) {  // not a 2xx level response
+        let error = new Error('Error fetching resource: ' +
+          response.status + ' ' + response.statusText)
+        error.status = response.status
+        error.response = response
+
+        throw error
+      }
+
+      return response
+    })
+}
+
+/**
+ * getResourceHead
+ *
+ * @param url {string}
+ * @param headers {object}
+ * @param options {object}
+ *
+ * @returns {Promise<Response>}
+ */
+function getResourceHead (url, headers = {}, options = {}) {
+  options['method'] = 'HEAD'
+
+  return getResource (url, headers, options)
+}
+
+/**
+ * getResourceOptions
+ *
+ * @param [url] {string} Defaults to current url
+ *
+ * @param [options={}] {object}
+ * @param [options.header] {string} Specific response header to return
+ * @param [options.withCredentials] {boolean} Send cookies cross-origin (`credentials: 'include'`)
+ *
+ * @returns {Promise} Resolves with `{ headers: ... }` object
+ */
+function getResourceOptions (url, options = {}) {
+  const _fetch = Config['Session']?.isActive ? authFetch : fetch;
+
+  url = url || Config.DocumentURL || currentLocation()
+
+  options.method = 'OPTIONS'
+
+  if (options.withCredentials) {
+    options.credentials = 'include'
+  }
+
+  return _fetch(url, options)
+
+    .then(response => {
+      if (!response.ok) {  // not a 2xx level response
+        let error = new Error('Error fetching resource OPTIONS: ' +
+          response.status + ' ' + response.statusText)
+        error.status = response.status
+        error.response = response
+
+        throw error
+      }
+      else if (options.header && !response.headers.get(options.header)){
+        let error = new Error('OPTIONS without ' + options.header + ' header: ' +
+          response.status + ' ' + response.statusText)
+        error.status = response.status
+        error.response = response
+
+        throw error
+      }
+
+      if (options.header) {  // specific header requested
+        return { headers: response.headers.get(options.header) }
+      }
+
+      return { headers: response.headers }  // Not currently used anywhere
+    })
+}
+
+//TODO: Move these and doc.js:getRDFaPrefixHTML (rename) elsewhere.
+function getN3PrefixesString(prefixes){
+  return Object.keys(prefixes).map(i => { return '@prefix ' + i + ': ' + '<' + prefixes[i] + '> .' }).join('\n');
+}
+function getSPARQLPrefixesString(prefixes){
+  return Object.keys(prefixes).map(i => { return 'PREFIX ' + i + ': ' + '<' + prefixes[i] + '>' }).join('\n');
+}
+//https://www.w3.org/TR/sparql11-query/#rVar
+function containsSPARQLVariable(str) {
+  const pnCharsBase = "A-Za-z\\u00C0-\\u00D6\\u00D8-\\u00F6\\u00F8-\\u02FF\\u0370-\\u037D\\u037F-\\u1FFF\\u200C-\\u200D\\u2070-\\u218F\\u2C00-\\u2FEF\\u3001-\\uD7FF\\uF900-\\uFDCF\\uFDF0-\\uFFFD";
+  const pnCharsU = `${pnCharsBase}_`;
+  const varName = `(?:[${pnCharsU}]|[0-9])(?:[${pnCharsU}]|[0-9]|\\u00B7|[\\u0300-\\u036F]|[\\u203F-\\u2040])*`;
+
+  const var1Pattern = `\\?[${pnCharsU}](${varName})`;
+  const var2Pattern = `\\$[${pnCharsU}](${varName})`;
+
+  const varRegex = new RegExp(`(${var1Pattern}|${var2Pattern})`, 'u');
+
+  return varRegex.test(str);
+}
+
+function patchResourceGraph (url, patches, options = {}) {
+  options.headers = options.headers || {}
+  options.headers['Content-Type'] = options.headers['Content-Type'] || 'text/n3';
+
+  patches = (Array.isArray(patches)) ? patches : [patches];
+  options['prefixes'] = options.prefixes || {};
+  options['prefixes']['solid'] = 'http://www.w3.org/ns/solid/terms#';
+  options['prefixes']['acl'] = 'http://www.w3.org/ns/auth/acl#';
+  options['prefixes']['foaf'] = 'http://xmlns.com/foaf/0.1/';
+  var prefixes;
+
+  switch(options.headers['Content-Type']) {
+    case 'application/sparql-update':
+      prefixes = getSPARQLPrefixesString(options.prefixes);
+      break;
+    case 'text/n3':
+    default:
+      prefixes = getN3PrefixesString(options.prefixes);
+      break;
+  }
+
+  var data = prefixes + `\n`;
+  var operation;
+
+  switch (options.headers['Content-Type']) {
+    case 'application/sparql-update':
+      if (patches[0].delete) {
+        operation = (patches[0].where || containsSPARQLVariable(patches[0].delete)) ? 'DELETE' : 'DELETE DATA';
+        data += `${operation} {\n${patches[0].delete}\n}\n`;
+      }
+
+      if (patches[0].insert) {
+        operation = (patches[0].where || containsSPARQLVariable(patches[0].insert)) ? 'INSERT' : 'INSERT DATA';
+        data += `${operation} {\n${patches[0].insert}\n}\n`;
+      }
+
+      if (patches[0].where) {
+        data += `WHERE {\n${patches[0].where}\n}\n`;
+      }
+      break
+
+    case 'text/n3':
+    default :
+      var patchId = '_:' + generateAttributeId();
+      data += `${patchId} a solid:InsertDeletePatch .\n`;
+      var deletes = '';
+      patches.forEach(patch => {
+        if (patch.delete) {
+          if (!deletes.length) {
+            deletes += `${patchId} solid:deletes {`
+          }
+          deletes += `${patch.delete}\n`;
+        }
+        if (patch.insert) {
+          data += `${patchId} solid:inserts {\n${patch.insert}\n} .\n`;
+        }
+        if (patch.where) {
+          data += `${patchId} solid:where {\n${patch.where}\n} .\n`;
+        }
+      });
+
+      if (deletes.length) {
+        data += deletes + '} .';
+      }
+
+      break
+  }
+
+ 
+  return patchResource (url, data, options);
+}
+
+function patchResource (url, data, options = {}) {
+  const _fetch = Config['Session']?.isActive ? authFetch : fetch;
+
+  options.headers = options.headers || {}
+
+  options.headers['Content-Type'] = options.headers['Content-Type'] || 'text/n3'
+
+  options.body = data
+
+  options.method = 'PATCH'
+
+  if (options.withCredentials) {
+    options.credentials = 'include'
+  }
+
+  return _fetch(url, options)
+
+    .then(response => {
+      if (!response.ok) {  // not a 2xx level response
+        let error = new Error('Error patching resource: ' +
+          response.status + ' ' + response.statusText)
+        error.status = response.status
+        error.response = response
+
+        throw error
+      }
+
+      return response
+    })
+}
+
+function postResource (url, slug, data, contentType, links, options = {}) {
+  const _fetch = Config['Session']?.isActive ? authFetch : fetch;
+
+  if (!url) {
+    return Promise.reject(new Error('Cannot POST resource - missing url'))
+  }
+
+  options.method = 'POST'
+
+  options.body = data
+
+  if (options.withCredentials) {
+    options.credentials = 'include'
+  }
+
+  options.headers = options.headers || {}
+
+  options.headers['Content-Type'] = contentType || DEFAULT_CONTENT_TYPE
+
+  links = (typeof links === 'string' && links.trim())
+    ? LDP_RESOURCE + ', ' + links
+    : LDP_RESOURCE
+
+  options.headers['Link'] = links
+
+  if (slug) {
+    options.headers['Slug'] = slug
+  }
+
+  return _fetch(url, options)
+
+    .then(response => {
+      if (!response.ok) {  // not a 2xx level response
+        let error = new Error('Error creating resource: ' +
+          response.status + ' ' + response.statusText)
+        error.status = response.status
+        error.response = response
+
+        throw error
+      }
+
+      return response
+    })
+}
+
+/**
+ * putResource
+ *
+ * @param url {string}
+ *
+ * @param data {string|object}
+ *
+ * @param [contentType=DEFAULT_CONTENT_TYPE] {string}
+ *
+ * @param [links=LDP_RESOURCE] {string}
+ *
+ * @param [options={}] {object}
+ *
+ * @returns {Promise<Response>}
+ */
+function putResource (url, data, contentType, links, options = {}) {
+  const _fetch = Config['Session']?.isActive ? authFetch : fetch;
+
+  if (!url) {
+    return Promise.reject(new Error('Cannot PUT resource - missing url'))
+  }
+
+  options.method = 'PUT'
+
+  options.body = data
+
+  if (options.withCredentials) {
+    options.credentials = 'include'
+  }
+
+  options.headers = options.headers || {}
+
+  options.headers['Content-Type'] = contentType || DEFAULT_CONTENT_TYPE
+
+  links = (typeof links === 'string' && links.trim())
+    ? LDP_RESOURCE + ', ' + links
+    : LDP_RESOURCE
+
+  options.headers['Link'] = links
+
+  return _fetch(url, options)
+
+    .then(response => {
+      if (!response.ok) {  // not a 2xx level response
+        let error = new Error('Error writing resource: ' +
+          response.status + ' ' + response.statusText)
+        error.status = response.status
+        error.response = response
+
+        throw error
+      }
+
+      return response
+    })
+}
+
+function processSave(url, slug, data, options) {
+  options = options || {};
+  var request = (slug)
+                ? postResource(url, slug, data)
+                : putResource(url, data)
+
+  return finalizeSave(request, url)
+}
+
+// Shared with backends that issue their own save request.
+function finalizeSave(request, url) {
+  return request
+    .then(response => {
+      var location = response.headers.get('Location') || url;
+
+      var message = {
+        'content': `Saved document to <code>${domSanitize(location)}</code>`,
+        'type': 'success'
+      }
+      return Promise.resolve({'response': response, 'message': message})
+    })
+    .catch(error => {
+      console.log(error)
+
+      let message
+
+      switch (error.status) {
+        case 401:
+          message = 'Need to authenticate before saving'
+          break
+
+        case 403:
+          message = 'You are not authorized to save'
+          break
+
+        case 405:
+        default:
+          message = 'Server doesn\'t allow this resource to be rewritten'
+          break
+      }
+
+      message = {
+        'content': message,
+        'type': 'error'
+      }
+
+      return Promise.reject({'error': error, 'message': message})
+    })
+}
+
+//TODO: Use OPTIONS (getResourceOptions). Check/use Allow: PATCH and Accept-Patch. Check/use Allow: PUT using Accept-Put. Fallback to PUT.
+
+function patchResourceWithAcceptPatch(url, patch, options) {
+  return getAcceptPatchPreference(url)
+    .then(preferredContentType => {
+      options = options || {}
+      options['headers'] = options['headers'] || {}
+      options.headers['Content-Type'] = options.headers['Content-Type'] || preferredContentType
+
+      return patchResourceGraph(url, patch, options)
+    })
+}
+
+function putResourceWithAcceptPut(url, html, options) {
+  return getAcceptPutPreference(url)
+    .then(preferredContentType => {
+      options = options || {}
+      options['headers'] = options['headers'] || {}
+      options.headers['Content-Type'] = options.headers['Content-Type'] || preferredContentType
+
+      return putResource(url, html, null, null, options)
+    })
+}
+
+export {
+  authFetch,
+  setAcceptRDFTypes,
+  copyResource,
+  currentLocation,
+  deleteResource,
+  getAcceptPostPreference,
+  getAcceptPatchPreference,
+  getAcceptPutPreference,
+  getResource,
+  getResourceHead,
+  getResourceOptions,
+  patchResource,
+  patchResourceGraph,
+  postResource,
+  putResource,
+  processSave,
+  finalizeSave,
+  patchResourceWithAcceptPatch,
+  putResourceWithAcceptPut,
+  getN3PrefixesString,
+  getSPARQLPrefixesString,
+  containsSPARQLVariable
+}

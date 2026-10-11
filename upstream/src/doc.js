@@ -1,0 +1,5331 @@
+/*!
+Copyright 2012-2026 Sarven Capadisli <https://csarven.ca/>
+Copyright 2023-2026 Virginia Balseiro <https://virginiabalseiro.com/>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+import rdf from "rdf-ext";
+import * as Slideshow from './ui/templates/slideshow.js';
+import { diffChars } from 'diff';
+import LinkHeader from "http-link-header";
+import Config from './config.js'
+import { getDateTimeISO, generateAttributeId, uniqueArray, getRandomIndex, getHash, isValidISBN, getDateTimeISOFromMDY, debounce } from './util.js'
+import { parseWacAllow } from '@dokieli/web-access-control';
+import { getAbsoluteIRI, getBaseURL, stripFragmentFromString, getFragmentFromString, getURLLastPath, getPrefixedNameFromIRI, generateDataURI, getProxyableIRI, getFragmentOrLastPath, currentLocation } from './uri.js'
+import { getResourceGraph, sortGraphTriples, getGraphContributors, getGraphAuthors, getGraphEditors, getGraphPerformers, getGraphPublishers, getGraphLabel, getGraphEmail, getGraphTitle, getGraphConceptLabel, getGraphPublished, getGraphUpdated, getGraphDescription, getGraphLicense, getGraphRights, getGraphFromData, getGraphAudience, getGraphTypes, getGraphLanguage, getGraphInbox, getUserLabelOrIRI, getGraphImage, getGraphDate, processResources, getAgentName, getGraphCreators } from './graph.js';
+import { Icon } from './ui/icons.js';
+import { buttonIcons, getButtonHTML, updateButtons } from './ui/buttons.js'
+import { domSanitizeHTMLBody, domSanitize, sanitizeInsertAdjacentHTML, htmlEncode, sanitizeIRI } from './utils/sanitization.js';
+import { saveMessageLog } from './storage.js';
+import { cleanProseMirrorOutput, normalizeHTML, normalizeWhitespace } from './utils/normalization.js';
+import { applyDocumentTransforms, registerDocumentTransform } from './utils/documentTransforms.js';
+import { formatHTML, fragmentFromString, getDoctype, getDocumentContentNode, selectArticleNode, getDocumentNodeFromString, stringFromFragment, createHTML, getOffset, htmlToMarkdown } from './utils/html.js';
+import { i18n } from './i18n.js';
+import { getRegistryURL } from './nanopub.js';
+import { rewriteBlobImagesToRelative, uploadBlobAssets, clearBlobAssets, hasUploadTarget } from './editor/utils/imageAssets.js';
+import { getSelectedParentElement, getInboxOfClosestNodeWithSelector } from './editor/utils/annotation.js';
+import { serializeAnnotationToHTML, serializeAnnotationToJSONLD } from '@dokieli/web-annotation';
+import { createNotification, serializeNotificationToJSONLD } from '@dokieli/notifications';
+import { renderFootnote, renderCitation } from './editor/utils/reference-render.js';
+import { getResource } from "./fetcher.js";
+import { encryptContent } from './crypto.js';
+import { isUnlocked, getSessionPublicKey, getDocumentRecipientKeys, syncDocumentRecipientsFromACL } from './keystore.js';
+import { selfLinkHost } from './ui/selfLinks.js';
+import { selfLinksEnabledForRoot } from './ui/templates/sections.js';
+
+const ns = Config.ns;
+
+export function setDocumentURL(url) {
+  url = url || currentLocation();
+
+  Config.DocumentURL = stripFragmentFromString(url);
+
+  if (url.startsWith('blob:')) {
+    var message = `A snapshot of the original document was loaded in a sandboxed environment and can only work in reduced functionality. It is recommended to open this document in a new window or tab.`;
+    var actionMessage = message;
+
+    const messageObject = {
+      'content': actionMessage,
+      'type': 'warning',
+      'timer': null,
+      'code': 0
+    }
+
+    addMessageToLog({...messageObject, content: message}, Config.MessageLog);
+    showActionMessage(document.body, messageObject);
+
+    console.warn(`Cannot use blob URL: ${url} . If using dokieli in an iframe with a blob URL, use 'src' with the source document URL instead so that operations on the document and related documents work as expected. See docs on using dokieli as an embeddable web application: https://dokie.li/docs#embeddable-web-application`);
+  }
+
+}
+
+export function updateDocumentTitle(nodeDocument) {
+  const head = nodeDocument.querySelector('head');
+  if (!head) return;
+
+  const heading = nodeDocument.querySelector('h1')?.textContent.trim();
+  let title = head.querySelector('title');
+  const text = heading || title?.textContent.trim() || 'Untitled';
+
+  if (!title) {
+    title = nodeDocument.createElement('title');
+    head.appendChild(title);
+  }
+  if (title.textContent !== text) {
+    title.textContent = text;
+  }
+}
+
+export function getDocument(cn, options = {}) {
+  let node = cn || document.documentElement;
+
+  if (typeof cn === 'string') {
+    const parser = new DOMParser();
+    node = parser.parseFromString(cn, 'text/html');
+    node = node.documentElement;
+  }
+  else if (cn instanceof Document) {
+    node = cn.documentElement;
+  }
+
+  const nodeParseOptions = {
+    contentType: (node.nodeName.toLowerCase() === 'svg') ? 'image/svg+xml' : 'text/html'
+  };
+
+  node = node.cloneNode(true);
+
+  //In case `node` type is DocumentFragment
+  const div = document.createElement('div');
+  div.appendChild(node);
+
+  //XXX: DO THIS?
+  // div.normalize;
+
+  let htmlString;
+
+  let nodeDocument = getDocumentNodeFromString(div.getHTML(), nodeParseOptions);
+
+  let fragment = cleanProseMirrorOutput(nodeDocument);
+
+  nodeDocument.documentElement.setHTMLUnsafe(stringFromFragment(fragment));
+
+  if (options.sanitize) {
+    nodeDocument = domSanitizeHTMLBody(nodeDocument, options);
+  }
+
+  if (options.normalize) {
+    nodeDocument = normalizeHTML(nodeDocument);
+  }
+
+  applyDocumentTransforms(nodeDocument);
+
+  updateDocumentTitle(nodeDocument);
+
+  nodeDocument = normalizeWhitespace(nodeDocument);
+
+  if (options.format) {
+    htmlString = formatHTML(nodeDocument.documentElement, options);
+    // console.log('formatted htmlString:', htmlString);
+  }
+  else {
+    htmlString = nodeDocument.documentElement.outerHTML;
+  }
+
+  //Prepend doctype
+  let doctype = (nodeDocument.constructor.name === 'XMLDocument') ? '<?xml version="1.0" encoding="utf-8"?>' : getDoctype();
+  doctype = (doctype.length > 0) ? doctype + '\n' : '';
+  htmlString = doctype + htmlString;
+
+  // console.trace("format: ", options.format, "sanitize: ", options.sanitize, "normalize: ", options.normalize, "output:", htmlString);
+
+  return htmlString;
+}
+
+export function createFeedXML(feed, options) {
+  options = options || {};
+
+  var feedXML = '';
+  var language = feed.language ? '<language>' + feed.language + '</language>' : '';
+  var title = feed.title ? '<title>' + feed.title + '</title>' : '<title>' + feed.self + '</title>';
+  var generator = '';
+  var license = '';
+  var rights = '';
+  var rightsLicenseText = ''
+  var description = '';
+  var authorData = '';
+
+  var now = getDateTimeISO();
+  var year = new Date(now).getFullYear();
+
+  var feedItems = [];
+  Object.keys(feed.items).forEach(i => {
+    var fI = '';
+    var url = i;
+    var origin = new URL(url).origin;
+    var author = '';
+    var authorData = [];
+    var title = (feed.items[i].title) ? '<title>' + feed.items[i].title + '</title>' : '';
+
+    //TODO: This would normally only work for input content is using a markup language.
+    var description = feed.items[i].description.replace(/(data|src|href)=(['"])([^'"]+)(['"])/ig, (match, p1, p2, p3, p4) => {
+      var isAbsolute = /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(p3); // Check if the value is an absolute URL
+      return `${p1}="${isAbsolute ? p3 : (p3.startsWith('/') ? origin : url) + '/' + p3}"`;
+    });
+    description = htmlEncode(description);
+
+    var published = '';
+    var updated = '';
+    var license = '';
+
+    switch (options.contentType) {
+      case 'application/atom+xml':
+        if (feed.items[i].author) {
+          feed.items[i].author.forEach(author => {
+            var a = `    <author>
+      <uri>${author.uri}</uri>${author.name ? `
+      <name>${author.name}</name>` : ''}${author.email ? `
+      <email>${author.email}</email>` : ''}
+    </author>`;
+
+            author.uri == feed.author.uri ? authorData.unshift(a) : authorData.push(a);
+          })
+        }
+
+        published = feed.items[i].published
+          ? `<published>${feed.items[i].published}</published>`
+          : `<published>${now}</published>`
+
+        updated = feed.items[i].updated
+          ? `<updated>${feed.items[i].updated}</updated>`
+          : '';
+
+        description = (feed.items[i].description) ? '<content type="html">' + description + '\n\
+      </content>' : '';
+
+        license = (feed.items[i].license) ? '<link rel="license" href="' + feed.items[i].license + '" />' : '';
+
+        fI = '\n\
+  <entry>\n\
+    <id>' + url + '</id>\n\
+    <link href="' + url + '" />\n\
+    ' + title + '\n\
+    ' + published + '\n\
+    ' + updated + '\n\
+    ' + license + '\n\
+' + authorData.join('\n') + '\n\
+    ' + description + '\n\
+  </entry>';
+        break;
+
+      case 'application/rss+xml':
+        if (feed.items[i].author) {
+          author = feed.items[i].author.find(item => item.uri === feed.author.uri) || feed.items[i].author[0];
+
+          if (author.email) {
+            author = author.name ? `${author.email} (${author.name})` : author.email;
+            authorData.push('<author>' + author + '</author>');
+          }
+          else if (author.uri) {
+            authorData.push('<dc:creator>' + (author.name ? author.name : author.uri) + '</dc:creator>');
+          }
+        }
+
+        let dateStr =
+          feed.items[i].updated ? new Date(feed.items[i].updated) :
+          feed.items[i].published ? new Date(feed.items[i].published) :
+          feed.items[i].headers?.date?.['field-value'] ? new Date(feed.items[i].headers.date['field-value']) :
+          new Date();
+
+        published = `<pubDate>${dateStr.toUTCString()}</pubDate>`;
+
+        description = feed.items[i].description ? '<description>' + description + '</description>' : '';
+
+        // license = ('license' in feed.items[i]) ? '<copyright>License: ' + feed.items[i].license + '</copyright>' : '';
+
+        fI = '\n\
+    <item>\n\
+      <guid>' + url + '</guid>\n\
+      ' + title + '\n\
+      ' + published + '\n\
+      ' + authorData.join('') + '\n\
+      ' + description + '\n\
+    </item>';
+        break;
+    }
+
+    feedItems.push(fI);
+  });
+
+
+  switch (options.contentType) {
+    case 'application/atom+xml':
+      if (feed.author?.uri) {
+        authorData = `
+  <author>
+    <uri>${feed.author.uri}</uri>
+    ${feed.author.name ? `<name>${feed.author.name}</name>` : ''}
+  </author>`;
+
+        rights = feed.author.name ? ' ' + feed.author.name : ''
+      }
+
+      description = (feed.description) ? '<summary>' + feed.description + '</summary>' : '';
+
+      if (feed.license) {
+        license = '<link rel="license" href="' + feed.license + '" />';
+        rightsLicenseText = ' . License: ' + feed.license;
+      }
+
+      rights = '<rights>Copyright ' + year + rights + rightsLicenseText + ' . Rights and license are feed only.</rights>';
+
+      generator = '<generator uri="https://dokie.li/#i">dokieli</generator>';
+
+      feedXML = '<feed xmlns="http://www.w3.org/2005/Atom">\n\
+  ' + title + '\n\
+  <link href="' + feed.self + '" rel="self" />\n\
+  <id>' + feed.self + '</id>\n\
+  <updated>' + now + '</updated>\n\
+  ' + rights + '\n\
+  ' + license + '\n\
+  ' + generator + '\n\
+' + authorData + '\n\
+' + feedItems.join('') + '\n\
+</feed>\n\
+';
+      break;
+
+    case 'application/rss+xml':
+      now = new Date(now).toUTCString();
+
+      if (feed.author) {
+        authorData = feed.author.name || feed.author.uri || '';
+
+        rights = feed.author.name ? ' ' + feed.author.name : ''
+
+        if (authorData) {
+          authorData = `<dc:creator>${authorData}</dc:creator>`;
+        }
+      }
+
+      description = feed.description
+          ? '<description>' + feed.description + '</description>'
+          : feed.title
+          ? '<description>' + feed.title + '</description>'
+          : '<description>' + feed.self + '</description>';
+
+      generator = '<generator>https://dokie.li/#i</generator>';
+
+      if (feed.license) {
+        rightsLicenseText = ' . License: ' + feed.license;
+      }
+
+      rights = '<copyright>Copyright ' + year + rights + rightsLicenseText + ' . Rights and license are feed only.</copyright>';
+
+      feedXML = '<?xml version="1.0" encoding="utf-8"?>\n\
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:dc="http://purl.org/dc/elements/1.1/">\n\
+  <channel>\n\
+    <atom:link href="' + feed.self + '" rel="self" type="application/rss+xml" />\n\
+    <link>' + feed.origin + '</link>\n\
+    ' + title + '\n\
+    <pubDate>' + now + '</pubDate>\n\
+    ' + rights + '\n\
+    ' + generator + '\n\
+    ' + language + '\n\
+    ' + authorData + '\n\
+    ' + description + '\n\
+' + feedItems.join('') + '\n\
+  </channel>\n\
+</rss>\n\
+';
+      break;
+  }
+
+  return feedXML;
+}
+
+export function getFeedFormatSelection() {
+  return `
+    <div id="feed-format-selection">
+      <label data-i18n="dialog.generate-feed.feed-format.label" for="feed-format">${i18n.t('dialog.generate-feed.feed-format.label.textContent')}</label>
+      <select id="feed-format">
+        <option id="feed-format-atom" lang="en" value="application/atom+xml" xml:lang="en">Atom</option>
+        <option id="feed-format-rss" lang="en" value="application/rss+xml" selected="selected" xml:lang="en">RSS</option>
+      </select>
+    </div>
+  `;
+}
+
+export function createActivityHTML(o) {
+  var prefixes = ' prefix="' + Config.prefixStrings.activity + '"';
+
+  var types = '<dt>Types</dt>'
+
+  o.type.forEach(function (t) {
+    types += '<dd><a about="" href="' + Config.getPrefixURI(t.split(':')[0]) + t.split(':')[1] + '" typeof="' + t + '">' + t.split(':')[1] + '</a></dd>'
+  })
+
+  var asObjectTypes = ''
+  if ('object' in o && 'objectTypes' in o && o.objectTypes.length > 0) {
+    asObjectTypes = '<dl><dt>Types</dt>'
+    o.objectTypes.forEach(t => {
+      asObjectTypes += '<dd><a about="' + o.object + '" href="' + t + '" typeof="' + t + '">' + t + '</a></dd>'
+    })
+    asObjectTypes += '</dl>'
+  }
+
+  var asObjectLicense = ''
+  if ('object' in o && 'objectLicense' in o && o.objectLicense.length > 0) {
+    asObjectLicense = '<dl><dt>License</dt><dd><a about="' + o.object + '" href="' + o.objectLicense + '" property="dcterms:license">' + o.objectLicense + '</a></dd></dl>'
+  }
+
+  var asinReplyTo = ('inReplyTo' in o) ? '<dl><dt>In reply to</dt><dd><a about="' + o.object + '" href="' + o.inReplyTo + '" property="as:inReplyTo">' + o.inReplyTo + '</a></dd></dl>' : ''
+
+  var asObjectURL = ('url' in o) ? '<dl><dt>URL</dt><dd><a about="' + o.object + '" href="' + o.url + '" property="as:url">' + o.url + '</a></dd></dl>' : ''
+
+  var asobject = ('object' in o) ? '<dt>Object</dt><dd><a href="' + o.object + '" property="as:object">' + o.object + '</a>' + asObjectTypes + asObjectLicense + asinReplyTo + asObjectURL + '</dd>' : ''
+
+  var ascontext = ('context' in o && o.context.length > 0) ? '<dt>Context</dt><dd><a href="' + o.context + '" property="as:context">' + o.context + '</a></dd>' : ''
+
+  var astarget = ('target' in o && o.target.length > 0) ? '<dt>Target</dt><dd><a href="' + o.target + '" property="as:target">' + o.target + '</a></dd>' : ''
+
+  var datetime = getDateTimeISO()
+  var asupdated = '<dt>Updated</dt><dd><time datetime="' + datetime + '" datatype="xsd:dateTime" property="as:updated" content="' + datetime + '">' + datetime.substr(0, 19).replace('T', ' ') + '</time></dd>'
+
+  var assummary = ('summary' in o && o.summary.length > 0) ? '<dt>Summary</dt><dd property="as:summary" datatype="rdf:HTML">' + o.summary + '</dd>' : ''
+
+  var ascontent = ('content' in o && o.content.length > 0) ? '<dt>Content</dt><dd property="as:content" datatype="rdf:HTML">' + o.content + '</dd>' : ''
+
+  var asactor = (Config.User.IRI) ? '<dt>Actor</dt><dd><a href="' + Config.User.IRI + '" property="as:actor">' + Config.User.IRI + '</a></dd>' : ''
+
+  var notificationLicense = o.license || Config.NotificationLicense
+  var license = notificationLicense ? '<dt>License</dt><dd><a href="' + notificationLicense + '" property="dcterms:license">' + notificationLicense + '</a></dd>' : ''
+
+  var asto = ('to' in o && o.to.length > 0 && !o.to.match(/\s/g) && o.to.match(/^https?:\/\//gi)) ? '<dt>To</dt><dd><a href="' + o.to + '" property="as:to">' + o.to + '</a></dd>' : ''
+
+  var statements = ('statements' in o) ? o.statements : ''
+
+  var dl = [
+    types,
+    asobject,
+    ascontext,
+    astarget,
+    asupdated,
+    assummary,
+    ascontent,
+    asactor,
+    license,
+    asto
+  ].map(function (n) { if (n !== '') { return '      ' + n + '\n' } }).join('')
+
+
+  // TODO: Come up with a better title. reuse `types` e.g., Activity Created, Announced..
+  var title = 'Notification'
+  if (types.indexOf('as:Announce') > -1) {
+    title += ': Announced'
+  } else if (types.indexOf('as:Create') > -1) {
+    title += ': Created'
+  } else if (types.indexOf('as:Like') > -1) {
+    title += ': Liked'
+  } else if (types.indexOf('as:Dislike') > -1) {
+    title += ': Disliked'
+  } else if (types.indexOf('as:Add') > -1) {
+    title += ': Added'
+  }
+
+  var data = '<article' + prefixes + '>\n\
+  <h1>' + title + '</h1>\n\
+  <section>\n\
+    <dl about="">\n\
+' + dl +
+    '    </dl>\n\
+  </section>\n\
+  <section>\n\
+' + statements + '\n\
+  </section>\n\
+</article>'
+
+  return data
+}
+
+// Object markup for the library's object.html: as:object link plus types, license, inReplyTo, statements RDFa
+export function createActivityObjectHTML(o) {
+  var rows = '';
+
+  if ('objectTypes' in o && o.objectTypes.length > 0) {
+    rows += '<dt>Types</dt>';
+    o.objectTypes.forEach(t => {
+      rows += '<dd><a about="' + o.object + '" href="' + t + '" typeof="' + t + '">' + t + '</a></dd>';
+    });
+  }
+
+  if ('statements' in o) {
+    var statements = o.statements.trim();
+    var wrapped = statements.match(/^<dl[^>]*>([\s\S]*)<\/dl>$/);
+    rows += wrapped ? wrapped[1].trim() : statements;
+  }
+
+  if ('objectLicense' in o && o.objectLicense.length > 0) {
+    rows += '<dt>License</dt><dd><a href="' + o.objectLicense + '" property="dcterms:license">' + o.objectLicense + '</a></dd>';
+  }
+
+  if ('inReplyTo' in o) {
+    rows += '<dt>In reply to</dt><dd><a href="' + o.inReplyTo + '" property="as:inReplyTo">' + o.inReplyTo + '</a></dd>';
+  }
+
+  if ('url' in o) {
+    rows += '<dt>URL</dt><dd><a href="' + o.url + '" property="as:url">' + o.url + '</a></dd>';
+  }
+
+  var objectProperties = rows ? '<dl about="' + o.object + '">' + rows + '</dl>' : '';
+
+  return '<a href="' + o.object + '" property="as:object">' + o.object + '</a>' + objectProperties;
+}
+
+// AS activity as JSON-LD; o.note embeds the annotation's JSON-LD, otherwise the object is the IRI
+export function createActivityJSONLD(o) {
+  const params = { type: o.type || [] };
+
+  if (Config.User.IRI) { params.actor = Config.User.IRI; }
+
+  if (o.note) {
+    const jsonld = serializeAnnotationToJSONLD(o.note);
+    if (o.url) jsonld.url = o.url;
+    params.object = { jsonld };
+  } else if (o.object) {
+    params.object = o.object;
+  }
+
+  if (o.target && o.target.length) { params.target = o.target; }
+  if (o.context && o.context.length) { params.context = o.context; }
+  if (o.summary && o.summary.length) { params.summary = o.summary; }
+  if (o.content && o.content.length) { params.content = o.content; }
+  if (o.to && typeof o.to === 'string' && /^https?:\/\//i.test(o.to) && !/\s/.test(o.to)) { params.to = o.to; }
+
+  const license = o.license || Config.NotificationLicense;
+  if (license) { params.license = license; }
+
+  const notification = createNotification(params);
+
+  return serializeNotificationToJSONLD(notification);
+}
+
+const OBJECT_ABOUT_MOTIVATIONS = new Set([
+  'oa:replying', 'oa:assessing', 'oa:questioning', 'oa:bookmarking', 'as:Like', 'as:Dislike'
+]);
+
+// Maps render context onto serialize options, then delegates to @dokieli/web-annotation
+export function createNoteDataHTML(n, serializerOptions = {}) {
+  const mode = n.mode || 'write';
+  const headingLevel = mode === 'read' ? 3 : mode === 'object' ? 2 : 1;
+
+  const options = {
+    headingLevel,
+    about: getAnnotationAbout(n, mode),
+    labels: getAnnotationLabels(),
+    licenses: Config.License,
+    resolveImage: (creator) => resolveAnnotationAvatar(creator, mode),
+    resolveName: (creator) => creator.name || (creator.iri ? getUserLabelOrIRI(creator.iri) : undefined),
+    resolveLanguageName: (code) => {
+      const entry = Config.Languages[code] || Config.Languages[code.split('-')[0]];
+      return entry ? entry.sourceName : undefined;
+    },
+    ...serializerOptions
+  };
+
+  // Embedded reference kinds render here; the rest goes through the library
+  let note;
+  if (n.type === 'ref-footnote') {
+    note = renderFootnote(n);
+  } else if (n.type === 'ref-citation') {
+    note = renderCitation(n, options);
+  } else {
+    note = serializeAnnotationToHTML(n, options);
+    // Anonymous placeholder avatar; display-only, never in the graph
+    if (n.creator && !resolveAnnotationAvatar(n.creator, mode)) {
+      const placeholder = '<img alt="" height="48" src="' + Config.IconBase64['.fas.fa-user-secret'] + '" width="48" /> ';
+      note = note.replace(/(<span rel="dcterms:creator"><span about="[^"]*"[^>]*>)/, '$1' + placeholder);
+    }
+  }
+
+  // TODO: implement retraction (nanopubs cannot be deleted, only retracted)
+  if (mode === 'read' && n.creator && n.creator.iri === Config.User.IRI && !n.nanopub) {
+    const buttonDelete = '<button aria-label="Delete item" class="delete do" title="Delete item" type="button">' + Icon['.fas.fa-trash-alt'] + '</button>';
+    note = note.replace('>', '>' + buttonDelete);
+  }
+
+  return note;
+}
+
+// Localized label slots; other labels use the library's English defaults
+function getAnnotationLabels() {
+  return {
+    language: i18n.t('language.label.textContent', { defaultValue: 'Language' }),
+    license: i18n.t('license.label.textContent', { defaultValue: 'License' }),
+    rights: i18n.t('rights.label.textContent', { defaultValue: 'Rights' }),
+    tags: i18n.t('tags.label.textContent', { defaultValue: 'Tags' }),
+  };
+}
+
+// RDFa subject for the annotation article: stored IRI in read mode, else fragment when AS-embedded
+function getAnnotationAbout(n, mode) {
+  if (mode === 'read' && n.iri) return n.iri;
+  const objectAbout = n.type === 'ref-citation' ||
+    OBJECT_ABOUT_MOTIVATIONS.has(getPrefixedNameFromIRI(n.motivatedBy || ''));
+  if (objectAbout) return mode === 'object' ? '#' + n.id : '';
+  return '#' + n.id;
+}
+
+// Creator avatar per dokieli's resolution order; undefined falls back to the serializer default
+function resolveAnnotationAvatar(creator, mode) {
+  let img;
+  if (creator.image) {
+    img = creator.image;
+  } else if (Config.User.Image && (creator.iri === Config.User.IRI || (Config.User.SameAs && Config.User.SameAs.includes(creator.iri)))) {
+    img = Config.User.Image;
+  } else if (Config.User.Contacts && Config.User.Contacts[creator.iri] && Config.User.Contacts[creator.iri].Image) {
+    img = Config.User.Contacts[creator.iri].Image;
+  }
+  if (!img) return undefined;
+  return mode === 'read' ? getProxyableIRI(img) : img;
+}
+
+export function addMessageToLog(message, log, options = {}) {
+  const m = Object.assign({}, message);
+  m['dateTime'] = getDateTimeISO();
+  log.unshift(m);
+
+  // Only the main log persists across sessions
+  if (log === Config.MessageLog) saveMessageLog();
+}
+
+export function handleActionMessage(resolved, rejected) {
+  if (resolved) {
+    const { response, message } = resolved;
+    showActionMessage(document.body, message);
+  }
+  else if (rejected) {
+    const { error, message } = rejected;
+    showActionMessage(document.body, message);
+  }
+}
+
+export function showActionMessage(node, message, options = {}) {
+  if (!node || !message) return;
+
+  if (options.clearId) {
+    document.getElementById(options.clearId)?.remove();
+  }
+
+  message['timer'] = ('timer' in message) ? message.timer : Config.ActionMessage.Timer;
+  message['type'] = ('type' in message) ? message.type : 'info';
+
+  const id = generateAttributeId();
+  const messageItem = domSanitize('<li id="' + id + '" class="' + message.type + '">' + buttonIcons[message.type].icon + ' ' + message.content + '</li>');
+
+  let aside = node.querySelector('#document-action-message');
+  if (!aside) {
+    var buttonClose = getButtonHTML({ key: 'dialog.document-action-message.close.button', button: 'close', buttonClass: 'close', iconSize: 'fa-2x' });
+
+    node.appendChild(fragmentFromString(`
+      <aside aria-labelledby="document-action-message-label" class="do on" dir="${Config.User.UI.LanguageDir}" id="document-action-message" lang="${Config.User.UI.Language}" rel="schema:hasPart" resource="#document-action-message" role="status" tabindex="0" xml:lang="${Config.User.UI.Language}">
+        <h2 data-i18n="dialog.document-action-message.messages.h2" id="document-action-message-label" property="schema:name">${i18n.t('dialog.document-action-message.messages.h2.textContent')}</h2>
+        ${buttonClose}
+        <ul role="log"></ul>
+      </aside>
+    `));
+    aside = node.querySelector('#document-action-message');
+  }
+  sanitizeInsertAdjacentHTML(aside.querySelector('ul[role="log"]'), 'afterbegin', messageItem);
+
+  let timerId = null;
+
+  function startTimer() {
+    if (message.timer !== null) {
+      timerId = window.setTimeout(() => {
+        const aside = node.querySelector('#document-action-message');
+        if (aside) {
+          const li = aside?.querySelector('#' + id);
+          if (li) {
+            li.parentNode.removeChild(li);
+          }
+
+          const remaining = aside?.querySelector('h2 + ul > li');
+          if (!remaining && aside) {
+            node.removeChild(aside);
+          }
+        }
+      }, message.timer);
+    }
+  }
+
+  function clearTimer() {
+    if (timerId !== null) {
+      clearTimeout(timerId);
+      timerId = null;
+    }
+  }
+
+  if (message.timer !== null) {
+    startTimer();
+
+    const pauseEvents = ['mouseenter', 'focusin'];
+    const resumeEvents = ['mouseleave', 'focusout'];
+
+    pauseEvents.forEach(evt => aside.addEventListener(evt, clearTimer));
+    resumeEvents.forEach(evt => aside.addEventListener(evt, startTimer));
+  }
+
+  return id;
+}
+
+export function insertDocumentLevelHTML(rootNode, h, options) {
+  rootNode = rootNode || document;
+  options = options || {};
+  h = domSanitize(h);
+
+  options['id'] = ('id' in options) ? options.id : Config.DocumentItems[Config.DocumentItems.length - 1];
+
+  var item = Config.DocumentItems.indexOf(options.id);
+
+  var article = selectArticleNode(rootNode);
+
+  var sectioningElements = ['article', 'aside', 'nav', 'section'];
+  var skipElements = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'];
+
+  h = '\n\
+' + h;
+
+  if (item > -1) {
+    for (var i = item; i >= 0; i--) {
+      var node = rootNode.querySelector('#' + Config.DocumentItems[i]);
+
+      if (node) {
+        if (skipElements.indexOf(node.nodeName.toLowerCase()) > -1) {
+          node = node.closest(sectioningElements.join(',')) || article;
+        }
+        sanitizeInsertAdjacentHTML(node, 'afterend', h);
+        break;
+      }
+      else if (i == 0) {
+        var a = article.querySelector('h1');
+
+        if (a) {
+          sanitizeInsertAdjacentHTML(a, 'afterend', h);
+        }
+        else {
+          sanitizeInsertAdjacentHTML(article, 'afterbegin', h);
+        }
+        break;
+      }
+    }
+  }
+  else {
+    sanitizeInsertAdjacentHTML(article, 'afterbegin', h);
+  }
+
+  return rootNode;
+}
+
+export function setDate(rootNode, options) {
+  rootNode = rootNode || document;
+  options = options || {};
+
+  var id = (options.id) ? options.id : `document-created`;
+
+  var node = ('property' in options) ? rootNode.querySelector('#' + id + ' [property="' + options.property + '"]') : rootNode.querySelector('#' + id + ' time');
+
+  if (node) {
+    var datetime = ('datetime' in options) ? options.datetime.toISOString() : getDateTimeISO();
+
+    if (node.getAttribute('datetime')) {
+      node.setAttribute('datetime', datetime);
+    }
+    if (node.getAttribute('content')) {
+      node.setAttribute('content', datetime);
+    }
+    node.textContent = i18n.tDoc('datetime.time.textContent', { val: new Date(datetime.substr(0, datetime.indexOf('T'))) });
+  }
+  else {
+    rootNode = insertDocumentLevelHTML(rootNode, createDateHTML(options), { 'id': id });
+  }
+
+  return rootNode;
+}
+
+export function createDateHTML(options) {
+  options = options || {};
+
+  var titleKey = ('id' in options) ? options.id.replace(/^(document|dataset)-/, '') : 'created';
+
+  var id = ('id' in options && options.id.length > 0) ? ' id="' + options.id + '"' : '';
+
+  var c = ('class' in options && options.class.length > 0) ? ' class="' + options.class + '"' : '';
+
+  var datetime = ('datetime' in options) ? options.datetime.toISOString() : getDateTimeISO();
+  // var datetimeLabel = datetime.substr(0, datetime.indexOf('T'));
+  var datetimeLabel = i18n.tDoc('datetime.time.textContent', { val: new Date(datetime) });
+
+  var time = ('property' in options)
+    ? `<time content="${datetime}" datatype="xsd:dateTime" datetime="${datetime}" property="${options.property}">${datetimeLabel}</time>`
+    : `<time datetime="${datetime}">${datetimeLabel}</time>`;
+
+  var date = `
+    <dl${c}${id}>
+      <dt>${i18n.tDoc(`datetime.${titleKey}.dt.textContent`)}</dt>
+      <dd>${time}</dd>
+    </dl>`;
+
+  return date;
+}
+
+// XXX: Parts of this may need to be ported. Ensure sanitization.
+// export function setEditSelections(options) {
+//   options = options || {};
+
+//   if (!('datetime' in options)) {
+//     options['datetime'] = new Date();
+//   }
+
+//   Config.ContributorRoles.forEach(contributorRole => {
+//     // console.log(contributorRole)
+//     var contributorNodeId = 'document-' + contributorRole + 's';
+//     var contributorNode = document.getElementById(contributorNodeId);
+//     if (contributorNode) {
+//       if (contributorNode.classList.contains('do')) {
+//         contributorNode.removeAttribute('class');
+//       }
+//       contributorNode.removeAttribute('contenteditable');
+
+//       var contributorSelected = document.querySelectorAll('#' + contributorNodeId + ' .do.selected');
+//       contributorSelected.forEach(selected => {
+//         selected.removeAttribute('class');
+//         selected.removeAttribute('contenteditable');
+//       });
+
+//       var remaining = document.querySelectorAll('#' + contributorNodeId + ' .do');
+//       remaining.forEach(i => {
+//         i.parentNode.removeChild(i);
+//       });
+
+//       var dd = document.querySelectorAll('#' + contributorNodeId + ' dd');
+//       if (contributorNode && dd.length == 0) {
+//         contributorNode = document.getElementById(contributorNodeId);
+//         contributorNode.parentNode.removeChild(contributorNode);
+//       }
+//     }
+//   });
+
+
+//   var documentLanguage = 'document-language';
+//   var dLangS = document.querySelector('#' + documentLanguage + ' option:checked');
+
+//   if (dLangS) {
+//     var languageValue = dLangS.value;
+
+//     var dl = dLangS.closest('#' + documentLanguage);
+//     dl.removeAttribute('contenteditable');
+
+//     if (languageValue == '') {
+//       dl.parentNode.removeChild(dl);
+//     }
+//     else {
+//       dl.removeAttribute('class');
+//       var dd = dLangS.closest('dd');
+//       dd.parentNode.removeChild(dd);
+//       dd = '<dd><span content="' + languageValue + '" lang="" property="dcterms:language" xml:lang="">' + Config.Languages[languageValue].sourceName + '</span></dd>';
+//       dl.sanitizeInsertAdjacentHTML('beforeend', dd);
+//     }
+//   }
+
+
+//   var documentLicense = 'document-license';
+//   var dLS = document.querySelector('#' + documentLicense + ' option:checked');
+
+//   if (dLS) {
+//     var licenseIRI = dLS.value;
+
+//     dl = dLS.closest('#' + documentLicense);
+//     dl.removeAttribute('contenteditable');
+
+//     if (licenseIRI == '') {
+//       dl.parentNode.removeChild(dl);
+//     }
+//     else {
+//       dl.removeAttribute('class');
+//       dd = dLS.closest('dd');
+//       dd.parentNode.removeChild(dd);
+//       dd = '<dd><a href="' + licenseIRI + '" rel="schema:license" title="' + Config.License[licenseIRI].description + '">' + Config.License[licenseIRI].name + '</a></dd>';
+//       dl.sanitizeInsertAdjacentHTML('beforeend', dd);
+//     }
+//   }
+
+
+//   var documentType = 'document-type';
+//   var dTS = document.querySelector('#' + documentType + ' option:checked');
+
+//   if (dTS) {
+//     var typeIRI = dTS.value;
+
+//     dl = dTS.closest('#' + documentType);
+//     dl.removeAttribute('contenteditable');
+
+//     if (typeIRI == '') {
+//       dl.parentNode.removeChild(dl);
+//     }
+//     else {
+//       dl.removeAttribute('class');
+//       dd = dTS.closest('dd');
+//       dd.parentNode.removeChild(dd);
+//       dd = '<dd><a href="' + typeIRI + '" rel="rdf:type">' + Config.ResourceType[typeIRI].name + '</a></dd>';
+//       dl.sanitizeInsertAdjacentHTML('beforeend', dd);
+//     }
+//   }
+
+
+//   var documentStatus = 'document-status';
+//   var dSS = document.querySelector('#' + documentStatus + ' option:checked');
+
+//   if (dSS) {
+//     var statusIRI = dSS.value;
+
+//     dl = dSS.closest('#' + documentStatus);
+//     dl.removeAttribute('contenteditable');
+
+//     if (statusIRI == '') {
+//       dl.parentNode.removeChild(dl);
+//     }
+//     else {
+//       dl.removeAttribute('class');
+//       dd = dSS.closest('dd');
+//       dd.parentNode.removeChild(dd);
+//       dd = '<dd prefix="pso: http://purl.org/spar/pso/" rel="pso:holdsStatusInTime" resource="#' + generateAttributeId() + '"><span rel="pso:withStatus" resource="' + statusIRI + '" typeof="pso:PublicationStatus">' + Config.PublicationStatus[statusIRI].name + '</span></dd>';
+
+//       dl.sanitizeInsertAdjacentHTML('beforeend', dd);
+
+//       if (statusIRI == 'http://purl.org/spar/pso/published') {
+//         setDate(document, { 'id': 'document-published', 'property': 'schema:datePublished', 'datetime': options.datetime });
+//       }
+//     }
+//   }
+
+//   var documentTestSuite = 'document-test-suite';
+//   var dTSS = document.querySelector('#' + documentTestSuite + ' input');
+
+//   if (dTSS) {
+//     var testSuiteIRI = dTSS.value;
+
+//     dl = dTSS.closest('#' + documentTestSuite);
+//     dl.removeAttribute('contenteditable');
+
+//     if (testSuiteIRI == '') {
+//       dl.parentNode.removeChild(dl);
+//     }
+//     else {
+//       dl.removeAttribute('class');
+//       dd = dTSS.closest('dd');
+//       dd.parentNode.removeChild(dd);
+//       dd = '<dd><a href="' + testSuiteIRI + '" rel="spec:testSuite">' + testSuiteIRI + '</a></dd>';
+//       dl.sanitizeInsertAdjacentHTML('beforeend', dd);
+//     }
+//   }
+
+//   var documentInbox = 'document-inbox';
+//   var dIS = document.querySelector('#' + documentInbox + ' input');
+
+//   if (dIS) {
+//     var inboxIRI = dIS.value;
+
+//     dl = dIS.closest('#' + documentInbox);
+//     dl.removeAttribute('contenteditable');
+
+//     if (inboxIRI == '') {
+//       dl.parentNode.removeChild(dl);
+//     }
+//     else {
+//       dl.removeAttribute('class');
+//       dd = dIS.closest('dd');
+//       dd.parentNode.removeChild(dd);
+//       dd = '<dd><a href="' + inboxIRI + '" rel="ldp:inbox">' + inboxIRI + '</a></dd>';
+//       dl.sanitizeInsertAdjacentHTML('beforeend', dd);
+//     }
+//   }
+
+//   var documentInReplyTo = 'document-in-reply-to';
+//   var dIRTS = document.querySelector('#' + documentInReplyTo + ' input');
+
+//   if (dIRTS) {
+//     var inReplyToIRI = dIRTS.value;
+
+//     dl = dIRTS.closest('#' + documentInReplyTo);
+//     dl.removeAttribute('contenteditable');
+
+//     if (inReplyToIRI == '') {
+//       dl.parentNode.removeChild(dl);
+//     }
+//     else {
+//       dl.removeAttribute('class');
+//       dd = dIRTS.closest('dd');
+//       dd.parentNode.removeChild(dd);
+//       dd = '<dd><a href="' + inReplyToIRI + '" rel="as:inReplyTo">' + inReplyToIRI + '</a></dd>';
+//       dl.sanitizeInsertAdjacentHTML('beforeend', dd);
+//     }
+//   }
+
+//   getResourceInfo();
+// }
+
+//TODO: Consider if/how setDocumentRelation and createDefinitionListHTML
+export function setDocumentRelation(rootNode, data, options) {
+  rootNode = rootNode || document;
+  if (!data || !options) { return; }
+
+  var h = [];
+  var dl = rootNode.querySelector('#' + options.id);
+  var dd;
+
+  data.forEach(d => {
+    var documentRelation = domSanitize('<dd>' + createRDFaHTML(d) + '</dd>');
+
+    if (dl) {
+      if (Config.DocumentItems.indexOf(options.id) > -1) {
+        dd = dl.querySelector('dd');
+        dl.removeChild(dd);
+      }
+      else {
+        var relation = dl.querySelector('[rel="' + d.rel + '"][href="' + d.href + '"]');
+
+        if (relation) {
+          dd = relation.closest('dd');
+          if (dd) {
+            dl.removeChild(dd);
+          }
+        }
+      }
+      sanitizeInsertAdjacentHTML(dl, 'beforeend', documentRelation);
+    }
+    else {
+      h.push(documentRelation);
+    }
+  });
+
+  if (h.length) {
+    var html = '<dl id="' + options.id + '"><dt>' + options.title + '</dt>' + h.join('') + '</dl>';
+    rootNode = insertDocumentLevelHTML(rootNode, html, { 'id': options.id });
+  }
+
+  return rootNode;
+}
+
+export function showTimeMap(node, url) {
+  url = url || Config.OriginalResourceInfo['timemap']
+  if (!url) { return; }
+
+  var elementId = 'memento-document';
+
+  getResourceGraph(url)
+    .then(({ graph: g }) => {
+      // console.log(g)
+      if (!node) {
+        node = document.getElementById(elementId);
+        if (!node) {
+          var buttonClose = getButtonHTML({ key: 'dialog.memento-document.close.button', button: 'close', buttonClass: 'close', iconSize: 'fa-2x' });
+
+          document.body.appendChild(fragmentFromString(`
+            <aside aria-labelledby="${elementId}-label" class="do on" dir="${Config.User.UI.LanguageDir}" id="${elementId}" lang="${Config.User.UI.Language}" rel="schema:hasPart" resource="#memento-document" xml:lang="${Config.User.UI.Language}">
+              <h2 id="${elementId}-label" property="schema:name">Memento</h2>
+              ${buttonClose}
+              <dl>
+                <dt>TimeMap</dt>
+                <dd><a href="${url}">${url}</a></dd>
+              </dl>
+            </aside>
+          `));
+          node = document.getElementById(elementId);
+        }
+      }
+
+      var timemap = node.querySelector('.memento');
+
+      if (timemap) {
+        node.removeChild(timemap);
+      }
+
+      var items = [];
+      var triples = sortGraphTriples(g, { sortBy: 'object' });
+      triples.forEach(t => {
+        var s = t.subject.value;
+        var p = t.predicate.value;
+        var o = t.object.value;
+
+        if (p === ns.mem.mementoDateTime.value) {
+          items.push('<li><a href="' + s + '" rel="noopener" target="_blank">' + o + '</a></li>');
+        }
+      });
+
+      var html = '<dl class="memento"><dt>Memento</dt><dd><ul>' + items.join('') + '</ul></dd></dl>';
+
+      sanitizeInsertAdjacentHTML(node, 'beforeend', html);
+
+      node = document.getElementById(elementId);
+      node.addEventListener('click', e => {
+        if (e.target.closest('button.close')) {
+          document.querySelector('#document-menu .resource-memento').disabled = false
+        }
+      });
+    })
+    .catch(error => {
+      // console.error(error)
+    });
+}
+
+export function setDocumentStatus(rootNode, options) {
+  rootNode = rootNode || document;
+  options = options || {};
+
+  var s = getDocumentStatusHTML(rootNode, options);
+
+  rootNode = insertDocumentLevelHTML(rootNode, s, options);
+
+  return rootNode;
+}
+
+export function getDocumentStatusHTML(rootNode, options) {
+  rootNode = rootNode || document;
+  options = options || {};
+  options['mode'] = ('mode' in options) ? options.mode : '';
+  options['id'] = ('id' in options) ? options.id : 'document-status';
+  var subjectURI = ('subjectURI' in options) ? ' about="' + options.subjectURI + '"' : '';
+  var typeLabel = '', typeOf = '';
+  var definitionTitle;
+
+  switch (options.type) {
+    default:
+      definitionTitle = 'Document Status';
+      break;
+    case 'mem:Memento':
+      definitionTitle = 'Resource State';
+      typeLabel = 'Memento';
+      typeOf = ' typeof="' + options.type + '"';
+      break;
+  }
+
+  var id = ' id="' + options.id + '"';
+  var c = ('class' in options && options.class.length > 0) ? ' class="' + options.class + '"' : '';
+  // var datetime = ('datetime' in options) ? options.datetime : util.getDateTimeISO();
+
+  var dd = '<dd><span' + subjectURI + typeOf + '>' + typeLabel + '</span></dd>';
+
+  var s = '';
+  var dl = rootNode.querySelector('#' + options.id);
+
+  //FIXME: mode should be an array of operations.
+
+  //TODO: s/update/append
+  switch (options.mode) {
+    case 'create': default:
+      s = '<dl' + c + id + '><dt>' + definitionTitle + '</dt>' + dd + '</dl>';
+      break;
+
+    case 'update':
+      if (dl) {
+        var clone = dl.cloneNode(true);
+        dl.parentNode.removeChild(dl);
+        sanitizeInsertAdjacentHTML(clone, 'beforeend', dd);
+        s = clone.outerHTML;
+      }
+      else {
+        s = '<dl' + c + id + '><dt>' + definitionTitle + '</dt>' + dd + '</dl>';
+      }
+      break;
+
+    case 'delete':
+      if (dl) {
+        clone = dl.cloneNode(true);
+        dl.parentNode.removeChild(dl);
+
+        var t = clone.querySelector('[typeof="' + options.type + '"]');
+        if (t) {
+          t.closest('dl').removeChild(t.parentNode);
+        }
+
+        var cloneDD = clone.querySelectorAll('#' + options.id + ' dd');
+        if (cloneDD.length > 0) {
+          s = clone.outerHTML;
+        }
+      }
+      break;
+  }
+
+  // console.log(s);
+  return s;
+}
+
+
+export function handleDeleteNote(button) {
+  button.setAttribute("disabled", "disabled");
+  var article = button.closest('article');
+  var refId = 'r-' + article.id;
+  var li = article.closest('li:has(blockquote[cite])');
+  var cite = li.querySelector('blockquote[cite]').getAttribute('cite');
+
+  var url = new URL(cite);
+  url = url.href.replace(url.hash, '');
+
+  if (url) {
+    Config.Storage.delete(url)
+      .then(() => {
+        li.parentNode.removeChild(li);
+        if (Config.EditorEnabled && Config.Editor.editorView) {
+          const view = Config.Editor.editorView;
+          const { state: { doc, tr, schema }, dispatch } = view;
+          doc.descendants((node, pos) => {
+            if (node.type.name === 'span' && node.attrs.originalAttributes?.resource === '#' + refId) {
+              const remainingSups = node.content.content.filter(c => c.type.name === 'sup').length;
+              if (remainingSups <= 1) {
+                let text = '';
+                node.forEach(child => { if (child.type.name !== 'sup') text += child.textContent; });
+                view.dispatch(text ? tr.replaceWith(pos, pos + node.nodeSize, schema.text(text)) : tr.delete(pos, pos + node.nodeSize));
+              } else {
+                // Remove only the sup whose resource matches the deleted annotation IRI
+                let supPos = -1, supSize = 0;
+                node.forEach((child, offset) => {
+                  if (child.type.name === 'sup') {
+                    child.forEach((a) => {
+                      if (a.attrs.originalAttributes?.resource === cite) {
+                        supPos = pos + 1 + offset;
+                        supSize = child.nodeSize;
+                      }
+                    });
+                  }
+                });
+                if (supPos >= 0) view.dispatch(tr.delete(supPos, supPos + supSize));
+              }
+              return false;
+            }
+          });
+        } else {
+          // Find the specific <sup> by its annotation IRI (resource attribute on its <a>)
+          var supAnchor = document.querySelector('sup > a[resource="' + cite + '"]');
+          if (supAnchor) {
+            var sup = supAnchor.parentElement;
+            var spanRef = sup.closest('span.ref');
+            sup.parentNode.removeChild(sup);
+            // Only unwrap the mark when no sups remain
+            if (spanRef && !spanRef.querySelector('sup')) {
+              spanRef.outerHTML = domSanitize(spanRef.querySelector('mark').textContent);
+            }
+          } else {
+            // Fallback: remove by refId (handles annotations created in this session before reload)
+            var span = document.querySelector('span[resource="#' + refId + '"]');
+            if (span) {
+              span.outerHTML = domSanitize(span.querySelector('mark').textContent);
+            }
+          }
+        }
+        window.history.replaceState({}, null, Config.DocumentURL);
+        // TODO: Delete notification or send delete activity
+      })
+      .catch(error => {
+        console.log(error);
+        //TODO: Alert user.. try again later or..?
+        li.classList.add('error');
+      })
+  }
+}
+
+export function getGraphContributorsRole(g, options) {
+  options = options || {};
+  options['sort'] = options['sort'] || false;
+  options['role'] = options['role'] || 'contributor';
+  // console.log(options)
+  var contributors;
+
+  switch (options.role) {
+    case 'contributor':
+    default:
+      contributors = getGraphContributors(g);
+      break;
+    case 'author':
+      contributors = getGraphAuthors(g);
+      break;
+    case 'creator':
+      contributors = getGraphCreators(g);
+      break;
+    case 'editor':
+      contributors = getGraphEditors(g);
+      break;
+    case 'performer':
+      contributors = getGraphPerformers(g);
+      break;
+    case 'publisher':
+      contributors = getGraphPublishers(g);
+      break;
+  }
+
+  if (!contributors || contributors.length === 0) {
+    return undefined;
+  }
+
+  var contributorData = [];
+
+  contributors.forEach(contributor => {
+    var aUN = {};
+    aUN['uri'] = contributor;
+    //XXX: Only checks within the same document.
+    var go = g.node(rdf.namedNode(contributor));
+
+    var label = getGraphLabel(go);
+    if (label) {
+      aUN['name'] = label;
+    }
+
+    var email = getGraphEmail(go);
+    if (email) {
+      // email = (typeof email === 'string') ? email : email.iri().toString();
+      aUN['email'] = email.startsWith('mailto:') ? email.slice(7) : email;
+    }
+
+    contributorData.push(aUN)
+  });
+
+  if (options.sort) {
+    contributorData.sort(function (a, b) {
+      // Sort by name if available, otherwise by uri, and then by email
+      return a.name
+        ? b.name
+          ? a.name.localeCompare(b.name)
+          : -1
+        : b.name
+          ? 1
+          : a.uri.localeCompare(b.uri);
+    });
+  }
+
+  return contributorData;
+}
+
+//Preferred IRI to use as an annotation target for a resource (RFC 8574 cite-as, then latest-version), from Link headers and the resource's graph.
+export function getPreferredTargetIRI(documentURL) {
+  documentURL = documentURL || Config.DocumentURL;
+  var resource = Config.Resource?.[documentURL];
+  if (!resource) return undefined;
+
+  var linkHeaders = resource.headers?.linkHeaders;
+  var graph = resource.graph;
+
+  var fromLinkHeader = (rel) => {
+    if (linkHeaders?.has('rel', rel)) {
+      return sanitizeIRI(linkHeaders.rel(rel)[0].uri);
+    }
+  };
+  var fromGraph = (rel) => {
+    var values = graph?.node(rdf.namedNode(documentURL)).out(ns.rel[rel]).values;
+    return values?.length ? sanitizeIRI(values[0]) : undefined;
+  };
+
+  for (var rel of ['cite-as', 'latest-version']) {
+    var iri = fromLinkHeader(rel) || fromGraph(rel);
+    if (iri) return iri;
+  }
+}
+
+//TODO: Rename this to avoid confusion with graph.getGraphFromData
+export function getGraphData(s, options) {
+  var documentURL = options['subjectURI'];
+
+  var info = {
+    'state': ns.ldp.RDFSource.value,
+    'profile': ns.ldp.RDFSource.value
+  };
+
+  info['graph'] = s;
+  info['rdftype'] = getGraphTypes(s);
+
+  info['title'] = getGraphTitle(s);
+  // info['label'] = graph.getGraphLabel(s);
+  info['published'] = getGraphPublished(s);
+  info['updated'] = getGraphUpdated(s);
+  info['description'] = getGraphDescription(s);
+  info['license'] = getGraphLicense(s);
+  info['rights'] = getGraphRights(s);
+  info['language'] = getGraphLanguage(s);
+  // info['summary'] = graph.getGraphSummary(s);
+  info['creators'] = getGraphContributorsRole(s, { role: 'creator' });
+  info['contributors'] = getGraphContributorsRole(s, { role: 'contributor' });
+  info['authors'] = getGraphContributorsRole(s, { role: 'author' });
+  info['editors'] = getGraphContributorsRole(s, { role: 'editor' });
+  info['performers'] = getGraphContributorsRole(s, { role: 'performer' });
+  info['publishers'] = getGraphContributorsRole(s, { role: 'publisher' });
+  info['audience'] = getGraphAudience(s);
+
+  info['profile'] = ns.ldp.RDFSource.value;
+
+  //Check if the resource is immutable
+  s.out(ns.rdf.type).values.forEach(type => {
+    if (type == ns.mem.Memento.value) {
+      info['state'] = ns.mem.Memento.value;
+    }
+  });
+
+  var original = s.out(ns.mem.original).values;
+  if (original.length) {
+    info['state'] = ns.mem.Memento.value;
+    info['original'] = original[0];
+
+    if (info['original'] == options['subjectURI']) {
+      //URI-R (The Original Resource is a Fixed Resource)
+      info['profile'] = ns.mem.OriginalResource.value;
+    }
+    else {
+      //URI-M
+      info['profile'] = ns.mem.Memento.value;
+    }
+  }
+
+  var memento = s.out(ns.mem.memento).values;
+  if (memento.length) {
+    //URI-R
+    info['profile'] = ns.mem.OriginalResource.value;
+    info['memento'] = memento[0];
+  }
+
+  original = s.out(ns.mem.original).values;
+  memento = s.out(ns.mem.memento).values;
+  if (original.length && memento.length && original[0] != memento[0]) {
+    //URI-M (Memento without a TimeGate)
+    info['profile'] = ns.mem.Memento.value;
+    info['original'] = original[0];
+    info['memento'] = memento[0];
+  }
+
+  var citeAs = s.out(ns.rel['cite-as']).values;
+  if (citeAs.length) {
+    info['cite-as'] = citeAs[0];
+  }
+
+  var latestVersion = s.out(ns.rel['latest-version']).values;
+  if (latestVersion.length) {
+    info['latest-version'] = latestVersion[0];
+  }
+
+  var predecessorVersion = s.out(ns.rel['predecessor-version']).values;
+  if (predecessorVersion.length) {
+    info['predecessor-version'] = predecessorVersion[0];
+  }
+
+  var timemap = s.out(ns.mem.timemap).values;
+  if (timemap.length) {
+    info['timemap'] = timemap[0];
+  }
+  else {
+    info['timemap'] = null;
+  }
+
+  var timegate = s.out(ns.mem.timegate).values;
+  if (timegate.length) {
+    info['timegate'] = timegate[0];
+  }
+
+  if (!Config.OriginalResourceInfo || ('mode' in options && options.mode == 'update')) {
+    Config['OriginalResourceInfo'] = info;
+  }
+
+  info['inbox'] = getGraphInbox(s);
+  info['annotationService'] = s.out(ns.oa.annotationService).values;
+
+  //TODO: Refactor
+  //FIXME: permissionsActions, specrequirement, skosConceptSchemes are assumed to be from document's policies
+
+  var hasPolicy = s.out(ns.odrl.hasPolicy).values;
+  if (hasPolicy.length && s.term.value == documentURL) {
+    info['odrl'] = getResourceInfoODRLPolicies(s);
+  }
+
+  info['spec'] = {};
+
+  var classesOfProducts = s.out(ns.spec.classesOfProducts).values;
+  if (classesOfProducts.length && s.term.value == documentURL) {
+    info['spec']['classesOfProducts'] = getResourceInfoSpecClassesOfProducts(s);
+  }
+
+  var requirement = s.out(ns.spec.requirement).values;
+  if (requirement.length && s.term.value == documentURL) {
+    info['spec']['requirement'] = getResourceInfoSpecRequirements(s);
+  }
+
+  var changelog = s.out(ns.spec.changelog);
+  if (changelog.values.length && s.term.value == documentURL) {
+    if (changelog.out(ns.spec.change).values.length) {
+      info['spec']['change'] = getResourceInfoSpecChanges(changelog);
+    }
+  }
+
+  var advisement = s.out(ns.spec.advisement).values;
+  if (advisement.length && s.term.value == documentURL) {
+    info['spec']['advisement'] = getResourceInfoSpecAdvisements(s);
+  }
+
+  //XXX: change i to s. testing. should be same as subjectURI?
+  info['skos'] = getResourceInfoSKOS(s);
+  info['citations'] = getResourceInfoCitations(s);
+
+  info['video'] = s.out(ns.schema.video).values;
+  info['audio'] = s.out(ns.schema.audio).values;
+
+  return info;
+}
+
+/**
+ * getResourceInfo
+ * 
+ * @param
+ * @param 
+ * @returns {Promise<Object>}
+ */
+
+export async function getResourceInfo(data, options) {
+  const documentOptions = {
+    ...Config.DOMProcessing,
+    format: true,
+    sanitize: true,
+    normalize: true
+  };
+
+  data = data || getDocument(null, documentOptions);
+
+  options = options || {};
+  options['contentType'] = ('contentType' in options) ? options.contentType : 'text/html';
+  options['subjectURI'] = ('subjectURI' in options) ? options.subjectURI : Config.DocumentURL;
+
+  var documentURL = options['subjectURI'];
+
+  Config['Resource'] = Config['Resource'] || {};
+  Config['Resource'][documentURL] = Config['Resource'][documentURL] || {};
+  Config['Resource'][documentURL]['data'] = data;
+  if (options['storeHash']) {
+    Config['Resource'][documentURL]['digestSRI'] = options['digestSRI'] || await getHash(data);
+  }
+  Config['Resource'][documentURL]['contentType'] = options.contentType;
+
+  var promises = [];
+
+  promises.push(getGraphFromDataBlock(data, options));
+  promises.push(getGraphFromData(data, options));
+
+  return Promise.allSettled(promises)
+    .then(resolvedPromises => {
+      const dataset = rdf.dataset();
+
+      resolvedPromises.forEach(response => {
+        if (response.value) {
+          dataset.addAll(response.value.dataset);
+        }
+      })
+
+      return rdf.grapoi({ dataset });
+    })
+    .then(g => {
+      g = g.node(rdf.namedNode(documentURL));
+
+      var info = getGraphData(g, options);
+
+      for (var key in info) {
+        if (Object.hasOwn(info, key) && key !== '__proto__' && key !== 'constructor' && key !== 'prototype') {
+          Config['Resource'][documentURL][key] = info[key];
+        }
+      }
+
+      return info;
+    });
+}
+
+export function getGraphFromDataBlock(data, options) {
+  var documentURL = options['subjectURI'];
+
+  if (Config.MediaTypes.Markup.includes(options.contentType)) {
+    var node = getDocumentNodeFromString(data, options);
+
+    var selectors = Config.MediaTypes.RDF
+      .filter(mediaType => {
+        return !Config.MediaTypes.Markup.includes(mediaType);
+      })
+      .map(mediaType => {
+        return 'script[type="' + mediaType + '"]';
+      });
+    // console.log(selectors)
+    var promises = [];
+
+    var scripts = node.querySelectorAll(selectors.join(', '));
+    // console.log(scripts)
+    scripts.forEach(script => {
+      var scriptType = script.getAttribute('type').trim();
+      var scriptData = script.textContent;
+      // console.log(scriptData)
+      var matches = Array.from(scriptData.matchAll(/<!\[CDATA\[(.*?)\]\]>/gs));
+      if (matches.length > 0) {
+        scriptData = matches.map(match => match[1].trim()).join('\n');
+      }
+      // console.log(scriptData)
+      //Cleans up the data block from comments at the beginning and end of the script.
+      var lines = scriptData.split(/\r\n|\r|\n/);
+      lines = lines.filter((line, index) => {
+        if (index === 0 || index === lines.length - 1) {
+          line = line.trim();
+          return !line.startsWith('#') && !line.startsWith('//');
+        }
+        return true;
+      });
+      scriptData = lines.join('\n');
+
+      scriptData = domSanitize(scriptData);
+
+      // console.log(scriptData)
+
+      var o = {
+        'subjectURI': documentURL,
+        'contentType': scriptType
+      }
+
+      promises.push(getGraphFromData(scriptData, o))
+    });
+
+    return Promise.allSettled(promises)
+      .then(resolvedPromises => {
+        const dataset = rdf.dataset();
+
+        resolvedPromises.forEach(response => {
+          // console.log(response.value)
+          if (response.value) {
+            dataset.addAll(response.value.dataset);
+          }
+        })
+
+        return rdf.grapoi({ dataset });
+      });
+  }
+  else {
+    return Promise.resolve();
+  }
+}
+
+export async function updateResourceInfos(documentURL = Config.DocumentURL, data, response, options = {}) {
+  if (documentURL.startsWith('blob:')) {
+    updateButtons();
+    return;
+  }
+
+  const storeHash = options.storeHash !== false;
+
+  if (!options.skipRDFParse) {
+    const documentOptions = {
+      ...Config.DOMProcessing,
+      format: true,
+      sanitize: true,
+      normalize: true
+    };
+
+    data = data || getDocument(null, documentOptions);
+
+    await getResourceInfo(data, { storeHash, digestSRI: options.digestSRI }).then(resourceInfo => {
+      Config.Resource[documentURL] = { ...Config.Resource[documentURL], ...resourceInfo };
+    });
+  }
+
+  if (response) {
+    updateSupplementalInfo(response, options);
+  }
+  else if (!documentURL.startsWith('file:')) {
+    await getResourceSupplementalInfo(documentURL, options);
+  }
+
+  updateButtons();
+}
+
+export function updateSupplementalInfo(response, options = {}) {
+  var checkHeaders = options?.checkHeaders ?? ['wac-allow', 'link', 'last-modified', 'etag', 'expires', 'date', 'allow'];
+  var headers = response.headers;
+  var documentURL = options?.documentURL || Config.DocumentURL;
+
+  Config['Resource'][documentURL] ||= {};
+
+  const preservedHeaders = {};
+  if (options?.preserveHeaders?.length) {
+    for (const key of options.preserveHeaders) {
+      const existing = Config['Resource'][documentURL]?.headers?.[key];
+      if (existing !== undefined) {
+        preservedHeaders[key] = existing;
+      }
+    }
+  }
+
+  Config['Resource'][documentURL]['response'] = response;
+  Config['Resource'][documentURL]['headers'] = { ...preservedHeaders };
+  Config['Resource'][documentURL]['headers']['response'] = headers;
+
+  checkHeaders.forEach(header => {
+    var headerValue = response.headers.get(header);
+    // headerValue = 'foo=bar ,user=" READ wriTe Append control ", public=" read append" ,other="read " , baz= write, group=" ",,';
+
+    if (headerValue) {
+      Config['Resource'][documentURL]['headers'][header] = { 'field-value': headerValue };
+
+      if (header == 'wac-allow') {
+        Config['Resource'][documentURL]['headers']['wac-allow']['permissionGroup'] = parseWacAllow(headerValue);
+      }
+
+      else if (header == 'link') {
+        var linkHeaders = LinkHeader.parse(headerValue);
+
+        Config['Resource'][documentURL]['headers']['linkHeaders'] = linkHeaders;
+
+        Config['Resource'][documentURL]['headers']['linkHeaders'].refs.forEach(relationItem => {
+          relationItem.rel = relationItem.rel.toLowerCase();
+          var linkTarget = relationItem.uri;
+
+          if (!linkTarget.startsWith('http:') && !linkTarget.startsWith('https:')) {
+            linkTarget = relationItem.uri = domSanitize(getAbsoluteIRI(getBaseURL(response.url), linkTarget));
+          }
+        });
+      }
+
+      else if (header == 'allow') {
+        Config['Resource'][documentURL]['headers']['allow'] = headerValue.toLowerCase().split(',').map(s => s.trim());
+      }
+    }
+  })
+}
+
+export function getResourceSupplementalInfo(documentURL, options) {
+  options = options || {};
+  options['reuse'] = options['reuse'] === true ? true : false;
+  options['followLinkRelationTypes'] = options['followLinkRelationTypes'] || [];
+
+  //TODO: Add `acl` and `http://www.w3.org/ns/solid/terms#storageDescription` to `linkRelationTypesOfInterest` and process them.
+
+  if (options.reuse) {
+    const currentDate = new Date();
+    const previousResponse = Config['Resource'][documentURL].headers?.response;
+    const previousResponseDateHeaderValue = previousResponse?.get('date');
+    const previousResponseDate = previousResponseDateHeaderValue ? new Date(previousResponseDateHeaderValue) : null;
+
+    if (!previousResponse || !previousResponseDateHeaderValue || (previousResponseDate && (currentDate.getTime() - previousResponseDate.getTime() > Config.RequestCheck.Timer))) {
+      options.reuse = false;
+    }
+  }
+
+  if (!options.reuse) {
+    var rHeaders = { 'Cache-Control': 'no-cache' };
+    var rOptions = { 'noCache': true };
+    return Config.Storage.head(documentURL, rHeaders, rOptions)
+      .then(response => {
+        updateSupplementalInfo(response);
+        processSupplementalInfoLinkHeaders(documentURL, options);
+      });
+  }
+  else {
+    return Promise.resolve(Config['Resource'][documentURL]);
+  }
+}
+
+export function processSupplementalInfoLinkHeaders(documentURL, options = {}) {
+  var promises = [];
+  var linkHeaders = Config['Resource'][documentURL]['headers']?.['linkHeaders'];
+
+  if (linkHeaders) {
+    linkHeaders.refs.forEach(relationItem => {
+      var relationType = relationItem.rel;
+      var linkTarget = relationItem.uri;
+      //TODO: GET acl linkTarget only if user/public has control permission.
+      if ('followLinkRelationTypes' in options && options.followLinkRelationTypes.includes(relationType)) {
+        promises.push(getResource(linkTarget));
+      }
+    });
+  }
+
+  return Promise.allSettled(promises)
+    .then(results => {
+      results.forEach(result => {
+        if (result.status !== 'fulfilled') return;
+          var response = result.value;
+
+          if (response) {
+            response.text()
+              .then(data => {
+                var cT = response.headers.get('Content-Type');
+                var o = {};
+                //XXX: Using the subject resource's URL (documentURL) as the focus of description resource.
+                //FIXME: ?
+                o['subjectURI'] = options.followLinkRelationTypes.includes('describedby') ? documentURL : response.url;
+                o['contentType'] = (cT) ? cT.split(';')[0].toLowerCase().trim() : 'text/turtle';
+
+                getResourceInfo(data, o)
+                  .then(info => {
+                    //FIXME: use response.url only if linkTarget is not going through proxy
+                    Config['Resource'][response.url] = info;
+                  })
+              });
+          }
+      });
+
+      return Config['Resource'][documentURL];
+    });
+}
+
+export function getResourceInfoCitations(g) {
+  var documentURL = Config.DocumentURL;
+  var citationProperties = Object.keys(Config.Citation).concat([ns.dcterms.references.value, ns.schema.citation.value]);
+
+  var predicates = citationProperties.map((property) => {
+    return rdf.namedNode(property);
+  })
+
+  var citationsList = g.out(predicates).distinct().values;
+
+  var externals = [];
+  citationsList.forEach(i => {
+    var iAbsolute = stripFragmentFromString(i);
+    if (iAbsolute !== documentURL) {
+      externals.push(iAbsolute)
+    }
+  });
+  citationsList = uniqueArray(externals).sort();
+
+  return citationsList;
+}
+
+//TODO: Review grapoi
+export function getResourceInfoODRLPolicies(s) {
+  var info = {}
+  info['odrl'] = {};
+
+  var policy = s.out(ns.odrl.hasPolicy);
+
+  // for (const policy of s.outzodrl.hasPolicy)) {
+  //   const policyIRI = policy.value
+
+  //   for (const policyType of policy.out(ns.rdf.type)) {
+  //     const policyTypeIRI = policyType.values;
+  //   }
+
+  // }
+  policy.values.forEach(policyIRI => {
+    info['odrl'][policyIRI] = {};
+
+    var policyGraph = s.node(rdf.namedNode(policyIRI));
+    var policyTypes = policyGraph.out(ns.rdf.type).values;
+
+    info['odrl'][policyIRI]['rdftype'] = policyTypes;
+
+    policyTypes.forEach(pT => {
+      if (pT == ns.odrl.Offer.value) {
+        var permissions = policyGraph.out(ns.odrl.permission).values;
+
+        permissions.forEach(permissionIRI => {
+          info['odrl'][policyIRI]['permission'] = {};
+          info['odrl'][policyIRI]['permission'][permissionIRI] = {};
+
+          var permissionGraph = s.node(rdf.namedNode(permissionIRI));
+
+          var permissionAssigner = permissionGraph.out(ns.odrl.assigner).values;
+          info['odrl'][policyIRI]['permission'][permissionIRI]['action'] = info['odrl']['permissionAssigner'] = permissionAssigner;
+
+          var permissionActions = permissionGraph.out(ns.odrl.action).values;
+          info['odrl'][policyIRI]['permission'][permissionIRI]['action'] = info['odrl']['permissionActions'] = permissionActions;
+        });
+      }
+
+      if (pT == ns.odrl.Agreement.value) {
+        var prohibition = policyGraph.out(ns.odrl.prohibition).values;
+
+        prohibition.forEach(prohibitionIRI => {
+          info['odrl'][policyIRI]['prohibition'] = {};
+          info['odrl'][policyIRI]['prohibition'][prohibitionIRI] = {};
+
+          var prohibitionGraph = s.node(rdf.namedNode(prohibitionIRI));
+
+          var prohibitionAssigner = prohibitionGraph.out(ns.odrl.assigner).values;
+          info['odrl'][policyIRI]['prohibition'][prohibitionIRI]['action'] = info['odrl']['prohibitionAssigner'] = prohibitionAssigner;
+
+          var prohibitionAssignee = prohibitionGraph.out(ns.odrl.assignee).values;
+          info['odrl'][policyIRI]['prohibition'][prohibitionIRI]['action'] = info['odrl']['prohibitionAssignee'] = prohibitionAssignee;
+
+          var prohibitionActions = prohibitionGraph.out(ns.odrl.action).values;
+          info['odrl'][policyIRI]['prohibition'][prohibitionIRI]['action'] = info['odrl']['prohibitionActions'] = prohibitionActions;
+        });
+      }
+    });
+  });
+
+  return info['odrl'];
+}
+
+export function getResourceInfoSpecClassesOfProducts(s) {
+  var info = {}
+  info['spec'] = {};
+  info['spec']['classesOfProducts'] = {};
+
+  // console.trace();
+  s.out(ns.spec.classesOfProducts).values.forEach(classesOfProductsConceptSchemeIRI => {
+    info['spec']['classesOfProducts'] = {};
+    info['spec']['classesOfProducts'][classesOfProductsConceptSchemeIRI] = {};
+
+    var classesOfProductsGraph = s.node(rdf.namedNode(classesOfProductsConceptSchemeIRI));
+    info['spec']['classesOfProducts'][classesOfProductsConceptSchemeIRI]['skos'] = getResourceInfoSKOS(classesOfProductsGraph);
+    var conceptSchemes = info['spec']['classesOfProducts'][classesOfProductsConceptSchemeIRI]['skos'].data;
+    if (conceptSchemes) {
+      Object.keys(conceptSchemes).forEach(conceptScheme => {
+        var conceptIRIs = conceptSchemes[conceptScheme][ns.skos.hasTopConcept];
+        if (conceptIRIs) {
+          conceptIRIs.forEach(conceptIRI => {
+            var conceptGraph = s.node(rdf.namedNode(conceptIRI));
+            Config.Resource[conceptIRI] = {};
+            Config.Resource[conceptIRI]['graph'] = conceptGraph;
+            Config.Resource[conceptIRI]['skos'] = getResourceInfoSKOS(conceptGraph);
+          })
+        }
+      })
+    }
+  });
+
+  return info['spec']['classesOfProducts'];
+}
+
+//XXX: Should this be stored for cheaper reuse?
+export function getClassesOfProductsConcepts() {
+  var concepts = [];
+
+  if (Config.Resource[Config.DocumentURL]?.spec?.classesOfProducts) {
+    var classesOfProducts = Config.Resource[Config.DocumentURL]?.spec?.classesOfProducts;
+
+    Object.keys(classesOfProducts).forEach(conceptSchemeIRI => {
+      var conceptScheme = classesOfProducts[conceptSchemeIRI].skos.data;
+      var hasTopConcepts = conceptScheme[conceptSchemeIRI][ns.skos.hasTopConcept];
+      if (hasTopConcepts) {
+        concepts = concepts.concat(hasTopConcepts);
+      }
+    })
+  }
+
+  // Live-DOM fallback: documents whose parsed graph predates the currently defined product classes.
+  if (!concepts.length) {
+    document.querySelectorAll('#classes-of-products dl[rel~="skos:hasTopConcept"] > dt[about]').forEach(dt => {
+      try { concepts.push(new URL(dt.getAttribute('about'), Config.DocumentURL).href); } catch { /* skip unresolvable */ }
+    });
+  }
+
+  return concepts;
+}
+
+// Live-DOM lookup for a product-class concept's label/definition (same fallback case as above).
+function getClassOfProductFromDOM(conceptIRI) {
+  const dt = Array.from(document.querySelectorAll('#classes-of-products dl[rel~="skos:hasTopConcept"] > dt[about]'))
+    .find(d => { try { return new URL(d.getAttribute('about'), Config.DocumentURL).href === conceptIRI; } catch { return false; } });
+  if (!dt) return null;
+  const dd = dt.nextElementSibling?.tagName === 'DD' ? dt.nextElementSibling : null;
+  return { label: dt.textContent.trim(), definition: dd?.textContent.trim() || '' };
+}
+
+
+//TODO: Review grapoi
+export function getResourceInfoSpecRequirements(s) {
+  var info = {}
+  info['spec'] = {};
+  info['spec']['requirement'] = {};
+
+  s.out(ns.spec.requirement).values.forEach(requirementIRI => {
+    info['spec']['requirement'][requirementIRI] = {};
+
+    var requirementGraph = s.node(rdf.namedNode(requirementIRI));
+    info['spec']['requirement'][requirementIRI][ns.spec.statement.value] = requirementGraph.out(ns.spec.statement).values[0];
+    info['spec']['requirement'][requirementIRI][ns.spec.requirementSubject.value] = requirementGraph.out(ns.spec.requirementSubject).values[0];
+    info['spec']['requirement'][requirementIRI][ns.spec.requirementLevel.value] = requirementGraph.out(ns.spec.requirementLevel).values[0];
+
+    Object.keys(Config.Citation).forEach(citationIRI => {
+      var requirementCitations = requirementGraph.out(rdf.namedNode(citationIRI)).values;
+
+      if (requirementCitations.length) {
+        info['spec']['requirement'][requirementIRI][citationIRI] = requirementCitations;
+      }
+    });
+
+    var seeAlso = requirementGraph.out(ns.rdfs.seeAlso).values;
+    if (seeAlso.length) {
+      info['spec']['requirement'][requirementIRI][ns.rdfs.seeAlso.value] = seeAlso;
+    }
+  });
+
+  // console.log(info['spec']['requirement']);
+
+  return info['spec']['requirement'];
+}
+
+//TODO: Review grapoi
+export function getResourceInfoSpecAdvisements(s) {
+  var info = {}
+  info['spec'] = {};
+  info['spec']['advisement'] = {};
+
+  s.out(ns.spec.advisement).values.forEach(advisementIRI => {
+    info['spec']['advisement'][advisementIRI] = {};
+
+    var advisementGraph = s.node(rdf.namedNode(advisementIRI));
+
+    info['spec']['advisement'][advisementIRI][ns.spec.statement.value] = advisementGraph.out(ns.spec.statement).values[0];
+    // info['spec'][advisementIRI][ns.spec.advisementSubject.value] = advisementSubject;
+    info['spec']['advisement'][advisementIRI][ns.spec.advisementLevel.value] = advisementGraph.out(ns.spec.advisementLevel).values[0];
+    var advisementCitations = advisementGraph.out(rdf.namedNode(advisementIRI)).values;
+
+    Object.keys(Config.Citation).forEach(citationIRI => {
+      if (advisementCitations.length) {
+        info['spec']['advisement'][advisementIRI][citationIRI] = advisementCitations;
+      }
+    });
+
+    var seeAlso = advisementGraph.out(ns.rdfs.seeAlso).values;
+    if (seeAlso.length) {
+      info['spec']['advisement'][advisementIRI][ns.rdfs.seeAlso.value] = seeAlso;
+    }
+  });
+
+  // console.log(info['spec']['advisement']);
+
+  return info['spec']['advisement'];
+}
+
+//TODO: Review grapoi
+export function getResourceInfoSpecChanges(s) {
+  var info = {}
+  info['change'] = {};
+
+  var change = s.out(ns.spec.change);
+
+  change.values.forEach(changeIRI => {
+    var changeGraph = s.node(rdf.namedNode(changeIRI));
+    info['change'][changeIRI] = {};
+    info['change'][changeIRI][ns.spec.statement.value] = changeGraph.out(ns.spec.statement).values[0];
+    info['change'][changeIRI][ns.spec.changeSubject.value] = changeGraph.out(ns.spec.changeSubject).values[0];
+    info['change'][changeIRI][ns.spec.changeClass.value] = changeGraph.out(ns.spec.changeClass).values[0];
+  });
+
+  return info['change'];
+}
+
+//TODO: Review grapoi
+export function getResourceInfoSKOS(g) {
+  var info = {};
+  info['skos'] = { 'data': {}, 'type': {} };
+
+  const quads = [];
+
+  // g.out().filter(ptr => {
+  //   return [...ptr.quads()][0].predicate.value.startsWith('')
+  // })
+
+  // const people = []
+
+  // for (const person of g.node(null).hasOut(ns.rdf.type, ns.foaf.Person).hasOut(ns.foaf.image)) {
+  //   people.push({
+  //     firstName: person.out(ns.foaf.firstName).value,
+  //     image: ptr.out(ns.foaf.image).value
+  //   })
+  //  }
+
+  //  const images = await Promise.all(g.node([person1])
+  //  .map(ptr => fetch(ptr.out(ns.foaf.image).value)))
+  //  //.out([ns.foaf.firstName, ns.foaf.lastName]).values.join(' ')
+
+  // console.log(g.terms.length)
+  // console.log(Array.from(g.out().quads()).length)
+  g.out().quads().forEach(t => {
+    // console.log(t)
+    var s = t.subject.value;
+    var p = t.predicate.value;
+    var o = t.object.value;
+    // console.log(s, p, o)
+    var isRDFType = (p == ns.rdf.type.value) ? true : false;
+    var isSKOSProperty = p.startsWith('http://www.w3.org/2004/02/skos/core#');
+    var isSKOSObject = o.startsWith('http://www.w3.org/2004/02/skos/core#');
+
+    // console.log(isRDFType, isSKOSProperty, isSKOSObject);
+
+    if (isRDFType && isSKOSObject) {
+      info['skos']['type'][o] = info['skos']['type'][o] || [];
+      info['skos']['type'][o].push(s);
+    }
+
+    if (isSKOSProperty || (isRDFType && isSKOSObject)) {
+      info['skos']['data'][s] = info['skos']['data'][s] || {};
+      info['skos']['data'][s][p] = info['skos']['data'][s][p] || [];
+      info['skos']['data'][s][p].push(o);
+      quads.push(t);
+    }
+  });
+
+  // console.log(info['skos']);
+  // console.log(quads);
+  const dataset = rdf.dataset(quads);
+  // console.log(dataset);
+  info['skos']['graph'] = rdf.grapoi({ dataset });
+
+  return info['skos'];
+}
+
+export function createImmutableResource(url, data, options) {
+  url = sanitizeIRI(url);
+
+  if (!url) return;
+
+  const documentOptions = {
+    ...Config.DOMProcessing,
+    format: true,
+    sanitize: true,
+    normalize: true
+  };
+
+  var uuid = generateAttributeId();
+  var containerIRI = url.substr(0, url.lastIndexOf('/') + 1);
+  var immutableURL = containerIRI + uuid;
+
+  var rootNode = document.documentElement.cloneNode(true);
+
+  var date = new Date();
+  rootNode = setDate(rootNode, { 'id': 'document-created', 'property': 'schema:dateCreated', 'datetime': date });
+
+  var resourceState = rootNode.querySelector('#' + 'document-resource-state');
+  if (!resourceState) {
+    var rSO = {
+      'id': 'document-resource-state',
+      'subjectURI': '',
+      'type': 'mem:Memento',
+      'mode': 'create'
+    }
+
+    rootNode = setDocumentStatus(rootNode, rSO);
+  }
+
+  var r, o;
+
+  o = { 'id': 'document-identifier', 'title': 'Identifier' };
+  r = { 'rel': 'owl:sameAs', 'href': immutableURL };
+  rootNode = setDocumentRelation(rootNode, [r], o);
+
+  o = { 'id': 'document-original', 'title': 'Original resource' };
+  if (Config.OriginalResourceInfo['state'] == ns.mem.Memento.value
+    && Config.OriginalResourceInfo['profile'] == ns.mem.OriginalResource.value) {
+    r = { 'rel': 'mem:original', 'href': immutableURL };
+  }
+  else {
+    r = { 'rel': 'mem:original', 'href': url };
+  }
+  rootNode = setDocumentRelation(rootNode, [r], o);
+
+  //TODO document-timegate
+
+  var timeMapURL = Config.OriginalResourceInfo['timemap'] || url + '.timemap';
+  o = { 'id': 'document-timemap', 'title': 'TimeMap' };
+  r = { 'rel': 'mem:timemap', 'href': timeMapURL };
+  rootNode = setDocumentRelation(rootNode, [r], o);
+
+  // Create URI-M
+  data = getDocument(rootNode, documentOptions);
+  Config.Storage.save(containerIRI, uuid, data, options)
+    .then((resolved) => handleActionMessage(resolved))
+    .catch((rejected) => handleActionMessage(null, rejected))
+    .finally(() => {
+      getResourceInfo(data, { 'mode': 'update' });
+    });
+
+  timeMapURL = Config.OriginalResourceInfo['timemap'] || url + '.timemap';
+
+
+  //Update URI-R
+  if (Config.OriginalResourceInfo['state'] != ns.mem.Memento.value) {
+    setDate(document, { 'id': 'document-created', 'property': 'schema:dateCreated', 'datetime': date });
+
+    o = { 'id': 'document-identifier', 'title': 'Identifier' };
+    r = { 'rel': 'owl:sameAs', 'href': url };
+    setDocumentRelation(document, [r], o);
+
+    o = { 'id': 'document-latest-version', 'title': 'Latest Version' };
+    r = { 'rel': 'mem:memento rel:latest-version', 'href': immutableURL };
+    setDocumentRelation(document, [r], o);
+
+    if (Config.OriginalResourceInfo['latest-version']) {
+      o = { 'id': 'document-predecessor-version', 'title': 'Predecessor Version' };
+      r = { 'rel': 'mem:memento rel:predecessor-version', 'href': Config.OriginalResourceInfo['latest-version'] };
+      setDocumentRelation(document, [r], o);
+    }
+
+    //TODO document-timegate
+
+    o = { 'id': 'document-timemap', 'title': 'TimeMap' };
+    r = { 'rel': 'mem:timemap', 'href': timeMapURL };
+    setDocumentRelation(document, [r], o);
+
+    // Create URI-R
+    data = getDocument(null, documentOptions);
+    Config.Storage.save(url, null, data, options)
+      .then((resolved) => handleActionMessage(resolved))
+      .catch((rejected) => handleActionMessage(null, rejected))
+  }
+
+
+  //Update URI-T
+  var insertG = '<' + url + '> <http://mementoweb.org/ns#memento> <' + immutableURL + '> .\n\
+<' + immutableURL + '> <http://mementoweb.org/ns#mementoDateTime> "' + date.toISOString() + '"^^<http://www.w3.org/2001/XMLSchema#dateTime> .';
+
+  var patch = { 'insert': insertG };
+
+  Config.Storage.patchWithConneg(timeMapURL, patch).then(() => {
+    showTimeMap(null, timeMapURL)
+  });
+}
+
+export async function createMutableResource(url, data, options) {
+  url = sanitizeIRI(url);
+
+  if (!url) return;
+
+  const documentOptions = {
+    ...Config.DOMProcessing,
+    format: true,
+    sanitize: true,
+    normalize: true
+  };
+
+  //TODO: Should this options include `datetime: new Date()` similar to createImmutableResource?
+  setDate(document, { 'id': 'document-created', 'property': 'schema:dateCreated' });
+
+  var uuid = generateAttributeId();
+  var containerIRI = url.substr(0, url.lastIndexOf('/') + 1);
+  var mutableURL = containerIRI + uuid;
+
+  var r, o;
+
+  o = { 'id': 'document-identifier', 'title': 'Identifier' };
+  r = { 'rel': 'owl:sameAs', 'href': mutableURL };
+  setDocumentRelation(document, [r], o);
+
+  o = { 'id': 'document-latest-version', 'title': 'Latest Version' };
+  r = { 'rel': 'rel:latest-version', 'href': mutableURL };
+  setDocumentRelation(document, [r], o);
+
+  if (Config.OriginalResourceInfo['latest-version']) {
+    o = { 'id': 'document-predecessor-version', 'title': 'Predecessor Version' };
+    r = { 'rel': 'rel:predecessor-version', 'href': Config.OriginalResourceInfo['latest-version'] };
+    setDocumentRelation(document, [r], o);
+  }
+
+  // First serialize: document carries the mutableURL identifier (rel:latest-version).
+  data = getDocument(null, documentOptions);
+  if (Config.User.Keys?.Encryption?.Enabled && Config.User.Keys?.Encryption?.DocumentEncrypt) data = await encryptArticlePayload(data, url);
+
+  Config.Storage.save(containerIRI, uuid, data, options)
+    .then((resolved) => handleActionMessage(resolved))
+    .catch((rejected) => handleActionMessage(null, rejected))
+
+  // Second serialize carries the canonical url identifier (owl:sameAs)
+  o = { 'id': 'document-identifier', 'title': 'Identifier' };
+  r = { 'rel': 'owl:sameAs', 'href': url };
+  setDocumentRelation(document, [r], o);
+
+  data = getDocument(null, documentOptions);
+  if (Config.User.Keys?.Encryption?.Enabled && Config.User.Keys?.Encryption?.DocumentEncrypt) data = await encryptArticlePayload(data, url);
+
+  Config.Storage.save(url, null, data, options)
+    .then((resolved) => handleActionMessage(resolved))
+    .catch((rejected) => handleActionMessage(null, rejected))
+    .finally(() => {
+      getResourceInfo(data, { 'mode': 'update' });
+    });
+}
+
+// Replaces article content and title with a JWE envelope; document scope also encrypts head metadata and body
+// documentURL is the resource being written, which Save As and new documents make different from the one on screen
+export async function encryptArticlePayload(htmlString, documentURL) {
+  if (!isUnlocked()) return htmlString;
+
+  const parser = new DOMParser();
+  const parsed = parser.parseFromString(htmlString, 'text/html');
+  const article = selectArticleNode(parsed);
+  if (!article) return htmlString;
+
+  const titleNode = parsed.querySelector('head > title');
+  const scope = 'document';
+
+  const hiddenHeadNodes = [...parsed.head.children].filter(node =>
+    node !== titleNode && !node.matches('script, link[rel~="stylesheet" i], meta[charset]'));
+  const plaintext = JSON.stringify({
+    scope,
+    title: titleNode?.textContent ?? null,
+    head: hiddenHeadNodes.map(node => node.outerHTML).join('\n'),
+    body: parsed.body.innerHTML
+  });
+
+  const target = documentURL || Config.DocumentURL || currentLocation();
+  await syncDocumentRecipientsFromACL(target);
+  const recipientKeys = [getSessionPublicKey(), ...getDocumentRecipientKeys(target)];
+  const jwe = await encryptContent(plaintext, recipientKeys);
+
+  const script = parsed.createElement('script');
+  script.id = 'dokieli-e2ee';
+  script.type = 'application/jose';
+  script.textContent = jwe;
+
+  hiddenHeadNodes.forEach(node => node.remove());
+  const shell = parsed.createElement('article');
+  shell.setAttribute('data-encrypted', 'true');
+  shell.appendChild(script);
+  const main = parsed.createElement('main');
+  main.appendChild(shell);
+  parsed.body.replaceChildren(main);
+
+  if (titleNode) titleNode.textContent = i18n.t('encryption.encrypted-document-title.textContent');
+
+  Config.User.Keys.Encryption.Document = true;
+
+  const doctype = getDoctype();
+  return (doctype ? doctype + '\n' : '') + formatHTML(parsed.documentElement, { ...Config.DOMProcessing, format: true });
+}
+
+export function isMarkdownTarget(url) {
+  if (document.querySelector('[data-markdown-mode]')) return true;
+  if (!url) return false;
+  try {
+    const path = new URL(url).pathname;
+    return /\.(md|markdown)$/i.test(path);
+  } catch {
+    return /\.(md|markdown)$/i.test(url);
+  }
+}
+
+export function getSavePayload(url, documentOptions) {
+  const mdNode = document.querySelector('[data-markdown-mode]');
+  if (mdNode) {
+    return { data: mdNode.textContent, contentType: 'text/markdown' };
+  }
+  if (isMarkdownTarget(url)) {
+    const article = selectArticleNode(document);
+    return { data: htmlToMarkdown(article), contentType: 'text/markdown' };
+  }
+  return { data: getDocument(null, documentOptions), contentType: 'text/html' };
+}
+
+export async function updateMutableResource(url, data, options) {
+  if (!url) return;
+  options = options || {};
+
+  const documentOptions = {
+    ...Config.DOMProcessing,
+    format: true,
+    sanitize: true,
+    normalize: true
+  };
+
+  var rootNode = (data) ? fragmentFromString(data).cloneNode(true) : document;
+
+  if (!('datetime' in options)) {
+    options['datetime'] = new Date();
+  }
+
+  setDate(rootNode, { 'id': 'document-modified', 'property': 'schema:dateModified', 'datetime': options.datetime });
+  // setEditSelections(options);
+
+  let blobImageMapping = [];
+  let payload;
+  const inMarkdownMode = !!document.querySelector('[data-markdown-mode]');
+  if (!data && hasUploadTarget() && !isMarkdownTarget(url) && !inMarkdownMode && document.querySelector('img[src^="blob:"]')) {
+    const clone = document.documentElement.cloneNode(true);
+    blobImageMapping = rewriteBlobImagesToRelative(clone);
+    payload = { data: getDocument(clone, documentOptions), contentType: 'text/html' };
+  } else {
+    payload = getSavePayload(url, documentOptions);
+  }
+  data = payload.data;
+  options.contentType = payload.contentType;
+
+  if (Config.User.Keys?.Encryption?.Enabled && Config.User.Keys?.Encryption?.DocumentEncrypt) data = await encryptArticlePayload(data, url);
+
+  // The message is shown here; the rejection still reaches callers that need to react to it
+  return Config.Storage.save(url, null, data, options)
+    .then(async (resolved) => {
+      if (blobImageMapping.length) {
+        await uploadBlobAssets(url, blobImageMapping);
+        clearBlobAssets();
+      }
+      handleActionMessage(resolved);
+    })
+    .catch((rejected) => {
+      handleActionMessage(null, rejected);
+      throw rejected;
+    })
+    .finally(() => {
+      getResourceInfo(data, { 'mode': 'update' });
+    });
+}
+
+export function removeReferences() {
+  var refs = document.querySelectorAll('body *:not([id="references"]) cite + .ref:not(.do)');
+
+  refs.forEach(r => {
+    r.parentNode.removeChild(r);
+  });
+}
+
+export function referenceItemHTML(referencesList, id, citation) {
+  var referencesListNodeName = referencesList.nodeName.toLowerCase();
+  var s = '';
+
+  switch (referencesListNodeName) {
+    case 'ol':
+    case 'ul':
+    default:
+      s = '<li id="' + id + '">' + citation + '</li>';
+      break;
+    case 'dl':
+      s = '<dt id="' + id + '"></dt><dd>' + citation + '</dd>';
+      break;
+  }
+
+  return s;
+}
+
+
+export function buildReferences(referencesList, id, citation) {
+  if (!referencesList) {
+    var nodeInsertLocation = selectArticleNode(document);
+    var section = '<section id="references"><h2>References</h2><div><ol></ol></div></section>';
+    sanitizeInsertAdjacentHTML(nodeInsertLocation, 'beforeend', section);
+  }
+
+  var references = document.querySelector('#references');
+  referencesList = references.querySelector('dl, ol, ul');
+
+  updateReferences(referencesList);
+
+  if (citation) {
+    var citationItem = referenceItemHTML(referencesList, id, citation);
+    sanitizeInsertAdjacentHTML(referencesList, 'beforeend', citationItem);
+  }
+}
+
+export function updateReferences(referencesList, options) {
+  options = options || {};
+  options['external'] = options.external || true;
+  options['internal'] = options.internal || false;
+
+  var citeA = document.querySelectorAll('body *:not([id="references"]) cite > a');
+  var uniqueCitations = {};
+  var lis = [];
+
+  var docURL = document.location.origin + document.location.pathname;
+
+  var insertRef = function (cite, rId, refId, refLabel) {
+    // console.log(cite);
+    // console.log(rId);
+    // console.log(refId);
+    // console.log(refLabel)
+    var ref = '<span class="ref"> <span class="ref-reference" id="' + rId + '">' + Config.RefType[Config.DocRefType].InlineOpen + '<a href="#' + refId + '">' + refLabel + '</a>' + Config.RefType[Config.DocRefType].InlineClose + '</span></span>';
+    sanitizeInsertAdjacentHTML(cite, 'afterend', ref);
+  }
+
+  citeA.forEach(a => {
+    var ref, refId, refLabel, rId;
+    var cite = a.parentNode;
+    var jumpLink;
+
+    if ((options.external && !a.href.startsWith(docURL + '#')) ||
+      (options.internal && a.href.startsWith(docURL + '#'))) {
+
+      refId = uniqueCitations[a.outerHTML];
+      rId = 'r-' + generateAttributeId();
+
+      if (refId) {
+        refLabel = refId;
+        refId = 'ref-' + refId;
+        // console.log(refId)
+        // console.log(rId)
+
+        jumpLink = document.querySelector('#' + refId + ' .jumplink');
+        // console.log(jumpLink)
+        if (jumpLink) {
+          var supAs = jumpLink.querySelectorAll('sup a');
+
+          var newJumpLink = [];
+          supAs.forEach((a, key) => {
+            newJumpLink.push(' <sup><a href="#' + getFragmentFromString(a.href) + '">' + String.fromCharCode(key + 97) + '</a></sup>');
+          });
+          newJumpLink.push(' <sup><a href="#' + rId + '">' + String.fromCharCode(supAs.length + 97) + '</a></sup>');
+
+          newJumpLink = fragmentFromString('<span class="jumplink"><sup>^</sup>' + newJumpLink.join(' ') + '</span>');
+
+          jumpLink.parentNode.replaceChild(newJumpLink, jumpLink);
+
+          insertRef(cite, rId, refId, refLabel);
+        }
+      }
+      else {
+        var length = Object.keys(uniqueCitations).length;
+
+        uniqueCitations[a.outerHTML] = length + 1;
+
+        refLabel = (length + 1);
+        refId = 'ref-' + (length + 1);
+
+        var rel = a.getAttribute('rel');
+        // var property = a.getAttribute('property');
+
+        var versionDate = a.getAttribute('data-versiondate') || '';
+        var versionURL = a.getAttribute('data-versionurl') || '';
+        var title = a.getAttribute('title');
+        title = title ? ' title="' + title + '"' : '';
+
+
+        if (versionDate && versionURL) {
+          // && (a.href.startsWith('http:') || a.href.startsWith('https:'))) {
+          // console.log(a);
+
+          versionDate = ' data-versiondate="' + versionDate + '"';
+          versionURL = ' data-versionurl="' + versionURL + '"';
+        }
+
+        var anchor = '<a ' + versionDate + versionURL + ' href="' + a.href + '"' + title + '>' + a.href + '</a>';
+
+        jumpLink = '<span class="jumplink"><sup><a href="#' + rId + '">^</a></sup></span>';
+
+        //FIXME: Better to add to an array and then insert but need to update the DOM before.
+
+        var referencesListNodeName = referencesList.nodeName.toLowerCase();
+        var citation = '';
+
+        switch (referencesListNodeName) {
+          case 'ol':
+          case 'ul':
+          default:
+            citation = jumpLink + ' <cite>' + a.textContent + '</cite>, <cite>' + anchor + '</cite>';
+            break;
+          case 'dl':
+            citation = '<cite>' + a.textContent + '</cite>, <cite>' + anchor + '</cite>';
+            break;
+        }
+
+        var referenceItem = referenceItemHTML(referencesList, refId, citation);
+
+        sanitizeInsertAdjacentHTML(referencesList, 'beforeend', referenceItem);
+
+        insertRef(cite, rId, refId, refLabel);
+      }
+
+      // cite.sanitizeInsertAdjacentHTML('afterend', ref);
+    }
+  })
+  // console.log(uniqueCitations);
+
+  // if (lis.length > 0) {
+  //   var updatedList = util.fragmentFromString('<ol>' + lis.join('') + '</ol>');
+  //   referencesOl.parentNode.replaceChild(updatedList, referencesOl);
+
+  // XXX: Expensive!
+  // document.querySelectorAll('#references cite > a[data-versionurl][data-originalurl').forEach(a => {
+  //   showRobustLinksDecoration(a.parentNode);
+  // })
+}
+
+export function showRobustLinksDecoration(node) {
+  node = node || document;
+  // console.log(node)
+  var nodes = node.querySelectorAll('a[data-versionurl], a[data-originalurl]');
+  // console.log(nodes)
+  nodes.forEach(i => {
+    if (i.nextElementSibling && i.nextElementSibling.classList.contains('do') && i.nextElementSibling.classList.contains('robustlinks')) {
+      return;
+    }
+
+    var href = i.getAttribute('href');
+
+    var originalurl = i.getAttribute('data-originalurl');
+    originalurl = (originalurl) ? originalurl.trim() : undefined;
+    originalurl = (originalurl) ? `<span data-i18n="popup.robustlinks.original.span">${i18n.t('popup.robustlinks.original.span.textContent')}</span><span><a href="${originalurl}" rel="noopener" target="_blank">${originalurl}</a></span>` : '';
+
+    var versionurl = i.getAttribute('data-versionurl');
+    versionurl = (versionurl) ? versionurl.trim() : undefined;
+    var versiondate = i.getAttribute('data-versiondate');
+    var nearlinkdateurl = '';
+
+    if (versiondate) {
+      versiondate = versiondate.trim();
+      nearlinkdateurl = 'http://timetravel.mementoweb.org/memento/' + versiondate.replace(/\D/g, '') + '/' + href;
+      nearlinkdateurl = `<span data-i18n="popup.robustlinks.near-link-date.span">${i18n.t('popup.robustlinks.near-link-date.span.textContent')}</span><span><a href="${nearlinkdateurl}" rel="noopener" target="_blank">${versiondate}</a></span>`;
+    }
+    else if (versionurl) {
+      versiondate = versionurl;
+    }
+
+    versionurl = (versionurl) ? `<span data-i18n="popup.robustlinks.version.span">${i18n.t('popup.robustlinks.version.span.textContent')}</span><span><a href="${versionurl}" rel="noopener" target="_blank">${versiondate}</a></span>` : '';
+
+    // var citations = Object.keys(Config.Citation).concat(ns.schema.citation);
+
+    //FIXME: This is ultimately inaccurate because it should be obtained through RDF parser
+    var citation = '';
+    var citationLabels = [];
+    var iri;
+    var citationType;
+    var rel = i.getAttribute('rel');
+
+    if (rel) {
+      citationLabels = getCitationLabelsFromTerms(rel);
+
+      if (citationLabels.length > 0) {
+        citationType = citationLabels.join(', ');
+        citation = `<span data-i18n="popup.robustlinks.citation-reason.span">${i18n.t('popup.robustlinks.citation-reason.span.textContent')}</span><span>${citationType}</span>`;
+      }
+    }
+
+    sanitizeInsertAdjacentHTML(i, 'afterend', `<span class="do robustlinks">${getButtonHTML({ key: 'popup.robustlinks.show.button', button: 'robustify-links' })}<span>${citation}${originalurl}${versionurl}${nearlinkdateurl}</span></span>`);
+  });
+
+  document.querySelectorAll('.do.robustlinks').forEach(i => {
+    i.addEventListener('click', (e) => {
+      const button = e.target.closest('button');
+      if (button) {
+        button.parentNode.classList.toggle("on");
+      }
+    });
+  });
+}
+
+export function getCitationLabelsFromTerms(rel, citations) {
+  citations = citations || Object.keys(Config.Citation);
+
+  var citationLabels = [];
+
+  rel.split(' ').forEach(term => {
+    if (Config.Citation[term]) {
+      citationLabels.push(Config.Citation[term]);
+    }
+    else {
+      var s = term.split(':');
+      if (s.length == 2) {
+        citations.forEach(c => {
+          if (s[1] == getFragmentFromString(c) || s[1] == getURLLastPath(c)) {
+            citationLabels.push(Config.Citation[c])
+          }
+        });
+      }
+    }
+  });
+
+  return citationLabels
+}
+
+export function getTestDescriptionReviewStatusHTML() {
+  var reviewStatusHTML = [];
+
+  reviewStatusHTML.push('<dl id="test-description-review-statuses">');
+
+  Object.keys(Config.TestDescriptionReviewStatus).forEach(i => {
+    const key = Config.TestDescriptionReviewStatus[i].toLowerCase().replace(/\s+/g, '-');
+    reviewStatusHTML.push('<dt>' + getFragmentFromString(i) + '</dt>');
+    reviewStatusHTML.push(`<dd data-i18n="test-description-review-status.${key}.dd">${i18n.t(`test-description-review-status.${key}.dd.textContent`)}</dd>`);
+  })
+
+  reviewStatusHTML.push('</dl>');
+
+  return reviewStatusHTML.join('');
+}
+
+export function getAgentHTML(options = {}) {
+  let { name, image, iri } = options;
+  let userName = Config.SecretAgentNames[getRandomIndex(Config.SecretAgentNames.length)];
+
+  // Only fall back to Config.User values when the iri is the signed-in user's iri
+  // (or when iri was not explicitly provided, meaning we're rendering the current user).
+  const hasExplicitIri = 'iri' in options;
+  const isCurrentUser = !hasExplicitIri || iri === Config.User.IRI;
+  if (isCurrentUser) {
+    iri = iri || Config.User.IRI;
+    name = name || Config.User.Name;
+    image = image || Config.User.Image;
+  }
+
+  // XXX: We have the IRI already
+  if (iri && name) {
+    userName = `<span about="${iri}" property="schema:name">${name}</span>`;
+  }
+
+  let userImage = '';
+
+  if (!('omitImage' in options && options.omitImage) && image) {
+    userImage = getResourceImageHTML(image, options) + ' ';
+  }
+
+  let user = `<span typeof="schema:Person">${userName}</span>`;
+
+  if (iri?.length) {
+    user = `<span about="${iri}" typeof="schema:Person">${userImage}<a rel="schema:url" href="${iri}">${userName}</a></span>`;
+  }
+
+  return user;
+}
+
+export function getResourceImageHTML(resource, options = {}) {
+  var avatarSize = ('avatarSize' in options) ? options.avatarSize : Config['AvatarSize'];
+
+  return `<img alt="" height="${avatarSize}" rel="schema:image" src="${resource}" width="${avatarSize}" />`;
+}
+
+export function createLicenseHTML(iri, options = {}) {
+  options['rel'] = options.rel ? options.rel : 'schema:license';
+  options['label'] = options.label ? options.label : 'License';
+  return createLicenseRightsHTML(iri, options);
+}
+
+export function createRightsHTML(iri, options = {}) {
+  options['rel'] = options.rel ? options.rel : 'dcterms:rights';
+  options['label'] = options.label ? options.label : 'Rights';
+  return createLicenseRightsHTML(iri, options);
+}
+
+export function createLicenseRightsHTML(iri, options = {}) {
+  if (!iri) return '';
+
+  var html = '';
+  var title = '';
+  var name = iri;
+
+  const labelKey = options.label.toLowerCase().replace(/\s+/g, '-');
+
+  html = `<dl class="${labelKey}"><dt data-i18n="${labelKey}.label">${i18n.t(`${labelKey}.label.textContent`)}</dt><dd>`;
+  // if ('name' in options) {
+  //   name = options.name;
+  //   title = ('description' in options) ? ` title="${i18n.t(`${labelKey}.dt.title`)}"` : '';
+  // }
+  // else
+  if (Config.License[iri]) {
+    name = Config.License[iri].name;
+    title = ` title="${i18n.t(`${labelKey}.${Config.License[iri].code}.option.title`)}"`;
+  }
+
+  html += '<a href="' + iri + '" rel="' + options.rel + '"' + title + '>' + name + '</a>';
+  html += '</dd></dl>';
+
+  return html;
+}
+
+//TODO: Consider if/how setDocumentRelation and createDefinitionListHTML
+//TODO: Extend with data.resource, data.datatype
+export function createDefinitionListHTML(data, options = {}) {
+  // console.log(data, options)
+  if (!data || !options) { return; }
+
+  var id = (options.id) ? ` id="${options.id}"` : '';
+  var title = options.title || options.id;
+  var classAttribute = (options.class) ? ` class="${options.class}"` : ` class="${title.toLowerCase()}"`;
+
+  var dds = [];
+
+  data.forEach(d => {
+    var prefix = d.prefix ? ` prefix="${d.prefix}"` : '';
+    var lang = d.lang !== undefined ? ` lang="${d.lang}"` : '';
+    var xmlLang = d.xmlLang !== undefined ? ` xml:lang="${d.xmlLang}"` : '';
+    var resource = d.resource ? ` resource="${d.resource}"` : '';
+    var content = d.content ? ` content="${d.content}"` : '';
+    var datatype = d.datatype ? ` datatype="${d.datatype}"` : '';
+    var typeOf = d.typeOf ? ` typeof="${d.typeOf}"` : '';
+
+    //d.href is required, d.resource is optional.
+
+    ///XXX: This can be further developed
+    if (d.child) {
+      var childTypeOf = d.child.typeOf ? ` typeof="${d.child.typeOf}"` : '';
+      var childResource = d.child.resource ? ` resource="${d.child.resource}"` : '';
+
+      dds.push(`
+        <dd>
+          <span${content}${datatype}${lang}${prefix} rel="${d.rel}"${resource}${typeOf}${xmlLang}>
+            <span rel="${d.child.rel}"${childResource}${childTypeOf}>${d.child.textContent}</span>
+          </span>
+        </dd>
+      `);
+    }
+    else if (d.rel && d.property) {
+      dds.push(`<dd><a href="${d.href}"${content}"${lang} property="${d.property}" rel="${d.rel}${resource}${xmlLang}>${d.textContent || d.href}</a></dd>`);
+    }
+    else if (d.rel) {
+      dds.push(`<dd><a href="${d.href}"${prefix} rel="${d.rel}"${resource}>${d.textContent || d.href}</a></dd>`);
+    }
+    else if (d.property) {
+      dds.push(`<dd><span${content}${datatype}${lang}${prefix} property="${d.property}"${xmlLang}>${d.textContent}</span></dd>`);
+    }
+  });
+
+  var html = `
+    <dl${classAttribute}${id}>
+      <dt>${title}</dt>
+      ${dds.join('\n')}
+    </dl>`;
+
+  // console.log(html);
+
+  return html;
+}
+
+export function createLanguageHTML(language, options = {}) {
+  if (!language) return '';
+
+  var property = options.property || 'dcterms:language';
+  var content = language;
+  var textContent = Config.Languages[language].sourceName || language;
+  options['title'] = options.label || 'Language';
+
+  return createDefinitionListHTML([{ property, content, textContent, lang: '', xmlLang: '' }], options);
+}
+
+export function createInboxHTML(url, options = {}) {
+  if (!url) return '';
+
+  options['class'] = options.class || 'inbox';
+  options['title'] = 'Inbox';
+
+  return createDefinitionListHTML([{ 'href': url, 'rel': 'ldp:inbox' }], options);
+}
+
+export function createInReplyToHTML(url, options = {}) {
+  if (!url) return '';
+
+  options['class'] = options.class || 'in-reply-to';
+  options['title'] = 'In reply to';
+
+  return createDefinitionListHTML([{ 'href': url, 'rel': 'as:inReplyTo' }], options);
+}
+
+export function createPublicationStatusHTML(url, options = {}) {
+  if (!url) return '';
+
+  options['class'] = options.class || 'publication-status';
+  console.log(Config.PublicationStatus)
+  console.log(Config.PublicationStatus[url], url)
+
+  var textContent = Config.PublicationStatus[url] || url;
+  options['title'] = 'Status';
+
+  return createDefinitionListHTML(
+    [
+      {
+        prefix: 'pso: http://purl.org/spar/pso/',
+        rel: 'pso:holdsStatusInTime',
+        resource: '#' + generateAttributeId(),
+        child: {
+          rel: 'pso:withStatus', resource: url, typeOf: 'pso:PublicationStatus', textContent
+        }
+      }
+    ],
+    options
+  );
+}
+
+export function createResourceTypeHTML(url, options = {}) {
+  if (!url) return '';
+
+  options['class'] = options.class || 'resource-type';
+  var textContent = Config.ResourceType[url] || url;
+  options['title'] = 'Type';
+
+  return createDefinitionListHTML([{ 'href': url, 'rel': 'rdf:type', textContent }], options);
+}
+
+export function createTestSuiteHTML(url, options = {}) {
+  if (!url) return '';
+
+  options['class'] = options.class || 'test-suite';
+  options['title'] = 'Test Suite';
+
+  return createDefinitionListHTML([{ 'href': url, 'rel': 'spec:testSuite' }], options);
+}
+
+// Show the linked container or inbox URL next to its label.
+export function targetHTML(url) {
+  return url ? ` <code><a href="${htmlEncode(url)}" rel="noopener" target="_blank">${htmlEncode(url)}</a></code>` : '';
+}
+
+// An inbox inserted this session may not be parsed or saved yet
+function getDocumentInboxFromDOM() {
+  const article = selectArticleNode(document) || document.body;
+  const node = Array.from(article.querySelectorAll('[rel~="ldp:inbox"], [rel~="as:inbox"]')).find(n => !n.closest('.do'));
+  const value = node?.getAttribute('href') || node?.getAttribute('resource');
+  if (!value) return;
+  try { return new URL(value, Config.DocumentURL).href; } catch { return; }
+}
+
+// Inboxes this post can notify; each checkbox value is an inbox URL
+export function getAnnotationInboxLocationHTML(action) {
+  if (action === 'bookmark') return '';
+
+  var inboxes = [];
+
+  var documentInbox = Config.Resource[Config.DocumentURL]?.inbox?.[0] || getDocumentInboxFromDOM();
+  if (documentInbox) {
+    // Checked state is derived from the access and encrypt toggles on popup open
+    inboxes.push({ suffix: 'document', url: documentInbox, label: i18n.t('annotation-inbox.document.label.textContent'), i18nKey: 'annotation-inbox.document.label', className: 'editor-form-notify-inbox' });
+  }
+
+  var selection = window.getSelection();
+  if (selection && !selection.isCollapsed) {
+    var selectedParentNode = getSelectedParentElement(selection.getRangeAt(0));
+    var annotationInbox = getInboxOfClosestNodeWithSelector(selectedParentNode, '.do[typeof="oa:Annotation"]');
+    if (annotationInbox) {
+      inboxes.push({ suffix: 'annotation', url: annotationInbox, label: i18n.t('annotation-inbox.annotation.label.textContent'), i18nKey: 'annotation-inbox.annotation.label', className: 'editor-form-notify-inbox' });
+    }
+  }
+
+  // Topical inboxes: public TypeIndex registrations for as:Announce
+  var registrations = Config.User.TypeIndex?.[ns.solid.publicTypeIndex.value] || {};
+  Object.values(registrations).forEach((registration, index) => {
+    if (registration[ns.solid.forClass.value] !== ns.as.Announce.value) return;
+    var container = registration[ns.solid.instanceContainer.value];
+    if (!container) return;
+    var label = registration[ns.rdfs.label.value];
+    // A topical inbox the user notified before starts checked
+    var remembered = Config.User.UI?.annotationNotifyInboxes?.checked;
+    inboxes.push({ suffix: `typeindex-${index}`, url: container, label: label ? htmlEncode(label) : i18n.t('annotation-inbox.label.textContent'), subject: registration[ns.dcterms.subject.value], checked: Array.isArray(remembered) && remembered.includes(container) });
+  });
+
+  var seen = new Set();
+  var items = [];
+  inboxes.forEach(inbox => {
+    if (seen.has(inbox.url)) return;
+    seen.add(inbox.url);
+    var id = `${action}-annotation-inbox-${inbox.suffix}`;
+    var className = inbox.className ? ` class="${inbox.className}"` : '';
+    var checked = inbox.checked ? ' checked="checked"' : '';
+    var subject = inbox.subject ? ` data-subject="${htmlEncode(inbox.subject)}"` : '';
+    var i18nAttr = inbox.i18nKey ? ` data-i18n="${inbox.i18nKey}"` : '';
+    items.push(`<li><input${className}${checked} id="${id}" name="${action}-annotation-inbox" type="checkbox" value="${htmlEncode(inbox.url)}"${subject} /><label${i18nAttr} for="${id}">${inbox.label}</label>${targetHTML(inbox.url)}</li>`);
+  });
+
+  if (!items.length) return '';
+
+  return `<details class="annotation-inbox-details" open=""><summary data-i18n="annotation-inbox-selection.notify.span">${i18n.t('annotation-inbox-selection.notify.span.textContent')}</summary><ul>${items.join('')}</ul></details>`;
+}
+
+// TypeIndex-registered annotation container for the action's activity type; private first, else public, else undefined
+export function getItemVisibility(iri) {
+  const typeIndex = Config.User.TypeIndex;
+  if (!iri || !typeIndex) return undefined;
+  const registries = [
+    ['private', typeIndex[ns.solid.privateTypeIndex.value]],
+    ['public', typeIndex[ns.solid.publicTypeIndex.value]]
+  ];
+  for (const [visibility, registrations] of registries) {
+    if (!registrations) continue;
+    for (const ti of Object.values(registrations)) {
+      const container = ti[ns.solid.instanceContainer.value];
+      if (container && iri.startsWith(container)) return visibility;
+    }
+  }
+  return undefined;
+}
+
+export function getRegisteredAnnotationContainer(action) {
+  const typeIndex = Config.User.TypeIndex;
+  const activityIndex = Config.ActionActivityIndex[action];
+  if (!typeIndex || !activityIndex) return undefined;
+
+  const registries = [
+    typeIndex[ns.solid.privateTypeIndex.value],
+    typeIndex[ns.solid.publicTypeIndex.value]
+  ];
+
+  for (const registrations of registries) {
+    if (!registrations) continue;
+    for (const ti of Object.values(registrations)) {
+      const forClass = ti[ns.solid.forClass.value];
+      const instanceContainer = ti[ns.solid.instanceContainer.value];
+      if (instanceContainer && activityIndex.includes(forClass)) {
+        return instanceContainer;
+      }
+    }
+  }
+  return undefined;
+}
+
+export function getAnnotationLocationHTML(action) {
+  var inputs = [];
+
+  if (Config.Editor.mode == 'author') {
+    return '';
+  }
+
+  const ui = Config.User.UI || {};
+
+  const options = [
+    { suffix: 'annotation-service', uiKey: 'annotationLocationService', url: (typeof Config.AnnotationService !== 'undefined') ? Config.AnnotationService : undefined },
+    { suffix: 'annotation-store', uiKey: 'annotationLocationAnnotationStore', url: getRegisteredAnnotationContainer(action) },
+    { suffix: 'personal-storage', uiKey: 'annotationLocationPersonalStorage', url: (Config.User.Storage && Config.User.Storage.length > 0) ? Config.User.Storage[0] : undefined },
+    { suffix: 'activity-outbox', uiKey: 'annotationLocationActivityOutbox', url: (Config.User.Outbox && Config.User.Outbox.length > 0) ? Config.User.Outbox[0] : undefined },
+    { suffix: 'nanopub-network', uiKey: 'annotationLocationNanopubNetwork', url: Config.Nanopub?.UseTestRegistry ? getRegistryURL() : 'https://nanopub.net/' },
+  ];
+
+  // A remembered choice pre-checks; otherwise fall back to the most relevant available location.
+  const remembered = options.some(({ uiKey }) => ui[uiKey] && ui[uiKey].checked);
+  const defaultOrder = ['annotation-store', 'annotation-service', 'activity-outbox', 'personal-storage'];
+  const defaultSuffix = remembered ? undefined : defaultOrder.find((suffix) => options.some((o) => o.suffix === suffix && o.url));
+
+  options.forEach(({ suffix, uiKey, url }) => {
+    if (!url) return;
+    const id = `${action}-annotation-location-${suffix}`;
+    const labelI18n = `annotation-location.${suffix}.label`;
+    const isChecked = (ui[uiKey] && ui[uiKey].checked) || suffix === defaultSuffix;
+    const checked = isChecked ? ' checked="checked"' : '';
+    inputs.push(`<li><input type="checkbox" id="${id}" name="${id}"${checked} /><label data-i18n="${labelI18n}" for="${id}">${i18n.t(labelI18n + '.textContent')}</label>${targetHTML(url)}</li>`);
+  });
+
+  let annotationInputs = `<p>${i18n.t('annotation-location-selection.not-found.p.textContent')}</p>`;
+
+  if (inputs.length) {
+    annotationInputs = `<ul>${inputs.join('')}</ul>`;
+  }
+
+  const setups = [];
+  if (Config.User.IRI && Config.User.Storage?.length) {
+    ['annotation-store', 'activity-outbox'].forEach(suffix => {
+      if (!options.find(o => o.suffix === suffix).url) setups.push(suffix);
+    });
+  }
+  const setupHTML = setups.length
+    ? `<details class="annotation-location-more"><summary data-i18n="annotation-location-more.summary">${i18n.t('annotation-location-more.summary.textContent')}</summary><ul class="annotation-location-setup">${setups.map(suffix => `<li><button class="setup-annotation-location" data-i18n="annotation-location-setup.${suffix}.button" data-location="${suffix}" type="button">${i18n.t(`annotation-location-setup.${suffix}.button.textContent`)}</button></li>`).join('')}</ul></details>`
+    : '';
+
+  return `<details class="annotation-location-details" open=""><summary data-i18n="annotation-location-selection.store-at.span">${i18n.t('annotation-location-selection.store-at.span.textContent')}</summary>${annotationInputs}${setupHTML}</details>`;
+}
+
+export function getPublicationStatusOptionsHTML(options) {
+  options = options || {};
+  var s = [], selectedIRI = '';
+
+  if ('selected' in options) {
+    selectedIRI = options.selected;
+    if (selectedIRI == '') {
+      s.push(`<option data-i18n="publication-status.choose.option" selected="selected" value="">${i18n.t('publication-status.choose.option.textContent')}</option>`);
+    }
+  }
+  else {
+    selectedIRI = ns.pso.draft.value;
+  }
+
+  Object.keys(Config.PublicationStatus).forEach(iri => {
+    var selected = (iri == selectedIRI) ? ' selected="selected"' : '';
+    const key = Config.PublicationStatus[iri].toLowerCase().replace(/\s+/g, '-');
+    s.push(`<option data-i18n="publication-status.${key}.option"${selected} title="${i18n.t(`publication-status.${key}.option.title`)}" value="${iri}">${i18n.t(`publication-status.${key}.option.textContent`)}</option>`);
+  })
+
+  return s.join('');
+}
+
+export function getResourceTypeOptionsHTML(options) {
+  options = options || {};
+  var s = [], selectedType = '';
+
+  if ('selected' in options) {
+    selectedType = options.selected;
+    if (selectedType == '') {
+      s.push(`<option data-i18n="resource-type.choose.option" selected="selected" value="">${i18n.t('resource-type.choose.option.textContent')}</option>`);
+    }
+  }
+  else {
+    selectedType = 'http://schema.org/Article';
+  }
+
+  // Sorted by label in the UI language.
+  Object.keys(Config.ResourceType)
+    .map(iri => {
+      const key = Config.ResourceType[iri].toLowerCase().replace(/\s+/g, '-');
+      return { iri, key, label: i18n.t(`resource-type.${key}.option.textContent`) };
+    })
+    .sort((a, b) => a.label.localeCompare(b.label, Config.User?.UI?.Language || undefined))
+    .forEach(({ iri, key, label }) => {
+      var selected = (iri == selectedType) ? ' selected="selected"' : '';
+      s.push(`<option data-i18n="${`resource-type.${key}.option`}"${selected} title="${i18n.t(`resource-type.${key}.option.title`)}" value="${iri}">${label}</option>`);
+    });
+
+  return s.join('');
+}
+
+export function getLanguageOptionsHTML(options) {
+  options = options || {};
+  var s = [], selectedLang = '';
+
+  if ('selected' in options) {
+    selectedLang = options.selected;
+    if (selectedLang == '') {
+      s.push(`<option data-i18n="language.choose.option" selected="selected" value="">${i18n.t('language.choose.option.textContent')}</option>`);
+    }
+  }
+  else if (typeof Config.User.UI?.Language !== 'undefined') {
+    selectedLang = Config.User.UI.Language;
+  }
+  else {
+    selectedLang = 'en';
+  }
+
+  Object.keys(Config.Languages).forEach(lang => {
+    let selected = (lang == selectedLang) ? ' selected="selected"' : '';
+    s.push(`<option dir="${Config.Languages[lang].dir}" lang="${lang}"${selected} value="${lang}" xml:lang="${lang}">${Config.Languages[lang].sourceName}</option>`);
+  });
+
+  return s.join('');
+}
+
+export function getLicenseOptionsHTML(options) {
+  options = options || {};
+  var s = [], selectedIRI = '';
+
+  if ('selected' in options) {
+    selectedIRI = options.selected;
+    if (selectedIRI == '') {
+      s.push(`<option dir="auto" data-i18n="license.choose.option" selected="selected" value="">${i18n.t('license.choose.option.textContent')}</option>`);
+    }
+  }
+  else if (typeof Config.User.UI.License !== 'undefined') {
+    selectedIRI = Config.User.UI.License;
+  }
+  else {
+    selectedIRI = 'https://creativecommons.org/licenses/by/4.0/';
+  }
+
+  Object.keys(Config.License).forEach(iri => {
+    if (iri != 'NoLicense') {
+      var selected = (iri == selectedIRI) ? ' selected="selected"' : '';
+      s.push(`<option dir="auto" data-i18n="license.${Config.License[iri].code}.option" value="${iri}"${selected} title="${i18n.t('license.' + Config.License[iri].code + '.option.title')}">${Config.License[iri].name}</option>`);
+    }
+  })
+
+  return s.join('');
+}
+
+export function getCountryOptionsHTML(options) {
+  options = options || {};
+  
+  var s = [], selectedCode = '';
+
+  if ('selected' in options) {
+    selectedCode = options.selected;
+    if (selectedCode == '') {
+      s.push(`<option dir="auto" data-i18n="country.choose.option" selected="selected" value="">${i18n.t('country.choose.option.textContent')}</option>`);
+    }
+  }
+
+  //Just for fun maybe in the future:
+  // else if (typeof Config.User.Address.Country !== 'undefined') {
+  //   selectedCode = Config.User.Address.Country;
+  // }
+  // else {
+  //   selectedCode = 'https://creativecommons.org/licenses/by/4.0/';
+  // }
+
+  Object.keys(Config.RefCountry).forEach(code => {
+    var selected = (code == selectedCode) ? ' selected="selected"' : '';
+    s.push(`<option dir="auto" data-i18n="${`country.${code}.option`}" value="${code}"${selected}">${i18n.t(`country.${code}.option.textContent`)}</option>`);
+  })
+
+  return s.join('');
+}
+
+
+export function getCitationOptionsHTML(options = {}) {
+  options = options || {};
+  var s = [], selectedIRI = '';
+
+  if ('selected' in options) {
+    selectedIRI = options.selected;
+    if (selectedIRI == '') {
+      s.push(`<option data-i18n="citation.choose.option" selected="selected" value="">${i18n.t('citation.choose.option.textContent')}</option>`);
+    }
+  }
+
+  Object.keys(Config.Citation).forEach(iri => {
+    const key = Config.Citation[iri].toLowerCase().replace(/\s+/g, '-');
+    s.push(`<option data-i18n="${`citation.${key}.option`}" value="${iri}">${i18n.t(`citation.${key}.option.textContent`)}</option>`);
+  })
+
+  return s.join('');
+}
+
+export function getRequirementLevelOptionsHTML(type) {
+  type = type || 'MUST';
+
+  var s = '';
+  Object.keys(Config.RequirementLevel).forEach(iri => {
+    s += '<option value="' + iri + '">' + Config.RequirementLevel[iri] + '</option>';
+  })
+
+  return s;
+}
+
+export function getRequirementSubjectOptionsHTML(options) {
+  options = options || {};
+  var s = '', selectedIRI = '';
+// console.trace();
+// console.log(options)
+
+  if ('selected' in options) {
+    selectedIRI = options.selected;
+    if (selectedIRI == '') {
+      s += '<option selected="selected" value="">Choose a requirement subject</option>';
+    }
+  }
+
+  const conceptIRIs = getClassesOfProductsConcepts();
+// console.log(concepts)
+  if (conceptIRIs.length) {
+    conceptIRIs.forEach(conceptIRI => {
+      var conceptData = Config.Resource[conceptIRI]?.skos?.data[conceptIRI];
+      var conceptLabel, title;
+
+      if (conceptData) {
+        conceptLabel = conceptData[ns.skos.prefLabel] || '';
+        title = conceptData[ns.skos.definition] || '';
+      }
+      else {
+        var domConcept = getClassOfProductFromDOM(conceptIRI);
+        if (!domConcept) return;
+        conceptLabel = domConcept.label;
+        title = domConcept.definition;
+      }
+
+      if (title) {
+        title = ` title="${htmlEncode(title)}"`;
+      }
+
+      var selected = (conceptIRI == selectedIRI) ? ' selected="selected"' : '';
+
+      s += '<option value="' + conceptIRI + '"' + selected + title + '>' + conceptLabel + '</option>';
+    })
+  }
+
+  return s;
+}
+
+
+export function getAccessModeOptionsHTML(options) {
+  // id = encodeURIComponent(id);
+  options = options || {};
+  //Contextual access control modes and human-readable labels
+  //UC-sharing-article: See Config.AccessContext.Share
+  options['context'] = options['context'] || 'Share';
+  var accessContext = Config.AccessContext[options.context] || 'Share';
+
+  var s = `<option data-i18n="dialog.share-resource.select-access-mode.no-access.option" value="">${i18n.t(`dialog.share-resource.select-access-mode.no-access.option.textContent`)}</option>`;
+
+  var modes = Object.keys(accessContext);
+  modes.forEach(mode => {
+    var selected = (options.selected && (mode === options.selected)) ? ' selected="selected"' : '';
+    var modeName = accessContext[mode];
+    s += `<option data-i18n="dialog.share-resource.select-access-mode.acl-${modeName}.option"${selected} value="${mode}">${i18n.t(`dialog.share-resource.select-access-mode.acl-${modeName}.option.textContent`)}</option>`;
+  });
+
+  // console.log(s);
+  return s;
+}
+
+export function setCopyToClipboard(contentNode, triggerNode, options = {}) {
+  triggerNode.addEventListener('click', e => {
+    if (e.target.closest('button.copy-to-clipboard')) {
+      var text;
+
+      switch (contentNode.nodeName.toLowerCase()) {
+        default:
+        case 'pre':
+          text = contentNode.textContent;
+          break;
+
+        case 'input':
+        case 'textarea':
+          text = contentNode.value;
+          break;
+
+        case 'table':
+          text = serializeTableToText(contentNode);
+          break;
+      }
+
+      navigator.clipboard.writeText(text)
+        .then(() => {
+          var message = `<span data-i18n="dialog.document-action-message.clipboard-success.span">${i18n.t('dialog.document-action-message.clipboard-success.span.textContent')}</span>`;
+          message = {
+            'content': message,
+            'type': 'info',
+            'timer': 3000
+          }
+          addMessageToLog(message, Config.MessageLog);
+          showActionMessage(document.body, message);
+        })
+        .catch(error => {
+          var message = `<span data-i18n="dialog.document-action-message.clipboard-fail.span">${i18n.t('dialog.document-action-message.clipboard-fail.span.textContent')}</span>`;
+          message = {
+            'content': message,
+            'type': 'error',
+            'timer': 3000
+          }
+          addMessageToLog(message, Config.MessageLog);
+          showActionMessage(document.body, message);
+        });
+    }
+  });
+}
+
+export function serializeTableToText(table) {
+  //FIXME: Multiple tbody
+
+  var thead = table.querySelector('thead');
+  var tbodies = table.querySelectorAll('tbody');
+
+  var theadData = serializeTableSectionToText(thead);
+
+  var tbodyData = [];
+  tbodies.forEach(tbody => {
+    tbodyData.push(serializeTableSectionToText(tbody));
+  })
+  tbodyData = tbodyData.join('\n');
+
+  return theadData + '\n' + tbodyData;
+}
+
+export function serializeTableSectionToText(section) {
+  //FIXME: Needs to handle rowspan/colspan and th/td combinations
+  //TODO: Test with example tables:
+  //https://csarven.ca/linked-research-decentralised-web#quality-attributes-dokieli
+  //https://csarven.ca/linked-research-decentralised-web.html#forces-and-functions-in-specifications
+  //https://csarven.ca/linked-research-decentralised-web#fair-metrics-dataset-dokieli
+  //https://csarven.ca/linked-research-decentralised-web#dokieli-implementation-web-annotation-motivations-notifications
+  //https://csarven.ca/linked-research-decentralised-web#ldn-test-consumer-summary
+
+  var data = [];
+  var rows;
+
+  switch (section.nodeName.toLowerCase()) {
+    case 'thead':
+      //FIXME: Assuming the last tr in thead has most specific columns.
+      rows = section.querySelectorAll('tr:last-child');
+      break;
+    case 'tbody':
+      rows = section.querySelectorAll('tr');
+      break;
+  }
+
+  rows.forEach(tr => {
+    var cells;
+
+    switch (section.nodeName.toLowerCase()) {
+      case 'thead':
+        cells = tr.querySelectorAll('th, td');
+        break;
+      case 'tbody':
+        cells = tr.querySelectorAll('th, td');
+        break;
+    }
+
+    var rowData = [];
+
+    cells.forEach(cell => {
+      var sanitized = domSanitize(cell.textContent.trim()).replace(/"/g, '""');
+      rowData.push(sanitized);
+    });
+
+    data.push(rowData.join('","'));
+  });
+
+  return data.map(row => '"' + row + '"').join('\n');
+}
+
+export function focusNote() {
+  document.addEventListener('click', e => {
+    var ref = e.target.closest('span.ref.do sup a');
+    if (!ref) return;
+
+    var hash = new URL(ref.href).hash;
+    if (!hash.length) return;
+    var refId = hash.substring(1);
+
+    var aside = document.getElementById('document-notifications');
+    if (!aside) return;
+
+    e.preventDefault();
+
+    if (!aside.classList.contains('on')) {
+      aside.classList.add('on');
+    }
+    window.history.replaceState({}, null, hash);
+
+    var revealNote = () => {
+      var note = aside.querySelector('[id="' + refId + '"]');
+      if (note) note.scrollIntoView();
+      return !!note;
+    };
+
+    // The note may be lazily added to the panel after it opens; observe briefly.
+    if (!revealNote()) {
+      var obs = new MutationObserver(() => { if (revealNote()) obs.disconnect(); });
+      obs.observe(aside, { childList: true, subtree: true });
+      setTimeout(() => obs.disconnect(), 5000);
+    }
+  });
+}
+
+export function getReferenceLabel(motivatedBy) {
+  motivatedBy = motivatedBy || '';
+  //TODO: uriToPrefix
+  motivatedBy = (motivatedBy.length && motivatedBy.slice(0, 4) == 'http' && motivatedBy.indexOf('#') > -1) ? 'oa:' + motivatedBy.substr(motivatedBy.lastIndexOf('#') + 1) : motivatedBy;
+
+  return Config.MotivationSign[motivatedBy] || '#';
+}
+
+export function createRDFaMarkObject(r, mode) {
+  //Generic
+  let about = r['about'];
+  let resource = r['resource'];
+  let typeOf = r['typeof'];
+  let rel = r['rel'];
+  let property = r['property'];
+  let href = r['href'];
+  let content = r['content'];
+  let lang = r['lang'];
+  let datatype = r['datatype'];
+
+  let id = generateAttributeId();
+
+  about = about || '#' + id;
+
+  //TODO: Figure out how to use user's preferred vocabulary. Huh?
+  property = property || 'rdfs:label';
+
+  let xmlLang = lang;
+  datatype = lang ? undefined : datatype;
+
+  let element = ('datatype' in r && r.datatype == 'xsd:dateTime') ? 'time' : ((href == '') ? 'span' : 'a');
+
+  let attrs = { id, about, resource, 'typeof': typeOf, rel, property, href, content, lang, 'xml:lang': xmlLang, datatype };
+
+  return { element, attrs }
+}
+
+//mode value can be: exapanded or null
+export function createRDFaHTML(r, mode) {
+  var s = '', about = '', property = '', rel = '', resource = '', href = '', content = '', langDatatype = '', typeOf = '', idValue = '', id = '';
+
+  if ('rel' in r && r.rel != '') {
+    rel = ' rel="' + r.rel + '"';
+  }
+
+  if ('href' in r && r.href != '') {
+    href = ' href="' + r.href + '"';
+  }
+
+  if (mode == 'expanded') {
+    idValue = generateAttributeId();
+    id = ' id="' + idValue + '"';
+
+    if ('about' in r && r.about != '') {
+      about = ' about="' + r.about + '"';
+    }
+    else {
+      about = ' about="#' + idValue + '"';
+    }
+
+    if ('property' in r && r.property != '') {
+      property = ' property="' + r.property + '"';
+    }
+    else {
+      //TODO: Figure out how to use user's preferred vocabulary.
+      property = ' property="rdfs:label"';
+    }
+
+    if ('resource' in r && r.resource != '') {
+      resource = ' resource="' + r.resource + '"';
+    }
+
+    if ('content' in r && r.content != '') {
+      content = ' content="' + r.content + '"';
+    }
+
+    if ('lang' in r && r.lang != '') {
+      langDatatype = ' lang="' + r.lang + '" xml:lang="' + r.lang + '"';
+    }
+    else {
+      if ('datatype' in r && r.datatype != '') {
+        langDatatype = ' datatype="' + r.datatype + '"';
+      }
+    }
+
+    if ('typeOf' in r && r.typeOf != '') {
+      typeOf = ' typeof="' + r.typeOf + '"';
+    }
+  }
+
+  var element = ('datatype' in r && r.datatype == 'xsd:dateTime') ? 'time' : ((href == '') ? 'span' : 'a');
+  var textContent = r.textContent || r.href || '';
+
+  s = '<' + element + about + content + href + id + langDatatype + property + rel + resource + typeOf + '>' + textContent + '</' + element + '>';
+
+  return s;
+}
+
+//TODO: Work on HTML nodes instead of the selected text
+export function createRDFaHTMLRequirement(r, mode) {
+  var s = '', about = '', property = '', rel = '', resource = '', href = '', content = '', langDatatype = '', typeOf = '', idValue = '', id = '', subject = '', level = '', basedOnConsensus;
+
+  var idValue = r.id || generateAttributeId();
+  id = ` id="${idValue}"`;
+
+  var aboutValue = ('about' in r && r.about != '') ? r.about : '';
+  about= ` about="${aboutValue}"`;
+
+  rel = ' rel="spec:requirement"';
+  resource = ' resource="#' + idValue + '"';
+
+  if ('lang' in r && r.lang != '') {
+    langDatatype = ' lang="' + r.lang + '" xml:lang="' + r.lang + '"';
+  }
+  else {
+    if ('datatype' in r && r.datatype != '') {
+      langDatatype = ' datatype="' + r.datatype + '"';
+    }
+  }
+
+  if ('typeOf' in r && r.typeOf != '') {
+    typeOf = ' typeof="' + r.typeOf + '"';
+  }
+
+  //TODO: Perhaps the value passed to this function should include both requirementSubjectURI and requirementSubjectLabel. For now this is URI and label is derived :( Same goes for requirement level.
+
+  //TODO: Handle undefined r.subject, level etc.
+  var requirementSubjectURI = r.subject;
+  var requirementSubjectLabel = requirementSubjectURI ? getFragmentOrLastPath(requirementSubjectURI) : '';
+  var requirementLevelURI = r.level;
+  var requirementLevelLabel = requirementLevelURI ? getFragmentOrLastPath(requirementLevelURI): '';
+  var prevRequirementLevelLabel = r.prevLevelLabel || requirementLevelLabel;
+  var prevRequirementSubjectLabel = r.prevSubjectLabel || requirementSubjectLabel;
+  var selectedTextContent = r.selectedTextContent || '';
+  var selectedHtmlString = r.selectedHtmlString || selectedTextContent;
+
+  var requirementSubject = `<span rel="spec:requirementSubject" resource="${requirementSubjectURI}">${requirementSubjectLabel}</span>`;
+  var requirementLevel = `<span rel="spec:requirementLevel" resource="${requirementLevelURI}">${requirementLevelLabel}</span>`;
+
+  // console.log(selectedTextContent);
+
+  console.log("NODES: ", r.nodes)
+
+  const subjectLabel = prevRequirementSubjectLabel;
+  const levelLabel = prevRequirementLevelLabel;
+  
+  const subjIndex = selectedHtmlString.indexOf(subjectLabel);
+  const levelIndex = selectedHtmlString.indexOf(levelLabel);
+  
+  const replacements = [
+    { start: subjIndex, end: subjIndex + (subjectLabel||'').length, replacement: requirementSubject },
+    { start: levelIndex, end: levelIndex + (levelLabel||'').length, replacement: requirementLevel }
+  ]
+    .filter(r => r.start !== -1)
+    .sort((a,b) => b.start - a.start);
+  
+  let newHtmlString = selectedHtmlString;
+  for (const { start, end, replacement } of replacements) {
+    newHtmlString = newHtmlString.slice(0, start) + replacement + newHtmlString.slice(end);
+  }
+  var statement = `<span property="spec:statement">${newHtmlString}</span>`;
+
+  //TODO: Do other things that match terms from HTTP-RDF.
+
+  //TODO: if selected text is the only content in parent, consider using `p`
+  var element = 'span';
+
+  //Input (with or without p):
+  //<p>Client <code>SHOULD</code> generate a Content-Type header field in a message that contains content. [<a href="https://example.org/consensus/1" rel="cito:citesAsSourceDocument">Source</a>]</p>
+
+  // position the markup according to previous subject and level labels positions
+
+
+  //span or p:
+  //<p about="" id="server-content-type-includes" rel="spec:requirement" resource="#server-content-type-includes"><span property="spec:statement"><span rel="spec:requirementSubject" resource="#Server">Server</span> <span rel="spec:requirementLevel" resource="spec:MUST">MUST</span> generate a <code>Content-Type</code> header field in a message that contains content.</span></p>
+
+  s = '<' + element + about + id + langDatatype + rel + resource + typeOf + '>' + statement + '</' + element + '>';
+
+  // console.log(s)
+
+  return s;
+}
+
+export function highlightItems() {
+  var highlights = getDocumentContentNode(document).querySelectorAll('*[class*="highlight-"]');
+  for (var i = 0; i < highlights.length; i++) {
+    highlights[i].addEventListener('mouseenter', (e) => {
+      var c = e.target.getAttribute('class').split(' ')
+                .filter(s => { return s.startsWith('highlight-'); });
+      var highlightsX = getDocumentContentNode(document).querySelectorAll('*[class~="'+ c[0] +'"]');
+      for (var j = 0; j < highlightsX.length; j++) {
+        highlightsX[j].classList.add('do', 'highlight');
+      }
+    });
+
+    highlights[i].addEventListener('mouseleave', (e) => {
+      var c = e.target.getAttribute('class');
+      c = e.target.getAttribute('class').split(' ')
+                .filter(s => { return s.startsWith('highlight-'); });
+      var highlightsX = getDocumentContentNode(document).querySelectorAll('*[class~="'+ c[0] +'"]');
+      for (var j = 0; j < highlightsX.length; j++) {
+        highlightsX[j].classList.remove('do', 'highlight');
+      }
+    });
+  }
+}
+
+export function showAsTabs(selector) {
+  selector = selector || '.tabs';
+  var nodes = document.querySelectorAll(selector);
+
+  nodes.forEach(node => {
+    var li = node.querySelectorAll('nav li.selected');
+    var figure = node.querySelectorAll('figure.selected');
+
+    if (li.length == 0 && figure.length == 0) {
+      node.querySelector('nav li').classList.add('selected');
+      node.querySelector('figure').classList.add('selected');
+    }
+
+    node.querySelector('nav').addEventListener('click', (e) => {
+      var a = e.target;
+      if (a.closest('a')) {
+        e.preventDefault();
+        e.stopPropagation();
+
+        var li = a.parentNode;
+        if(!li.classList.contains('class')) {
+          var navLi = node.querySelectorAll('nav li');
+          for (var i = 0; i < navLi.length; i++) {
+            navLi[i].classList.remove('selected');
+            if (!navLi[i].classList.length) navLi[i].removeAttribute('class');
+          }
+          li.classList.add('selected');
+          var figures = node.querySelectorAll('figure');
+          for (let i = 0; i < figures.length; i++) {
+            figures[i].classList.remove('selected');
+            if (!figures[i].classList.length) figures[i].removeAttribute('class');
+          }
+          node.querySelector('figure' + a.hash).classList.add('selected');
+        }
+      }
+    });
+  })
+}
+
+export function showRefs() {
+  var refs = document.querySelectorAll('span.ref');
+  for (var i = 0; i < refs.length; i++) {
+    // console.log(this);
+    var ref = refs[i].querySelector('mark[id]');
+    // console.log(ref);
+    if (ref) {
+      var refId = ref.id;
+      // console.log(refId);
+      var refA = refs[i].querySelectorAll('[class*=ref-] a');
+      // console.log(refA);
+      for (var j = 0; j < refA.length; j++) {
+        //XXX: Assuming this is always an internal anchor?
+        var noteId = refA[j].getAttribute('href').substr(1);
+        // console.log(noteId);
+        var refLabel = refA[j].textContent;
+        // console.log(refLabel);
+
+        // console.log(refId + ' ' +  refLabel + ' ' + noteId);
+        positionNote(refId, noteId, refLabel);
+      }
+    }
+  }
+}
+
+export function showCitations(citation, g) {
+  // console.log('----- showCitations: ')
+  // console.log(citation);
+
+  var cEURL = stripFragmentFromString(citation.citingEntity);
+  // console.log(Config.Activity[cEURL]);
+
+  if (Config.Activity[cEURL]) {
+    if (Config.Activity[cEURL]['Graph']) {
+      addCitation(citation, Config.Activity[cEURL]['Graph']);
+    }
+    else {
+      // console.log('  Waiting...' + citation.citingEntity)
+      window.setTimeout(showCitations, 1000, citation, g);
+    }
+  }
+  else {
+    processCitationClaim(citation);
+  }
+}
+
+export function processCitationClaim(citation) {
+  // console.log('  processCitationClaim(' + citation.citingEntity + ')')
+  // var pIRI = getProxyableIRI(citation.citingEntity);
+  return getResourceGraph(citation.citingEntity)
+    .then(({ graph: g }) => {
+        var cEURL = stripFragmentFromString(citation.citingEntity);
+        Config.Activity[cEURL] = {};
+        Config.Activity[cEURL]['Graph'] = g;
+        var s = g.node(rdf.namedNode(citation.citingEntity));
+        addCitation(citation, s);
+      }
+    );
+}
+
+export function addCitation(citation, s) {
+  // console.log('  addCitation(' + citation.citingEntity + ')')
+  var citingEntity = citation.citingEntity;
+  var citationCharacterization = citation.citationCharacterization;
+  var citedEntity = citation.citedEntity;
+
+  var documentURL = Config.DocumentURL;
+
+  //XXX: Important
+  s = s.node(rdf.namedNode(citingEntity));
+
+  //TODO: cito:Citation
+  // if rdftypes.indexOf(citoCitation)
+  //   note.citocitingEntity && note.citocitationCharacterization && note.citocitedEntity)
+
+  // else
+
+  // console.log("  " + citationCharacterization + "  " + citedEntity);
+  var citationCharacterizationLabel = Config.Citation[citationCharacterization] || citationCharacterization;
+
+  var id = generateAttributeId(citingEntity);
+  var refId;
+
+  var cEURL = stripFragmentFromString(citingEntity);
+  var citingEntityLabel = getGraphLabel(s);
+  if (!citingEntityLabel) {
+    var cEL = getGraphLabel(s.node(rdf.namedNode(cEURL)));
+    citingEntityLabel = cEL ? cEL : citingEntity;
+  }
+  citation['citingEntityLabel'] = citingEntityLabel;
+
+  var citedEntityLabel = getGraphLabel(Config.Resource[documentURL].graph.node(rdf.namedNode(citedEntity)));
+  if (!citedEntityLabel) {
+    cEL = Config.Resource[documentURL].graph(Config.Resource[documentURL].graph.node(rdf.namedNode(stripFragmentFromString(citedEntity))));
+    citedEntityLabel = cEL ? cEL : citedEntity;
+  }
+  citation['citedEntityLabel'] = citedEntityLabel;
+
+  var noteData = {
+    'id': id,
+    'iri': citingEntity,
+    'type': 'ref-citation',
+    'mode': 'read',
+    'citation': citation
+  }
+
+  // console.log(noteData)
+  var noteDataHTML = createNoteDataHTML(noteData);
+
+  var asideNote = `
+    <aside class="note do">
+      <blockquote cite="${citingEntity}">${noteDataHTML}</blockquote>
+    </aside>`;
+
+  // console.log(asideNote)
+  var asideNode = fragmentFromString(asideNote);
+
+  var fragment, fragmentNode;
+
+  // //FIXME: If containerNode is used.. the rest is buggy
+
+  fragment = getFragmentFromString(citedEntity);
+  // console.log("  fragment: " + fragment)
+  fragmentNode = document.querySelector('[id="' + fragment + '"]');
+
+  if (fragmentNode) {
+    // console.log(asideNote)
+    var containerNode = fragmentNode;
+    refId = fragment;
+    // console.log(fragment);
+    // console.log(fragmentNode);
+    containerNode.appendChild(asideNode);
+    positionNote(refId, id, citingEntityLabel);
+  }
+  else {
+    var dl;
+    var citingItem = '<li><a about="' + citingEntity + '" href="' + citingEntity + '" rel="' + citationCharacterization + '" resource="' + citedEntity + '">' + citingEntityLabel + '</a> (' + citationCharacterizationLabel + ')</li>';
+
+    var documentCitedBy = 'document-cited-by';
+    var citedBy = document.getElementById(documentCitedBy);
+
+    if(citedBy) {
+      var ul = citedBy.querySelector('ul');
+      var spo = ul.querySelector('[about="' + citingEntity + '"][rel="' + citationCharacterization + '"][resource="' + citedEntity + '"]');
+      if (!spo) {
+        ul.appendChild(fragmentFromString(citingItem));
+      }
+    }
+    else {
+      dl = '        <dl class="do" id="' + documentCitedBy + '"><dt>Cited By</dt><dd><ul>' + citingItem + '</ul></dl>';
+      insertDocumentLevelHTML(document, dl, { 'id': documentCitedBy });
+    }
+  }
+}
+
+export function positionNote(refId, noteId, refLabel) {
+  var ref =  document.querySelector('[id="' + refId + '"]');
+  var note = document.querySelector('[id="' + noteId + '"]');
+  ref = (ref) ? ref : selectArticleNode(note);
+
+  if (note.hasAttribute('style')) {
+    note.removeAttribute('style');
+  }
+
+  //TODO: If there are articles already in the aside.note , the subsequent top values should come after one another
+  var style = [
+    'top: ' + Math.ceil(ref.parentNode.offsetTop) + 'px'
+  ].join('; ');
+  note.setAttribute('style', style);
+}
+
+// Deterministic stylesheet toggling: deactivate via media="not all" (original parked in data-media), activate by restoring media plus the legacy disabled toggle — titled-set flags alone are unreliable.
+function applyStylesheetState(stylesheet, rel, disabled) {
+  if (stylesheet.getAttribute('rel') !== rel) stylesheet.setAttribute('rel', rel);
+
+  if (disabled) {
+    if (stylesheet.getAttribute('media') !== 'not all') {
+      stylesheet.setAttribute('data-media', stylesheet.getAttribute('media') || '');
+      stylesheet.setAttribute('media', 'not all');
+    }
+    stylesheet.disabled = true;
+    if (stylesheet.sheet) stylesheet.sheet.disabled = true;
+  }
+  else {
+    if (stylesheet.getAttribute('media') === 'not all') {
+      const original = stylesheet.getAttribute('data-media');
+      if (original) stylesheet.setAttribute('media', original);
+      else stylesheet.removeAttribute('media');
+      stylesheet.removeAttribute('data-media');
+    }
+    stylesheet.disabled = true;
+    stylesheet.disabled = false;
+    if (stylesheet.sheet) stylesheet.sheet.disabled = false;
+  }
+}
+
+// Save hook: restore the parked media value so saved documents carry clean link markup.
+export function normalizeStylesheetLinks(doc) {
+  doc.querySelectorAll('head link[data-media]').forEach((link) => {
+    const original = link.getAttribute('data-media');
+    if (original) link.setAttribute('media', original);
+    else link.removeAttribute('media');
+    link.removeAttribute('data-media');
+  });
+}
+
+registerDocumentTransform(normalizeStylesheetLinks);
+
+export function updateSelectedStylesheets(stylesheets, selected) {
+  selected = selected.toLowerCase();
+
+  for (var j = 0; j < stylesheets.length; j++) {
+    (function(stylesheet) {
+      if (stylesheet.getAttribute('title').toLowerCase() != selected) {
+        applyStylesheetState(stylesheet, 'stylesheet alternate', true);
+      }
+    })(stylesheets[j]);
+  }
+  for (let j = 0; j < stylesheets.length; j++) {
+    (function(stylesheet) {
+      if (stylesheet.getAttribute('title').toLowerCase() == selected) {
+        applyStylesheetState(stylesheet, 'stylesheet', false);
+      }
+    })(stylesheets[j]);
+  }
+}
+
+export function initCurrentStylesheet(e) {
+  var currentStylesheet = getCurrentLinkStylesheet();
+  currentStylesheet = (currentStylesheet) ? currentStylesheet.getAttribute('title') : '';
+  var selected = (e && e.target) ? e.target.textContent.toLowerCase() : currentStylesheet.toLowerCase();
+  var stylesheets = document.querySelectorAll('head link[rel~="stylesheet"][title]:not([href$="dokieli.css"])');
+
+  updateSelectedStylesheets(stylesheets, selected);
+
+  var bd = document.querySelectorAll('#document-views button');
+  for(var j = 0; j < bd.length; j++) {
+    bd[j].disabled = (e && e.target && (e.target.textContent == bd[j].textContent)) ? true : false;
+  }
+
+  showRefs();
+
+  if (selected == 'shower') {
+    var slides = document.querySelectorAll('.slide');
+    for(j = 0; j < slides.length; j++) {
+      slides[j].classList.add('do');
+    }
+    getDocumentContentNode(document).classList.add('on-slideshow', 'single');
+    sanitizeInsertAdjacentHTML(document.querySelector('head'), 'beforeend', '<meta content="width=792, user-scalable=no" name="viewport" />');
+
+    var body = getDocumentContentNode(document);
+    var dMenu = document.querySelector('#document-menu.do');
+
+    if(dMenu) {
+      var dMenuButton = dMenu.querySelector('button');
+      dMenuButton.parentNode.replaceChild(fragmentFromString(Config.Button.Menu.CloseMenu), dMenuButton);
+
+      dMenu.classList.remove('on');
+
+      var dMenuSections = dMenu.querySelectorAll('section');
+      for (j = 0; j < dMenuSections.length; j++) {
+        dMenuSections[j].parentNode.removeChild(dMenuSections[j]);
+      }
+    }
+
+    var toc = document.getElementById('table-of-contents');
+    toc = (toc) ? toc.parentNode.removeChild(toc) : false;
+
+    Slideshow.start();
+  }
+
+  if (currentStylesheet.toLowerCase() == 'shower') {
+    slides = document.querySelectorAll('.slide');
+    for (var c = 0; c < slides.length; c++){
+      slides[c].classList.remove('do');
+    }
+    getDocumentContentNode(document).classList.remove('on-slideshow', 'single', 'full');
+    getDocumentContentNode(document).removeAttribute('style');
+    var mV = document.querySelector('head meta[name="viewport"][content="width=792, user-scalable=no"]');
+    mV = (mV) ? mV.parentNode.removeChild(mV) : false;
+
+    history.pushState(null, null, window.location.pathname);
+
+    Slideshow.stop();
+  }
+}
+
+export function getCurrentLinkStylesheet() {
+  return document.querySelector('head link[rel="stylesheet"][title]:not([href$="dokieli.css"]):not([disabled])');
+}
+
+export function initCopyToClipboard() {
+  var elements = ['pre', 'table'];
+
+  let articleNode = selectArticleNode(document);
+
+  // Drop any pre-existing copy-to-clipboard buttons so repeat calls don't stack.
+  articleNode.querySelectorAll('button.copy-to-clipboard').forEach(b => b.remove());
+
+  elements.forEach(element => {
+    var nodes = articleNode.querySelectorAll(element);
+    nodes.forEach(node => {
+      node.insertAdjacentHTML('afterend', Config.Button.Clipboard);
+      var button = node.nextElementSibling;
+      setCopyToClipboard(node, button);
+    });
+  })
+}
+
+export function showFragment(selector) {
+  var ids = (selector) ? document.querySelectorAll(selector) : document.querySelectorAll('main *[id]:not(input):not(textarea):not(select):not(#content):not(tr)');
+
+  for(var i = 0; i < ids.length; i++){
+    ids[i].addEventListener('mouseenter', (e) => {
+      // A spec's self-links are already in the markup; no hover affordance on top.
+      if (selfLinksEnabledForRoot(selectArticleNode(document))) return;
+      // A details keeps its self-link, and so the wrapper, inside its summary.
+      var host = selfLinkHost(e.target);
+      var fragment = host.querySelector(':scope > .do.fragment');
+      if (!fragment && e.target.parentNode.nodeName.toLowerCase() != 'aside'){
+        // The self-link is already in the document, so borrow it rather than add a second.
+        const selfLink = host.querySelector(':scope > a.self-link');
+
+        if (selfLink) {
+          fragment = document.createElement('span');
+          fragment.className = 'do fragment';
+          selfLink.before(fragment);
+          fragment.appendChild(selfLink);
+        }
+        else {
+          const sign = getSelectorSign(e.target);
+
+          sanitizeInsertAdjacentHTML(host, 'afterbegin', '<span class="do fragment"><a href="#' + e.target.id + '">' + sign + '</a></span>');
+          fragment = host.querySelector(':scope > .do.fragment');
+        }
+
+        var fragmentClientWidth = fragment.clientWidth;
+
+        var fragmentOffsetLeft = getOffset(e.target).left;
+        var bodyOffsetLeft = getOffset(getDocumentContentNode(document)).left;
+
+        var offsetLeft = 0;
+        if ((fragmentOffsetLeft - bodyOffsetLeft) > 200) {
+          offsetLeft = e.target.offsetLeft;
+        }
+
+        fragment.style.top = Math.ceil(e.target.offsetTop) + 'px';
+        fragment.style.left = (offsetLeft - fragmentClientWidth) + 'px';
+        fragment.style.height = e.target.clientHeight + 'px';
+        fragment.style.width = (fragmentClientWidth - 10) + 'px';
+      }
+    });
+
+    ids[i].addEventListener('mouseleave', (e) => {
+      var fragment = selfLinkHost(e.target).querySelector(':scope > .do.fragment');
+      if (fragment && fragment.parentNode) {
+        // The self-link belongs to the document; only the wrapper goes.
+        const selfLink = fragment.querySelector(':scope > a.self-link');
+        if (selfLink) fragment.before(selfLink);
+        fragment.parentNode.removeChild(fragment);
+      }
+    });
+  }
+}
+
+export function getSelectorSign(node) {
+  if(!node) {
+    return Config.SelectorSign["*"];
+  }
+
+  if (typeof node === 'object') {
+    var nodeName = node.nodeName.toLowerCase();
+    var nodeId = '';
+
+    if(node.id) {
+      switch(nodeName) {
+        default: break;
+        case 'section': case 'dl':
+          nodeId = '#' + node.id;
+          break;
+      }
+    }
+
+    return Config.SelectorSign[nodeName + nodeId] || Config.SelectorSign[nodeName] || Config.SelectorSign["*"];
+  }
+
+  return Config.SelectorSign["*"];
+}
+
+export function setDocRefType() {
+  var link = document.querySelector('head link[rel="stylesheet"][title]');
+  if (link) {
+    Config.DocRefType = link.getAttribute('title');
+  }
+  if (Object.keys(Config.RefType).indexOf(Config.DocRefType) == -1) {
+    Config.DocRefType = 'LNCS';
+  }
+}
+
+export function generateIndexItemHTML(g, options) {
+  if (typeof g.iri === 'undefined') return;
+
+  // console.log(graph);
+  options = options || {};
+  var image = '';
+  var name = '';
+  var published = '';
+  var summary = '';
+  var tags = '';
+
+  image = getGraphImage(g) || '';
+  if (image) {
+    image = getResourceImageHTML(image) + ' ';
+  }
+
+  name = getGraphLabel(g) || g.term.value;
+  name = '<a href="' + g.term.value + '" property="schema:name" rel="schema:url">' + name + '</a>';
+
+  //XXX: Is this what's really intended with getValues? Should it return array?
+  function getValues(g, properties) {
+    let result;
+    properties.forEach(p => {
+      result = g.out(p).values;
+    })
+    return result;
+  } 
+
+  var properties = [ns.schema.datePublished, ns.dcterms.issued, ns.dcterms.date, ns.as.published, ns.schema.dateCreated, ns.dcterms.created, ns.prov.generatedAtTime, ns.dcterms.modified, ns.as.updated];
+  var datePublished = getValues(g, properties)[0] || '';
+
+  if (datePublished) {
+    published = ', <time content="' + datePublished + '" datetime="' + datePublished + '" property="schema:dataPublished">' + datePublished.substr(0,10) + '</time>';
+  }
+
+  if (g.out(ns.oa.hasBody).values.length) {
+    summary = g.node(rdf.namedNode(summary)).out(ns.rdf.value).values[0];
+  }
+  else {
+    summary = getValues(g, [ns.schema.abstract, ns.dcterms.description, ns.rdf.value, ns.as.summary, ns.schema.description, ns.as.content])[0] || '';
+  }
+
+  if (summary) {
+    summary = '<div datatype="rdf:HTML" property="schema:description">' + summary + '</div>';
+  }
+
+  if (g.out(ns.as.tag).values.length) {
+    tags = [];
+    g.out(ns.as.tag).values.forEach(tagURL => {
+      var t = g.node(g.namedNode(tagURL));
+      var tagName = getFragmentOrLastPath(tagURL);
+
+      if (t.out(ns.as.href).values.length) {
+        tagURL = t.out(ns.as.href).values[0];
+      }
+      if (t.out(ns.as.name).values.length) {
+        tagName = t.out(ns.as.name).values[0];
+      }
+      tags.push('<li><a href="' + tagURL + '" rel="schema:about">' + tagName + '</a></li>');
+    })
+    tags = '<ul>' + tags.join('') + '</ul>';
+  }
+
+  return image + name + published + summary + tags;
+}
+
+export function rewriteBaseURL(nodes, options) {
+  options = options || {};
+  if (typeof nodes === 'object' && nodes.length) {
+    for (var i = 0; i < nodes.length; i++) {
+      var node = nodes[i];
+      var url, ref;
+      switch(node.tagName.toLowerCase()) {
+        default:
+          url = node.getAttribute('src');
+          ref = 'src';
+          break;
+        case 'link':
+          url = node.getAttribute('href');
+          ref = 'href';
+          break;
+        case 'object':
+          url = node.getAttribute('data');
+          ref = 'data';
+          break;
+      }
+
+      var s = url.split(':')[0];
+      if (s != 'http' && s != 'https' && s != 'file' && s != 'data' && s != 'urn' && document.location.protocol != 'file:') {
+        url = setBaseURL(url, options);
+      }
+      else if (url.startsWith('http:') && node.tagName.toLowerCase()) {
+        url = getProxyableIRI(url)
+      }
+      node.setAttribute(ref, url);
+    }
+  }
+
+  return nodes;
+}
+
+
+export function buildResourceView(data, options) {
+  if (!Config.MediaTypes.RDF.includes(options['contentType'])) {
+    return Promise.resolve({"data": data, "options": options});
+  }
+
+  return getGraphFromData(data, options).then(
+    function(g){
+      // console.log(g)
+      var title = getGraphLabel(g) || options.subjectURI;
+      var h1 = '<a href="' +  options.subjectURI + '">' + title + '</a>';
+
+      var types = getGraphTypes(g);
+      // console.log(types)
+      if(types.includes(ns.ldp.Container.value) ||
+          types.includes(ns.as.Collection.value) ||
+          types.includes(ns.as.OrderedCollection.value)) {
+
+        return processResources(options['subjectURI'], options).then(
+          function(urls) {
+            var promises = [];
+            urls.forEach(url => {
+              // console.log(u);
+              // window.setTimeout(function () {
+
+              // var pIRI = getProxyableIRI(u);
+              promises.push(getResourceGraph(url));
+              // }, 1000)
+            });
+
+            return Promise.allSettled(promises)
+              .then(results => {
+                var items = [];
+
+                results.forEach(result => {
+                  // Surface the resource URL from the rejected entry's response when possible
+                  if (result.status === 'rejected') {
+                    var rejectedURL = result.reason?.response?.url;
+                    if (rejectedURL) {
+                      items.push('<li rel="schema:hasPart" resource="' + rejectedURL + '"><a href="' + rejectedURL + '">' + rejectedURL + '</a></li>');
+                    }
+                    return;
+                  }
+
+                  var g = result.value?.graph;
+                  if (!g) return;
+
+                  var html = generateIndexItemHTML(g);
+                  if (typeof html === 'string' && html !== '') {
+                    items.push('<li rel="schema:hasPart" resource="' + g.term.value + '">' + html + '</li>');
+                  }
+                })
+
+                //TODO: Show createNewDocument button.
+                var createNewDocument = '';
+
+                var listItems = '';
+
+                if (items.length) {
+                  listItems = "<ul>" + items.join('') + "</ul>";
+                }
+
+                var html = `      <article about="" typeof="as:Collection">
+    <h1 property="schema:name">` + h1 + `</h1>
+    <div datatype="rdf:HTML" property="schema:description">
+      <section>` + createNewDocument + listItems + `
+      </section>
+    </div>
+  </article>`;
+
+                return {
+                  'data': createHTML('Collection: ' + options.subjectURI, html),
+                  'options': {
+                    'subjectURI': options.subjectURI,
+                    'contentType': 'text/html'
+                  },
+                  'defaultStylesheet': true
+                };
+              })
+              .catch(e => {
+                // console.log(e)
+              });
+          });
+      }
+      else {
+        return {"data": data, "options": options};
+      }
+
+    });
+}
+
+export function diffRequirements(sourceGraph, targetGraph) {
+  var documentURL = Config.DocumentURL;
+  var sourceGraphURI = sourceGraph.term.value;
+  var targetGraphURI = targetGraph.term.value;
+// console.log(sourceGraphURI, targetGraphURI)
+  var sourceRequirements = getResourceInfoSpecRequirements(sourceGraph);
+  var targetRequirements = getResourceInfoSpecRequirements(targetGraph);
+// console.log(sourceRequirements, targetRequirements)
+  var changes = Object.values(Config.Resource[sourceGraphURI].spec.change);
+// console.log(changes)
+  Object.keys(sourceRequirements).forEach(sR => {
+    Config.Resource[sourceGraphURI].spec['requirement'][sR]['diff'] = {};
+
+    var sRStatement = sourceRequirements[sR][ns.spec.statement.value] || '';
+    var tR = targetGraphURI + '#' + getFragmentFromString(sR);
+
+    Config.Resource[sourceGraphURI].spec['requirement'][sR]['diff'][tR] = {};
+
+    var tRStatement = '';
+
+    if (targetRequirements[tR]) {
+      tRStatement = targetRequirements[tR][ns.spec.statement.value] || '';
+    }
+
+    var change = changes.filter(change => change[ns.spec.changeSubject.value] == sR)[0];
+    var changeHTML = '';
+    if (change) {
+      var changeClass = change[ns.spec.changeClass.value];
+      var changeDescription = change[ns.spec.statement.value];
+      if (changeClass) {
+        var changeClassValue = Config.ChangeClasses[changeClass] || changeClass;
+        if (changeDescription) {
+          changeDescription = '<dt>Change Description</dt><dd>' + changeDescription + '</dd>';
+        }
+        changeHTML = '<details><summary>Changelog</summary><dl><dt>Change Class</dt><dd><a href="' + changeClass + '">' + changeClassValue + '</a></dd>' + changeDescription + '</dl></details>';
+      }
+    }
+
+    var diff = diffChars(tRStatement, sRStatement);
+    var diffHTML = [];
+    diff.forEach((part) => {
+      var eName = 'span';
+
+      if (part.added) {
+        eName = 'ins';
+      }
+      else if (part.removed) {
+        eName = 'del';
+      }
+
+      diffHTML.push('<' + eName + '>' + part.value + '</' + eName + '>');
+    });
+
+    Config.Resource[sourceGraphURI].spec['requirement'][sR]['diff'][tR]['statement'] = diffHTML.join('') + changeHTML;
+  });
+}
+
+export function getBaseURLSelection() {
+  return `
+    <div id="base-url-selection">
+      <label data-i18n="dialog.base-url-selection.label" for="base-url">${i18n.t('dialog.base-url-selection.label.textContent')}</label>
+      <select id="base-url">
+        <option data-i18n="dialog.base-url-relative.option" id="base-url-relative" value="base-url-relative" selected="selected">${i18n.t('dialog.base-url-relative.option.textContent')}</option>
+        <option data-i18n="dialog.base-url-absolute.option" id="base-url-absolute" value="base-url-absolute">${i18n.t('dialog.base-url-absolute.option.textContent')}</option>
+      </select>
+    </div>
+  `;
+}
+
+export function setBaseURL(url, options) {
+  options = options || {};
+  var urlType = ('baseURLType' in options) ? options.baseURLType : 'base-url-absolute';
+// console.log(url)
+// console.log(options)
+// console.log(urlType)
+  var matches = [];
+  var regexp = /(https?:\/\/([^\/]*)\/|file:\/\/\/|data:|urn:|\/\/)?(.*)/;
+
+  matches = url.match(regexp);
+
+  if (matches) {
+    switch(urlType) {
+      case 'base-url-absolute': default:
+        if(matches[1] == '//' && 'iri' in options){
+          url = options.iri.split(':')[0] + ':' + url;
+        }
+        else {
+          let href = ('iri' in options) ? getProxyableIRI(options.iri) : document.location.href;
+          url = getBaseURL(href);
+// console.log(url)
+          //TODO: Move/Refactor in uri.js
+          //TODO: "./"
+          if (matches[3].startsWith('../')) {
+            var parts = matches[3].split('../');
+            for (var i = 0; i < parts.length - 1; i++) {
+              url = getParentURLPath(url) || url;
+            }
+            url += parts[parts.length - 1];
+          }
+          else {
+            url += matches[3].replace(/^\//g, '');
+          }
+// console.log(href)
+// console.log(url)
+        }
+        break;
+      case 'base-url-relative':
+        url = matches[3].replace(/^\//g, '');
+// console.log(url)
+        break;
+    }
+  }
+
+  return url;
+}
+
+export function copyRelativeResources(storageIRI, relativeNodes) {
+  var ref = '';
+  var baseURL = getBaseURL(storageIRI);
+
+  for (var i = 0; i < relativeNodes.length; i++) {
+    var node = relativeNodes[i];
+    switch(node.tagName.toLowerCase()) {
+      default:
+        ref = 'src';
+        break;
+      case 'link':
+        ref = 'href';
+        break;
+      case 'object':
+        ref = 'data';
+        break;
+    }
+
+    var fromURL = node.getAttribute(ref).trim();
+    var pathToFile = '';
+    var s = fromURL.split(':')[0];
+
+    if (s != 'http' && s != 'https' && s != 'file' && s != 'data' && s != 'urn' && s != 'urn') {
+      if (fromURL.startsWith('//')) {
+        fromURL = document.location.protocol + fromURL
+        var toURL = baseURL + fromURL.substr(2)
+      }
+      else if (fromURL.startsWith('/')) {
+        pathToFile = setBaseURL(fromURL, {'baseURLType': 'base-url-relative'});
+        fromURL = document.location.origin + fromURL
+        toURL = baseURL + pathToFile
+      }
+      else {
+        pathToFile = setBaseURL(fromURL, {'baseURLType': 'base-url-relative'});
+        fromURL = getBaseURL(document.location.href) + fromURL
+        toURL = baseURL + pathToFile
+      }
+
+      Config.Storage.copy(fromURL, toURL);
+    }
+  }
+}
+
+//TODO: Review grapoi
+export function getDocumentConceptDefinitionsHTML(documentURL) {
+// console.log(documentURL)
+  var s = '';
+  Object.keys(Config.Resource[documentURL]['skos']['type']).forEach(rdftype => {
+// console.log(rdftype)
+    s += '<dt>' + Config.SKOSClasses[rdftype] + 's</dt>';
+
+    if (rdftype == ns.skos.Concept.value) {
+      s += '<dd><ul>';
+    }
+
+    sortToLower(Config.Resource[documentURL]['skos']['type'][rdftype]).forEach(subject => {
+      var g = Config.Resource[documentURL]['graph'].node(rdf.namedNode(subject));
+
+      var conceptLabel = sortToLower(getGraphConceptLabel(g));
+// console.log(conceptLabel)
+      conceptLabel = (conceptLabel.length) ? conceptLabel.join(' / ') : getFragmentOrLastPath(subject);
+      conceptLabel = conceptLabel.trim();
+      conceptLabel = '<a href="' + subject + '">' + conceptLabel + '</a>';
+
+      if (rdftype == ns.skos.Concept.value) {
+        s += '<li>' + conceptLabel + '</li>';
+      }
+      else {
+        s += '<dd>';
+        s += '<dl>';
+        s += '<dt>' + conceptLabel + '</dt><dd><ul>';
+
+        var hasConcepts = [ns.skos.hasTopConcept.value, ns.skos.member.value];
+
+        hasConcepts.forEach(hasConcept => {
+          var concept = Config.Resource[documentURL]['skos']['data'][subject][hasConcept];
+
+          if (concept?.length) {
+            sortToLower(concept).forEach(c => {
+              var conceptGraph = Config.Resource[documentURL]['graph'].node(rdf.namedNode(c));
+              var cLabel = getGraphConceptLabel(conceptGraph);
+              cLabel = (cLabel.length) ? cLabel : [getFragmentOrLastPath(c)];
+              cLabel.forEach(cL => {
+                cL = cL.trim();
+                // console.log(cL)
+                s += '<li><a href="' + c + '">' + cL + '</a></li>';
+              });
+            });
+          }
+        });
+        s += '</ul></dd></dl>';
+        s += '</dd>';
+      }
+    })
+
+    if (rdftype == ns.skos.Concept.value) {
+      s += '</ul></dd>';
+    }
+  });
+
+  return s;
+}
+
+// ?spec spec:requirement ?requirement .
+// ?spec spec:implementationReport ?implementationReport .
+// ?spec spec:testSuite ?testSuite .
+// ?testSuite ldp:contains ?testCase .
+// ?testCase spec:requirementReference ?requirement .
+export function insertTestCoverageToTable(id, testSuiteGraph) {
+  var table = document.getElementById(id);
+  var thead = table.querySelector('thead');
+  sanitizeInsertAdjacentHTML(thead.querySelector('tr:first-child'), 'beforeend', '<th colspan="2">Coverage</th>');
+  sanitizeInsertAdjacentHTML(thead.querySelector('tr:nth-child(2)'), 'beforeend', '<th>Test Case (Review Status)</th>');
+
+  var subjects = [];
+  testSuiteGraph  = rdf.grapoi({ dataset: testSuiteGraph.dataset });
+// console.log(testSuiteGraph)
+  testSuiteGraph.out().quads().forEach(t => {
+// console.log(t)
+    subjects.push(t.subject.value);
+  });
+  subjects = uniqueArray(subjects);
+
+  var testCases = [];
+
+  //FIXME: Brittle selector
+  var specificationReferenceBase = document.querySelector('#document-latest-published-version [rel~="rel:latest-version"]').href;
+// console.log(specificationReferenceBase)
+
+  subjects.forEach(i => {
+    var s = testSuiteGraph.node(rdf.namedNode(i));
+    var testCaseIRI = s.term.value;
+    var types = getGraphTypes(s);
+
+    if (types.length) {
+      if (types.includes(ns['test-description'].TestCase.value)) {
+        var requirementReference = s.out(ns.spec.requirementReference).values[0];
+        if (requirementReference && requirementReference.startsWith(specificationReferenceBase)) {
+          testCases[testCaseIRI] = {};
+          testCases[testCaseIRI][ns.spec.requirementReference.value] = requirementReference;
+          testCases[testCaseIRI][ns['test-description'].reviewStatus.value] = s.out(ns['test-description'].reviewStatus).values[0];
+          testCases[testCaseIRI][ns.dcterms.title.value] = s.out(ns.dcterms.title).values[0];
+        }
+      }
+    }
+  });
+
+// console.log(testCases);
+
+  table.querySelectorAll('tbody tr').forEach(tr => {
+    var requirement = tr.querySelector('td:nth-child(3) a').href;
+
+    Object.keys(testCases).forEach(testCaseIRI => {
+      if (testCases[testCaseIRI][ns.spec.requirementReference.value] == requirement) {
+        var testCaseLabel = testCases[testCaseIRI][ns.dcterms.title.value] || testCaseIRI;
+
+        var testCaseHTML = '<a href="'+ testCaseIRI + '">' + testCaseLabel + '</a>';
+
+        if (testCases[testCaseIRI][ns['test-description'].reviewStatus.value]) {
+          var reviewStatusIRI = testCases[testCaseIRI][ns['test-description'].reviewStatus.value];
+          var reviewStatusLabel = getFragmentFromString(reviewStatusIRI) || getURLLastPath(reviewStatusIRI) || reviewStatusIRI;
+
+          var reviewStatusHTML = ' (<a href="'+ reviewStatusIRI + '">' + reviewStatusLabel + '</a>)';
+
+          testCaseHTML = testCaseHTML + reviewStatusHTML;
+        }
+
+        testCaseHTML = '<li>' + testCaseHTML + '</li>';
+
+        var tdTestCase = tr.querySelector('td:nth-child(4)');
+
+        if (tdTestCase) {
+          sanitizeInsertAdjacentHTML(tdTestCase.querySelector('ul'), 'beforeend', testCaseHTML);
+        }
+        else {
+          sanitizeInsertAdjacentHTML(tr, 'beforeend', '<td><ul>' + testCaseHTML + '</ul></td>');
+        }
+      }
+    })
+
+    var tC = tr.querySelector('td:nth-child(4)');
+    if (!tC) {
+      sanitizeInsertAdjacentHTML(tr, 'beforeend', '<td><span class="warning">?</span></td>');
+    }
+  });
+
+  sanitizeInsertAdjacentHTML(table, 'beforeend', '<tfoot><tr>' + getTestDescriptionReviewStatusHTML() + '</tr></tfoot>')
+}
+
+export function getStorageSelfDescription(g) {
+  var s = '';
+
+  var storageName = getGraphLabel(g);
+  
+  var storageURL = g.term.value;
+
+  storageName = (typeof storageName !== 'undefined') ? storageName : storageURL;
+
+  Config.Resource[storageURL] = Config.Resource[storageURL] || {};
+  Config.Resource[storageURL]['title'] = storageName;
+  Config.Resource[storageURL]['description'] = g.out(ns.schema.abstract).values[0] || g.out(ns.dcterms.description).values[0] || g.out(ns.rdf.value).values[0] || g.out(ns.as.summary).values[0] || g.out(ns.schema.description).values[0] || g.out(ns.as.content).values[0] || undefined;
+
+  var storageTitle = '<dt data-i18n="dialog.storage-location.dt">' + i18n.t('dialog.storage-location.dt.textContent') + '</dt><dd><a href="' + storageURL + '">' + storageName + '</a></dd>';
+  var storageDescription = (Config.Resource[storageURL]['description']) ? '<dt data-i18n="dialog.storage-self-description.dt">' + i18n.t('dialog.storage-self-description.dt') + '</dt><dd>' + Config.Resource[storageURL]['description'] + '</dd>' : '';
+
+  s = '<dl id="storage-self-description">' + storageTitle + storageDescription + '</dl>';
+
+  return s;
+}
+
+export function getPersistencePolicy(g) {
+  var s = '';
+
+  var persistencePolicy = g.out(ns.doc.persistencePolicy).values;
+
+  if (persistencePolicy.length) {
+    var pp = [];
+
+    Config.Resource[g.term.value] = Config.Resource[g.term.value] || {};
+    Config.Resource[g.term.value]['persistencePolicy'] = [];
+
+    persistencePolicy.forEach(iri => {
+      Config.Resource[g.term.value]['persistencePolicy'].push(iri);
+
+      pp.push('<dd><a href="' + iri  + '" rel="noopener" target="_blank">' + iri + '</a></dd>');
+    });
+
+    s = '<dl id="storage-persistence-policy"><dt>URI persistence policy</dt>' + pp.join('') + '</dl>'
+  }
+
+  return s;
+}
+
+export function getODRLPolicies(g) {
+  var s = '';
+  var odrlPolicies = [];
+
+  var hasPolicy = g.out(ns.odrl.hasPolicy).values;
+
+  if (hasPolicy.length) {
+    hasPolicy.forEach(iri => {
+      var policy = g.node(rdf.namedNode(iri));
+      var policyDetails = [];
+
+      var types = getGraphTypes(policy);
+
+      var indexPolicy = types.findIndex(t => 
+        t === ns.odrl.Offer.value || t === ns.odrl.Agreement.value
+      );
+
+      if (indexPolicy >= 0) {
+        var rule = types[indexPolicy];
+        //XXX: Label derived from URI.
+        var ruleLabel = rule.substr(rule.lastIndexOf('/') + 1);
+
+        policyDetails.push('<dt>Rule<dt><dd><a href="' + rule + '" rel="noopener" target="_blank">' + ruleLabel + '</a></dd>');
+      }
+
+      //TODO: odrl:Set
+
+      var uid = policy.out(ns.odrl.uid).values[0];
+      if (uid) {
+        policyDetails.push('<dt>Unique identifier<dt><dd><a href="' + uid + '" rel="noopener" target="_blank">' + uid + '</a></dd>');
+      }
+
+      var target = policy.out(ns.odrl.target).values[0];
+      if (target) {
+        policyDetails.push('<dt>Target<dt><dd><a href="' + target + '" rel="noopener" target="_blank">' + target + '</a></dd>');
+      }
+
+      var permission = policy.out(ns.odrl.permission).values[0];
+      if (permission) {
+        var ruleG = g.node(rdf.namedNode(permission));
+
+        policyDetails.push(getODRLRuleActions(ruleG));
+        policyDetails.push(getODRLRuleAssigners(ruleG));
+        policyDetails.push(getODRLRuleAssignees(ruleG));
+      }
+      var prohibition = policy.out(ns.odrl.prohibition).values[0];
+      if (prohibition) {
+        ruleG = g.node(rdf.namedNode(prohibition));
+
+        policyDetails.push(getODRLRuleActions(ruleG));
+        policyDetails.push(getODRLRuleAssigners(ruleG));
+        policyDetails.push(getODRLRuleAssignees(ruleG));
+      }
+
+      var detail = '<dl>' + policyDetails.join('') + '</dl>';
+
+      odrlPolicies.push('<dd><details><summary><a href="' + iri + '" rel="noopener" target="_blank">' + iri + '</a></summary>' + detail + '</details></dd>');
+    });
+
+    s = '<dl id="odrl-policies"><dt>Policies</dt>' + odrlPolicies.join('') + '</dl>';
+  }
+
+  return s;
+}
+
+export function getODRLRuleActions(g) {
+// console.log(r.odrlaction)
+  var actions = [];
+
+  var actionsIRIs = g.out(ns.odrl.action).values;
+
+  actionsIRIs.forEach(iri => {
+    //FIXME: Label derived from URI.
+    var label = iri;
+    var href = iri;
+
+    if (iri.startsWith('http://www.w3.org/ns/odrl/2/')) {
+      label = iri.substr(iri.lastIndexOf('/') + 1);
+      href = 'https://www.w3.org/TR/odrl-vocab/#term-' + label;
+    }
+    else if (iri.startsWith('http://creativecommons.org/ns#')) {
+      label = iri.substr(iri.lastIndexOf('#') + 1);
+      href = 'https://www.w3.org/TR/odrl-vocab/#term-' + label;
+    }
+    else if (iri.lastIndexOf('#')) {
+      label = iri.substr(iri.lastIndexOf('#') + 1);
+    }
+    else if (iri.lastIndexOf('/')) {
+      label = iri.substr(iri.lastIndexOf('/') + 1);
+    }
+
+    var warning = '';
+    var attributeClass = '';
+    var attributeTitle = '';
+
+    //Get user's actions from preferred policy (prohibition) to check for conflicts with storage's policy (permission)
+    if (Config.User.PreferredPolicyRule && Config.User.PreferredPolicyRule.Prohibition && Config.User.PreferredPolicyRule.Prohibition.Actions.includes(iri)) {
+      warning = Icon[".fas.fa-circle-exclamation"] + ' ';
+      attributeClass = ' class="warning"';
+      attributeTitle = ' title="The action (' + label + ') is prohibited by preferred policy."';
+    }
+
+    actions.push('<li' + attributeTitle + '>' + warning + '<a' + attributeClass + ' href="' + href + '" resource="' + iri + '">' + label + '</a></li>')
+  });
+
+  actions = '<dt>Actions</dt><dd><ul rel="odrl:action">' + actions.join('') + '</ul></dd>';
+
+  return actions;
+}
+
+export function getODRLRuleAssigners(g) {
+  var s = '';
+  var a = [];
+
+  var assigners = g.out(ns.odrl.assigner).values;
+
+  assigners.forEach(iri => {
+    a.push('<dd><a href="' + iri + '" rel="noopener" target="_blank">' + iri + '</a></dd>');
+  });
+
+  s = '<dt>Assigners</dt>' + a.join('');
+
+  return s;
+}
+
+export function getODRLRuleAssignees(g) {
+  var s = '';
+  var a = [];
+
+  var assignees = g.out(ns.odrl.assignees).values;
+
+  assignees.forEach(iri => {
+    a.push('<dd><a href="' + iri + '" rel="noopener" target="_blank">' + iri + '</a></dd>');
+  });
+
+  s = '<dt>Assignees</dt>' + a.join('');
+
+  return s;
+}
+
+export function getContactInformation(g) {
+  var s = '';
+  var resourceOwners = [];
+
+  var solidOwner = g.out(ns.solid.owner).values;
+
+  if (solidOwner.length) {
+    Config.Resource[g.term.value] = Config.Resource[g.term.value] || {};
+    Config.Resource[g.term.value]['owner'] = [];
+
+    solidOwner.forEach(iri => {
+      Config.Resource[g.term.value]['owner'].push(iri);
+
+      resourceOwners.push('<dd><a href="' + iri + '" rel="noopener" target="_blank">' + iri + '</a></dd>');
+    });
+
+    s = '<dl id="resource-owners"><dt>Owners</dt>' + resourceOwners.join('') + '</dl>';
+  }
+
+  return s;
+}
+
+//TODO: Review grapoi
+export function getCitation(i, options) {
+  // console.log(i)
+  // console.log(options)
+  options = options || {};
+  var url;
+
+  if (isValidISBN(i)) {
+    url = 'https://openlibrary.org/isbn/' + i;
+    var headers = {'Accept': 'application/json'};
+    var wikidataHeaders = {'Accept': 'application/ld+json'};
+
+    var isbnData = rdf.grapoi({ dataset: rdf.dataset() }).node(rdf.namedNode(url));
+
+    return Config.Storage.get(url, headers, options)
+      .then(response => {
+        // console.log(response)
+        return response.text();
+      }).then(data => {
+        //TODO: try/catch?
+        data = JSON.parse(data);
+        // console.log(data)
+        //data.identifiers.librarything data.identifiers.goodreads
+
+        var promises = [];
+
+        if (data.title) {
+          // console.log(data.title)
+          isbnData.addOut(ns.schema.name, data.title);
+        }
+
+        //Unused
+        // if (data.subtitle) {
+        //   console.log(data.subtitle)
+        // }
+
+        if (data.publish_date) {
+          // console.log(data.publish_date)
+          isbnData.addOut(schemadatePublished, getDateTimeISOFromMDY(data.publish_date));
+        }
+
+        if (data.covers) {
+          // console.log(data.covers)
+          isbnData.addOut(ns.schema.image, rdf.namedNode('https://covers.openlibrary.org/b/id/' + data.covers[0] + '-S.jpg'));
+          // sanitizeInsertAdjacentHTML(document.body, 'afterbegin', '<img src="' + img + '"/>');
+
+          //   async function fetchImage(url) {
+          //     const img = new Image();
+          //     return new Promise((res, rej) => {
+          //         img.onload = () => res(img);
+          //         img.onerror = e => rej(e);
+          //         img.src = url;
+          //     });
+          // }
+          // const img = await fetchImage('https://covers.openlibrary.org/b/id/12547191-L.jpg');
+          // const w = img.width;
+          // const h = img.height;
+        }
+
+        if (data.authors && Array.isArray(data.authors) && data.authors.length && data.authors[0].key) {
+          var a = 'https://openlibrary.org' + data.authors[0].key;
+          // console.log(a)
+          promises.push(Config.Storage.get(a, headers, options)
+            .then(response => {
+              // console.log(response)
+              return response.text();
+            })
+            .then(data => {
+              //TODO: try/catch?
+              data = JSON.parse(data);
+              // console.log(data)
+
+              var authorURL = 'http://example.com/.well-known/genid/' + generateAttributeId();
+              if (data.links && Array.isArray(data.links) && data.links.length) {
+                // console.log(data.links[0].url)
+                authorURL = data.links[0].url;
+              }
+              isbnData.addOut(ns.schema.author, rdf.namedNode(authorURL), authorName => {
+                if (data.name) {
+                  authorName.addOut(ns.schema.name, data.name);
+                }
+              });
+
+              return isbnData;
+
+              // XXX: Working but unused:
+              // if (data.remote_ids && data.remote_ids.wikidata) {
+              //   wE has a few redirects to wW
+              //   var wE = 'https://www.wikidata.org/entity/' + data.remote_ids.wikidata;
+              //   var wW = 'https://www.wikidata.org/wiki/Special:EntityData/' + data.remote_ids.wikidata + '.jsonld';
+              //   promises.push(getResourceGraph(wW, wikidataHeaders, options)
+              //     .then(g => {
+              //       console.log(g)
+              //       console.log(g.iri().toString())
+              //       var s = g.match(wE.replace(/^https:/, 'http:'))
+              //         console.log(s.toString());
+
+              //       console.log(isbnData)
+              //       console.log(isbnData.toString())
+
+              //       return isbnData;
+              //     }));
+              // }
+
+            }));
+        }
+
+        // XXX: Working but unused:
+        // if (data.identifiers?.wikidata && Array.isArray(data.identifiers.wikidata) && data.identifiers.wikidata.length) {
+        //   var w = 'https://www.wikidata.org/entity/' + data.identifiers.wikidata[0];
+        //   promises.push(getResourceGraph(w, wikidataHeaders, options).then(g => {
+        //     console.log(g);
+        //     console.log(g.toString());
+        //   }));
+        // }
+
+        return Promise.allSettled(promises)
+          .then(results => {
+            var items = [];
+            results.forEach(result => {
+              // console.log(result)
+              items.push(result.value);
+            })
+
+            //For now just [0]
+            return items[0];
+          });
+
+      })
+  }
+  else {
+    if (i.match(/^10\.\d+\//)) {
+      url= 'https://doi.org/' + i;
+    }
+    else {
+      url = i.replace(/https?:\/\/dx\.doi\.org\//i, 'https://doi.org/');
+    }
+
+    return getResourceGraph(url, null, options).then(({ graph }) => graph);
+  }
+}
+
+export function getCitationHTML(citationGraph, citationURI, options) {
+  if (!citationGraph) { return; }
+  options = options || {};
+  // var citationId = ('citationId' in options) ? options.citationId : citationURI;
+  var subject = citationGraph.node(rdf.namedNode(citationURI));
+  // console.log(citationGraph);
+  // console.log('citationGraph.iri().toString(): ' + citationGraph.iri().toString());
+  // console.log('citationGraph.toString(): ' + citationGraph.toString());
+  // console.log('options.citationId: ' + options.citationId);
+  // console.log('citationURI: ' + citationURI);
+  // console.log('subject.iri().toString(): ' + subject.iri().toString());
+
+  var title = getGraphLabel(subject);
+  //FIXME: This is a hack that was related to SimpleRDF's RDFa parser not setting the base properly. May no longer be needed.
+  if(typeof title == 'undefined') {
+    subject = citationGraph.node(rdf.namedNode(options.citationId));
+
+    title = getGraphLabel(subject) || '';
+  }
+  title = htmlEncode(title);
+  title = (title.length) ? '<cite>' + title + '</cite>, ' : '';
+  var datePublished = getGraphDate(subject) || '';
+  var dateVersion = subject.out(ns.schema.dateModified).values[0] || datePublished;
+  datePublished = (datePublished) ? datePublished.substr(0,4) + ', ' : '';
+  var dateAccessed = 'Accessed: ' + getDateTimeISO();
+  var authors = [], authorList = [];
+  // console.log(subject);
+  // console.log(subject.biboauthorList);
+  // console.log(subject.schemaauthor);
+  // console.log(subject.dctermscreator);
+
+  //   XXX: FIXME: Putting this off for now because SimpleRDF is not finding the bnode for some reason in citationGraph.child(item), or at least authorItem.rdffirst (undefined)
+  //   TODO: Revisit using grapoi
+  //       if (subject.biboauthorList) {
+  // TODO: Just use/test something like: authorList = authorList.concat(traverseRDFList(citationGraph, subject.biboauthorList));
+  //       }
+  //       else
+
+  var schemaAuthor = subject.out(ns.schema.author).values;
+  var dctermsCreator = subject.out(ns.dcterms.creator).values;
+  var asActor = subject.out(ns.as.actor).values;
+  if (schemaAuthor.length) {
+    schemaAuthor.forEach(a => {
+      authorList.push(a);
+    });
+  }
+  else if (dctermsCreator.length) {
+    dctermsCreator.forEach(a => {
+      authorList.push(a);
+    });
+  }
+  else if (asActor.length) {
+    asActor.forEach(a => {
+      authorList.push(a);
+    });
+  }
+  // console.log(authorList);
+
+  if (authorList.length) {
+    authorList.forEach(authorIRI => {
+      var s = subject.node(rdf.namedNode(authorIRI));
+      var author = getAgentName(s);
+      var schemafamilyName = s.out(ns.schema.familyName).values;
+      var schemagivenName = s.out(ns.schema.givenName).values;
+      var foaffamilyName = s.out(ns.foaf.familyName).values;
+      var foafgivenName = s.out(ns.foaf.givenName).values;
+
+      if (schemafamilyName.length && schemagivenName.length) {
+        author = createRefName(schemafamilyName[0], schemagivenName[0]);
+      }
+      else if (foaffamilyName.length && foafgivenName.length) {
+        author = createRefName(foaffamilyName[0], foafgivenName[0]);
+      }
+
+      if (author) {
+        authors.push(author);
+      }
+      else {
+        authors.push(authorIRI);
+      }
+    });
+    authors = authors.join(', ') + ': ';
+  }
+
+  var dataVersionURL;
+  var memento = subject.out(ns.mem.memento).values;
+  var latestVersion = subject.out(ns.rel['latest-version']).values;
+  if (memento.length) {
+    dataVersionURL = memento;
+  }
+  else if (latestVersion.length) {
+    dataVersionURL = latestVersion;
+  }
+  dataVersionURL = (dataVersionURL) ? ' data-versionurl="' + dataVersionURL + '"' : '';
+
+  var dataVersionDate = (dateVersion) ? ' data-versiondate="' + dateVersion + '"' : '';
+
+  var content = ('content' in options && options.content.length) ? options.content + ', ' : '';
+
+  var citationReason = (options.citationReason && Config.Citation[options.citationReason]) ? `, Citation Reason: ${Config.Citation[options.citationReason]}` : '';
+
+  var anchorTitle = Config.Citation[options.citationReason] ? ` title="${Config.Citation[options.citationReason]}"` : '';
+
+  var citationIdLabel = citationURI;
+  var prefixCitationLink = '';
+
+  if (isValidISBN(options.citationId)) {
+    citationIdLabel = options.citationId;
+    prefixCitationLink = ', ISBN: ';
+  }
+  else if (options.citationId.match(/^10\.\d+\//)) {
+    citationURI = 'https://doi.org/' + options.citationId;
+    citationIdLabel = citationURI;
+  }
+  else {
+    citationURI = citationURI.replace(/https?:\/\/dx\.doi\.org\//i, 'https://doi.org/');
+    citationIdLabel = citationURI;
+  }
+
+  var citationHTML = authors + title + datePublished + content + prefixCitationLink + '<a about="#' + options.refId + '"' + dataVersionDate + dataVersionURL + ' href="' + citationURI + '" rel="schema:citation ' + options.citationReason  + '"' + anchorTitle + '>' + citationIdLabel + '</a> [' + dateAccessed + citationReason + ']';
+  //console.log(citationHTML);
+  return citationHTML;
+}
+
+export function createRefName(familyName, givenName, refType) {
+  refType = refType || Config.DocRefType;
+  switch(refType) {
+    case 'LNCS': default:
+      return familyName + ', ' + givenName.slice(0,1) + '.';
+    case 'ACM':
+      return givenName.slice(0,1) + '. ' + familyName;
+    case 'fullName':
+      return givenName + ' ' + familyName;
+  }
+}
+
+export function setDocumentString(node) {
+  const documentOptions = {
+    ...Config.DOMProcessing,
+    format: true,
+    sanitize: true,
+    normalize: true
+  };
+
+  Config.DocumentString = getDocument(node, documentOptions);
+}
+
+
+// Autocomplete list lives in <body> so ProseMirror's MutationObserver doesn't revert it
+function getSuggestionsElement(input, listId) {
+  const container = input.closest('.autocomplete');
+  let list = document.getElementById(listId);
+  if (!list) {
+    list = document.createElement('ul');
+    list.id = listId;
+    list.className = 'suggestions';
+    list.setAttribute('contenteditable', 'false');
+    list.setAttribute('spellcheck', 'false');
+    container.appendChild(list);
+  }
+  return list;
+}
+
+export function getLocationSuggestionsElement(input) {
+  return getSuggestionsElement(input, 'cv-location-suggestions');
+}
+
+export function setupAutocomplete(inputSelector, fetchFn, showFn, { listId, fetchOptions = {}, debounceMs = 300 } = {}) {
+  let closed = false;
+
+  const doSearch = async (input) => {
+    const keyword = input.value.trim();
+    document.getElementById(listId)?.remove();
+    if (!keyword) return;
+
+    try {
+      input.nextElementSibling?.classList.contains('progress') && input.nextElementSibling.remove();
+      sanitizeInsertAdjacentHTML(input, 'afterend', `<span class="progress">${Icon['.fas.fa-circle-notch.fa-spin.fa-fw']}</span>`);
+
+      const results = await fetchFn(keyword, fetchOptions);
+
+      input.nextElementSibling?.classList.contains('progress') && input.nextElementSibling.remove();
+
+      if (closed || input.value.trim() !== keyword) return;
+
+      showFn(input, results);
+    } catch (err) {
+      console.warn(err);
+    }
+  };
+
+  const runSearch = debounce(doSearch, debounceMs);
+
+  document.addEventListener('input', (e) => {
+    if (!e.target.matches(inputSelector)) return;
+    closed = false;
+    // Editing invalidates a pick: drop pick-derived metadata, keep the marker
+    [...e.target.attributes].forEach(a => {
+      if (a.name.startsWith('data-') && a.name !== 'data-autocomplete') e.target.removeAttribute(a.name);
+    });
+    runSearch(e.target);
+  });
+
+  document.addEventListener('keyup', (e) => {
+    if (!e.target.matches(inputSelector)) return;
+    const list = document.getElementById(listId);
+    const items = list ? Array.from(list.children) : [];
+
+    switch (e.key) {
+      case 'ArrowDown':
+      case 'ArrowUp': {
+        if (!items.length) return;
+        e.preventDefault();
+        e.stopPropagation();
+        let i = items.findIndex(li => li.classList.contains('active'));
+        items.forEach(li => { li.classList.remove('active'); li.setAttribute('aria-selected', 'false'); });
+        i = e.key === 'ArrowDown' ? (i + 1) % items.length : (i <= 0 ? items.length : i) - 1;
+        items[i].classList.add('active');
+        items[i].setAttribute('aria-selected', 'true');
+        break;
+      }
+      case 'Enter': {
+        e.preventDefault();
+        e.stopPropagation();
+        const active = items.find(li => li.classList.contains('active'));
+        if (active) { active.selectResult(); }
+        // Nothing highlighted: keep the typed free text and close the dropdown.
+        else { closed = true; list?.remove(); }
+        break;
+      }
+      case 'Escape':
+        e.preventDefault();
+        e.stopPropagation();
+        closed = true;
+        list?.remove();
+        break;
+    }
+  }, true);
+}
+
+export function showLocationSuggestions(input, results) {
+  const list = getLocationSuggestionsElement(input);
+  list.replaceChildren();
+
+  if (!results.length) { list.remove(); return; }
+
+  results.slice(0, 20).forEach((b) => {
+    const entity = b.id?.value || '';
+    const label = b.label?.value || entity;
+    const locationType = b.locationType?.value || 'addressLocality';
+    const selfRegionCode = b.selfRegionCode?.value || '';
+    const selfCountryCode = b.selfCountryCode?.value || '';
+    const countryCode = b.countryCode?.value || '';
+    const countryName = b.countryLabel?.value || '';
+    const regionCode = b.regionCode?.value || '';
+    const regionName = b.regionLabel?.value || '';
+
+    const displayRegionCode = locationType === 'addressLocality' ? regionCode : locationType === 'addressRegion' ? selfRegionCode : '';
+    const displayRegionName = locationType === 'addressLocality' ? regionName : label;
+    const displayCountryCode = locationType === 'addressCountry' ? selfCountryCode : countryCode;
+    const displayCountryName = locationType === 'addressCountry' ? label : countryName;
+
+    const li = document.createElement('li');
+    li.append(label);
+    if (displayRegionCode) {
+      const code = document.createElement('span');
+      code.className = 'region-code';
+      code.textContent = displayRegionCode;
+      if (displayRegionName) code.title = displayRegionName;
+      li.append(' ', code);
+    }
+    if (displayCountryCode) {
+      const code = document.createElement('span');
+      code.className = 'country-code';
+      code.textContent = displayCountryCode;
+      if (displayCountryName) code.title = displayCountryName;
+      li.append(' ', code);
+    }
+    li.setAttribute('title', entity);
+    li.selectResult = () => {
+      input.value = label;
+      input.setAttribute('value', label);
+      const set = (name, value) => value ? input.setAttribute(name, value) : input.removeAttribute(name);
+      set('data-entity', entity);
+      set('data-location-type', locationType);
+      if (locationType === 'addressLocality') {
+        set('data-region-code', regionCode);
+        set('data-region-name', regionName);
+        set('data-country-code', countryCode);
+        set('data-country-name', countryName);
+      } else if (locationType === 'addressRegion') {
+        set('data-region-code', selfRegionCode);
+        set('data-region-name', label);
+        set('data-country-code', countryCode);
+        set('data-country-name', countryName);
+      } else {
+        set('data-country-code', selfCountryCode);
+        set('data-country-name', label);
+      }
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      list.remove();
+    };
+    li.addEventListener('mouseup', (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      li.selectResult();
+    });
+    list.appendChild(li);
+  });
+}
+
+
+
+export function showSkillSuggestions(input, results) {
+  const list = getSuggestionsElement(input, 'cv-skill-suggestions');
+  list.replaceChildren();
+
+  if (!results.length) { list.remove(); return; }
+
+  results.slice(0, 20).forEach(({ uri, title }) => {
+    const li = document.createElement('li');
+    li.textContent = title;
+    if (uri) li.setAttribute('title', uri);
+    li.selectResult = () => {
+      input.value = title;
+      input.setAttribute('value', title);
+      uri ? input.setAttribute('data-entity', uri) : input.removeAttribute('data-entity');
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      list.remove();
+    };
+    li.addEventListener('mouseup', (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      li.selectResult();
+    });
+    list.appendChild(li);
+  });
+}
+
+//XXX: Unused
+// export function getListHTMLFromTriples(triples, options) {
+//   options = options || {element: 'ul'};
+//   var elementId = ('elementId' in options) ? ' id="' + options.elementId + '"' : '';
+//   var elementName = ('elementName' in options) ? ' name="' + options.elementName + '"' : '';
+//   var elementLabel = ('elementLabel' in options) ? ' aria-label="' + options.elementLabel + '"': '';
+//   var elementTitle = ('elementTitle' in options) ? options.elementTitle : '';
+//   var items = '';
+//   triples.forEach(t => {
+//     var s = t.subject.value;
+//     var o = t.object.value;
+//     switch(options.element) {
+//       case 'ol': case 'ul': default:
+//         items += '<li><a href="' + s + '">' + o + '</a></li>';
+//         break;
+//       case 'dl':
+//         items += '<dd><a href="' + s + '">' + o + '</a></dd>';
+//         break;
+//       case 'select':
+//         items += '<option value="' +   s + '">' + o + '</option>';
+//         break;
+//     }
+//   });
+
+//   switch(options.element) {
+//     case 'ul': default:
+//       return '<ul' + elementId + '>' + items + '</ul>';
+//     case 'ol':
+//       return '<ol' + elementId + '>' + items + '</ol>';
+//     case 'dl':
+//       return '<dl' + elementId + '><dt>' + elementTitle + '</dt>' + items + '</dl>';
+//     case 'select':
+//       return '<select' + elementLabel + elementId + elementName + '>' + items + '</select>';
+//   }
+// }
+
+
+//Unused until there is UI
+// export function getSparkline(data, options) {
+//   options = options || {};
+//   if(!('cssStroke' in options)) {
+//     options['cssStroke'] = '#000';
+//   }
+// 
+//   var svg = '<svg height="100%" prefix="rdf: http://www.w3.org/1999/02/22-rdf-syntax-ns# rdfs: http://www.w3.org/2000/01/rdf-schema# xsd: http://www.w3.org/2001/XMLSchema# qb: http://purl.org/linked-data/cube# prov: http://www.w3.org/ns/prov# schema: http://schema.org/" width="100%" xmlns="http://www.w3.org/2000/svg">';
+// 
+//   svg += drawSparklineGraph(data, options);
+//   svg += '</svg>';
+// 
+//   return svg;
+// }
+// 
+// export function drawSparklineGraph(data, options) {
+//   options = options || {};
+//   if(!('cssStroke' in options)) {
+//     options['cssStroke'] = '#000';
+//   }
+//   var svg= '';
+// 
+//   var obsValue = 'http://purl.org/linked-data/sdmx/2009/measure#obsValue';
+//   var observation = 'http://purl.org/linked-data/cube#Observation';
+// 
+//   var dotSize = 1;
+//   var values = data.map(n => { return n[obsValue]; }),
+//     min = Math.min.apply(null, values),
+//     max = Math.max.apply(null, values);
+// 
+//   var new_max = 98;
+//   var new_min = 0;
+//   var range = new_max - new_min;
+// 
+//   var parts = values.map(function (v) {
+//     return (new_max - new_min) / (max - min) * (v - min) + new_min || 0;
+//   });
+// 
+//   var div = 100 / parts.length;
+//   var x1 = 0, y1 = 0, x2 = div / 2, y2 = range - parts[0];
+// 
+//   var lines = '';
+//   for (var i=0; i < parts.length; i++) {
+//     x1 = x2; y1 = y2;
+//     x2 = range * (i / parts.length) + (div / 2);
+//     y2 = range - parts[i];
+// 
+//     lines += '<a href="' + data[i][observation] + '" rel="rdfs:seeAlso noopener" resource="' + data[i][observation] + '" target="_blank"><line' +
+//       ' x1="' + x1 + '%"' +
+//       ' x2="' + x2 + '%"' +
+//       ' y1="' + y1 + '%"' +
+//       ' y2="' + y2 + '%"' +
+//       ' stroke="' + options.cssStroke + '"' +
+//       ' /></a>';
+// 
+//     //Last data item
+//     if(i+1 === parts.length) {
+//       lines += '<a href="' + data[i][observation] + '" rel="noopener" target="_blank"><circle' +
+//         ' cx="' + x2 + '%"' +
+//         ' cy="' + y2 + '%"' +
+//         ' r="' + dotSize + '"' +
+//         ' stroke="#f00"' +
+//         ' fill:#f00' +
+//         ' /></a>';
+//     }
+//   }
+// 
+//   var wasDerivedFrom = '';
+//   if(options && 'url' in options) {
+//     wasDerivedFrom = ' rel="prov:wasDerivedFrom" resource="' + options.url + '"';
+//   }
+//   svg += '<g' + wasDerivedFrom + '>';
+//   svg += '<metadata rel="schema:license" resource="https://creativecommons.org/publicdomain/zero/1.0/"></metadata>';
+//   if (options && 'title' in options) {
+//     svg += '<title property="schema:name">' + options['title'] + '</title>';
+//   }
+//   svg += lines + '</g>';
+// 
+//   return svg;
+// }

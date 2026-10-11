@@ -1,0 +1,402 @@
+/*!
+Copyright 2012-2026 Sarven Capadisli <https://csarven.ca/>
+Copyright 2023-2026 Virginia Balseiro <https://virginiabalseiro.com/>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+import { getLastPathSegment } from './uri.js';
+import Config from './config.js';
+
+export function uniqueArray(a) {
+  return Array.from(new Set(a));
+}
+
+// Signed in by any method, not only a Solid-OIDC session. Use for "is authenticated" checks (e.g. private vs public TypeIndex).
+export function isUserAuthenticated() {
+  return !!(Config['Session']?.isActive || Config.User?.IRI);
+}
+
+export function getDateTimeISO() {
+  var date = new Date();
+  return date.toISOString();
+}
+
+export function getDateTimeISOFromMDY(s) {
+  let date = new Date(s);
+
+  let year = date.getFullYear();
+  let month = String(date.getMonth() + 1).padStart(2, '0');
+  let day = String(date.getDate()).padStart(2, '0');
+
+  return `${year}-${month}-${day}`;
+}
+
+export function convertToISO8601Duration(timeValue) {
+  const [hours, minutes, seconds] = timeValue.split(':').map(Number);
+  const formattedDuration = `PT${hours}H${minutes}M${seconds}S`;
+  return formattedDuration;
+}
+
+export function getDateTimeISOFromDate(dateHeader) {
+  if (!dateHeader) {
+    return;
+  }
+
+  return new Date(dateHeader).toISOString();
+}
+
+export function debounce(func, delay) {
+  let timer;
+  return function (...args) {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      func(...args);
+    }, delay);
+  };
+}
+
+export function debounceAsync(func, delay) {
+  let timer;
+  let supersede;
+  const debounced = function (...args) {
+    clearTimeout(timer);
+    if (supersede) { supersede(undefined); supersede = null; }
+    return new Promise((resolve) => {
+      supersede = resolve;
+      timer = setTimeout(async () => {
+        supersede = null;
+        resolve(await func(...args));
+      }, delay);
+    });
+  };
+  debounced.cancel = () => {
+    clearTimeout(timer);
+    if (supersede) { supersede(undefined); supersede = null; }
+    timer = null;
+    supersede = null;
+  };
+  return debounced;
+}
+
+export function escapeRegExp(string) {
+  return string.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function escapeRDFLiteral(str) {
+  return str.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+export function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function generateUUID(inputString) {
+  // Simple FNV-1a hash function to generate a deterministic 32-bit integer hash for each part
+  function fnv1aHash(str, seed = 2166136261) {
+    let hash = seed;
+    for (let i = 0; i < str.length; i++) {
+      hash ^= str.charCodeAt(i);
+      hash += (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24);
+    }
+    return hash >>> 0; // Ensure unsigned 32-bit integer
+  }
+
+  if (inputString) {
+    // Generate deterministic UUID using FNV-1a hash
+    const d0 = fnv1aHash(inputString, 2166136261);
+    const d1 = fnv1aHash(inputString, 2166136261 ^ 0xdeadbeef);
+    const d2 = fnv1aHash(inputString, 2166136261 ^ 0xcafebabe);
+    const d3 = fnv1aHash(inputString, 2166136261 ^ 0x8badf00d);
+
+    const hex = (
+      d0.toString(16).padStart(8, '0') +
+      d1.toString(16).padStart(8, '0') +
+      d2.toString(16).padStart(8, '0') +
+      d3.toString(16).padStart(8, '0')
+    );
+
+    // Ensure UUID version (4) and variant (8, 9, a, or b)
+    let uuid = hex.substring(0, 8) + '-' +
+               hex.substring(8, 12) + '-' +
+               '4' + hex.substring(13, 16) + '-' + // Set version to 4
+               ((parseInt(hex[16], 16) & 0x3) | 0x8).toString(16) + // Set variant to 10xx (one hex digit)
+               hex.substring(17, 20) + '-' +
+               hex.substring(20, 32);
+
+    // Optionally, ensure the UUID starts with 'a' if needed
+    uuid = 'a' + uuid.slice(1);
+
+    return uuid;
+  }
+  else {
+    const uuid = crypto.randomUUID();
+    const array = new Uint8Array(1);
+    crypto.getRandomValues(array);
+    const randomLetter = String.fromCharCode(97 + (array[0] % 6)); // Start with a-f
+    return randomLetter + uuid.slice(1);
+  }
+}
+
+export function generateId(prefix, string, suffix) {
+  prefix = prefix || "";
+
+  if (string) {
+    string = string.trim();
+    string = string.replace(/\W/g, "-");
+    var s1 = string.substr(0, 1);
+    string =
+      prefix === "" && s1 == parseInt(s1) ? "x-" + string : prefix + string;
+    return document.getElementById(string)
+      ? string + "-" + (suffix || generateUUID())
+      : string;
+  } else {
+    return generateUUID();
+  }
+}
+
+export function slugify(text, maxLength) {
+  let s = (text || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+  if (maxLength) s = s.slice(0, maxLength);
+  return s.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+// H1 slug, else first 15 characters of text, else a generated id
+export function getDefaultDocumentBasename(articleNode) {
+  const node = articleNode || document.body;
+  const h1 = node.querySelector('h1');
+  let base = slugify(h1?.textContent?.trim());
+  if (!base) base = slugify((node.textContent || '').trim(), 15);
+  return base || generateAttributeId();
+}
+
+export function generateAttributeId(prefix, string, suffix) {
+  const id = generateId(prefix, string, suffix);
+  if (/^\d/.test(id)) {
+    return generateAttributeId(prefix, string, suffix);
+  }
+  return id;
+}
+
+//SRI hash that's browser safe
+export async function getHash(message, algo = 'SHA-512') {
+  if (!['SHA-256', 'SHA-384', 'SHA-512'].includes(algo)) {
+    throw new Error('Unsupported SRI algorithm');
+  }
+
+  const encoder = new TextEncoder();
+  const data = encoder.encode(message);
+  const hashBuffer = await crypto.subtle.digest(algo, data);
+  const base64 = btoa(String.fromCharCode(...new Uint8Array(hashBuffer)));
+
+  return `${algo.replace('-', '').toLowerCase()}-${base64}`;
+}
+
+export function hashCode(s) {
+  var hash = 0;
+  if (s.length == 0) return hash;
+  for (var i = 0; i < s.length; i++) {
+    var char = s.charCodeAt(i);
+    hash = (hash << 5) - hash + char;
+    hash = hash & hash; // Convert to 32bit integer
+  }
+  return hash;
+}
+
+export function stringToColor(str) {
+  let hash = 5381;
+  for (let i = 0; i < str.length; i++) {
+    hash = (hash << 5) + hash + str.charCodeAt(i);
+  }
+
+  const h = Math.abs(hash) % 360;
+  const s = 60 + (Math.abs(hash) % 20);       // 60–80%
+  const l = 40 + (Math.abs(hash >> 8) % 20);  // 40–60%
+
+  // y-prosemirror requires a 6-digit hex color: it appends an alpha suffix
+  // (`${color}70`) to draw remote selections, which only works on hex.
+  return hslToHex(h, s, l);
+}
+
+function hslToHex(h, s, l) {
+  s /= 100; l /= 100;
+  const a = s * Math.min(l, 1 - l);
+  const f = n => {
+    const k = (n + h / 30) % 12;
+    const c = l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+    return Math.round(255 * c).toString(16).padStart(2, '0');
+  };
+  return `#${f(0)}${f(8)}${f(4)}`;
+}
+
+export function getRandomIndex(length) {
+  const array = new Uint32Array(1);
+  crypto.getRandomValues(array);
+  return array[0] % length;
+}
+
+export function sortToLower(array, key) {
+  return array.sort(function (a, b) {
+    if (key) {
+      a = a[key];
+      b = b[key];
+    }
+    return a.toLowerCase().localeCompare(b.toLowerCase());
+  });
+}
+
+//DO NOT DELETE. See top management.
+export function kebabToCamel(str) {
+  return str.replace(/-([a-z])/g, (_, char) => char.toUpperCase());
+}
+
+function isReDoSVulnerable(regex) {
+  const regexStr = regex.toString();
+
+  const vulnerablePatterns = [
+    /(\*|\+|\{.*\})\s?\1/,  
+    /([a-zA-Z0-9])\1{2,}/,  
+    /.*a.*b.*c.*d.*e.*/  
+  ];
+
+  for (let pattern of vulnerablePatterns) {
+    if (pattern.test(regexStr)) {
+      return true;
+    }
+  }
+
+  return false; 
+}
+
+export function matchAllIndex(string, regexp) {
+  // const matches = Array.from(string.matchAll(regexp));
+  // return matches.map(match => ({ match: match[0], index: match.index }));
+
+  const matches = [];
+
+  if (!regexp.global) {
+    const globalRegexp = new RegExp(regexp.source, `${regexp.flags}g`);
+    regexp = globalRegexp;
+  }
+
+  // if (isReDoSVulnerable(regexp)) {
+  //   throw new Error('Regular expression is potentially vulnerable to ReDoS attack');
+  // }
+  
+  for (const match of string.matchAll(regexp)) {
+    const arr = [...match]; // Convert the match to an array
+    arr.index = match.index; // Add the index of the match
+    arr.input = match.input; // Add the original input string
+    matches.push(arr);
+  }
+  
+  return matches.length ? matches : null;
+}
+
+export function isValidISBN (str) {
+  const regex = /^(?=(?:[^0-9]*[0-9]){10}(?:(?:[^0-9]*[0-9]){3})?$)[\d-]+$/;
+  const pattern = new RegExp(regex);
+  return pattern.test(str);
+}
+
+export function findPreviousDateTime(times, checkTime) {
+  const sortedTimes = uniqueArray(times).sort().reverse();
+
+  let previousDateTime = null;
+  for(let time of sortedTimes) {
+    if (time <= checkTime) {
+      previousDateTime = time;
+      break;
+    }
+  }
+
+  return previousDateTime;
+}
+
+//TODO: Check browser support for Temporal.Duration, in particular `PT`, e.g., PT17S
+export function parseISODuration(duration) {
+  if (!/^P(?:\d+[YMD])*(?:T(?:\d+[HMS])*)?$/.test(duration)) {
+    throw new Error('Invalid ISO 8601 duration format');
+  }
+  const regex = /P(?:([\d.]+)Y)?(?:([\d.]+)M)?(?:([\d.]+)D)?(?:T(?:([\d.]+)H)?(?:([\d.]+)M)?(?:([\d.]+)S)?)?/;
+  const matches = duration.match(regex);
+
+  const [, years, months, days, hours, minutes, seconds] = matches.map(x => x ? parseFloat(x) : 0);
+
+  const parts = [];
+  if (years) parts.push(`${years}y`);
+  if (months) parts.push(`${months}m`);
+  if (days) parts.push(`${days}d`);
+  if (hours) parts.push(`${hours}h`);
+  if (minutes) parts.push(`${minutes}m`);
+  if (seconds) parts.push(`${seconds}s`);
+
+  return parts.length ? parts.join(', ') : '0s';
+}
+
+// export function tranformIconstoCSS(icons) {
+//   let cssOutput = '';
+
+//   Object.entries(icons).forEach(([key, svg]) => {
+//     cssOutput += `i${key} { background-image: url("${svgToDataURI(svg)}"); }\n`;
+//   });
+
+//   return cssOutput;
+// }
+
+// export function generateCSSBasedOnCurrentDocumentIcons() {
+//   var icons = getIconsFromCurrentDocument();
+//   var css = tranformIconstoCSS(icons);
+//   console.log(css);
+// }
+
+export function setWebExtensionURL() {
+  Config['WebExtensionBaseURL'] = Config.WebExtensionEnabled ? Config.WebExtension.runtime.getURL('') : null;
+}
+
+export function utf8Tob64(s) {
+  return window.btoa(encodeURIComponent(s));
+}
+
+export function b64Toutf8(s) {
+  return unescape(decodeURIComponent(window.atob(s)));
+}
+
+export function generateFilename(url, options) {
+  url = url || Config.DocumentURL;
+  var fileName = getLastPathSegment(url);
+  var timestamp = getDateTimeISO().replace(/[^\w]+/ig, '') || "now";
+  var extension = options.filenameExtension || '.txt';
+  fileName = fileName + "." + timestamp + extension;
+  return fileName;
+}
+
+export function scoreMatch(search, label) {
+  const a = search.toLowerCase();
+  const b = label.toLowerCase();
+
+  if (a === b) return 1000000;
+
+  let i = 0, j = 0, matches = 0;
+
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) {
+      matches++;
+      i++; j++;
+    } else {
+      j++;
+    }
+  }
+
+  return matches;
+}
