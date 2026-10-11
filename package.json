@@ -7,13 +7,15 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "node scripts/prepare-release.mjs && vite build",
-    "test": "vitest run",
+    "test": "node --test tests/test-runner.test.mjs && node scripts/run-tests.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/house tests scripts",
     "release:check": "node scripts/check-release.mjs",
     "licenses:check": "node scripts/generate-notices.mjs --check",
     "lint:donor": "eslint src/editor src/ui src/utils src/vendor src/config.js src/services.js src/uri.js src/table.js --rule 'no-unused-vars:off' --rule 'no-redeclare:off' --rule 'no-dupe-keys:off' --rule 'no-dupe-class-members:off' --rule 'no-useless-escape:off' --rule 'no-empty:off'",
-    "publish": "node publish.mjs"
+    "starter:check": "node scripts/check-starter.mjs",
+    "publish": "node publish.mjs",
+    "verify": "npm run typecheck && npm run lint && npm test && npm run starter:check && npm run lint:donor && npm run licenses:check && npm run build && npm run release:check"
   },
   "dependencies": {
     "@agentshouse/app-bridge": "0.1.0-ce524f6608238",

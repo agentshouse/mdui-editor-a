@@ -3,3 +3,5 @@ dist/
 reports/*.log
 
 .port-caches/
+
+.build/

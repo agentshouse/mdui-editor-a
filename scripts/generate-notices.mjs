@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import crypto from 'node:crypto';
-const root='public/licenses';fs.mkdirSync(root,{recursive:true});
+const root='.build/public/licenses';if(!fs.existsSync(root))fs.cpSync('public','.build/public',{recursive:true});fs.mkdirSync(root,{recursive:true});
 const lock=JSON.parse(fs.readFileSync('package-lock.json','utf8'));
 const inventory=[];
 const supplemental=JSON.parse(fs.readFileSync(`${root}/upstream-notices.json`,'utf8'));

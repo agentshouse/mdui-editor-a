@@ -5,17 +5,17 @@ Pinned source: 7deba503d5a5f5ea239aafaa630b705311453e81
 Copyright 2012-2026 Sarven Capadisli <https://csarven.ca/>
 Copyright 2023-2026 Virginia Balseiro <https://virginiabalseiro.com/>
 Source code: Apache License 2.0 (dokieli-Apache-2.0.txt).
-The complete donor snapshot is preserved under upstream/ in the source branch.
+The complete donor snapshot is preserved under tests/support/upstream/ in the source branch.
 
 House adaptation (2026-10-11): new Room storage backend/router; explicit guarded saves; private Room article list, creation, reversible archive, semantic HTML export and actual refusal/error notices. Original ProseMirror schema, actual AuthorToolbar/ToolbarView implementations, formatting handlers, article CSS, fonts, icons, placeholders and details node view retained and adapted. Remote Solid/OIDC/Gitforge/ActivityPub/Yjs, auth, notifications, annotation publishing and external resources are excluded from the production graph. Local keymaps, table tools, slash metadata, source/Markdown, embedded notes/requirements, anchors, templates and native node views are retained. There are no synthetic documents or online/presence claims. The pure PapaParse text parser is extracted verbatim from pinned 5.5.3 with network/file/worker streamers removed.
 
-Seed articles: upstream/docs.html and upstream/index.html at the source revision above, from https://dokie.li/docs and https://dokie.li/.
+Seed articles: tests/support/upstream/docs.html and tests/support/upstream/index.html at the source revision above, from https://dokie.li/docs and https://dokie.li/.
 Article content: Creative Commons Attribution 4.0 International.
 Author: Sarven Capadisli and dokieli contributors (docs.html names Sarven Capadisli).
 License: https://creativecommons.org/licenses/by/4.0/
 Adaptations: removed executable elements, remote embeds and remote image loads; normalized navigational links; article text and original attribution retained. Documentation describes upstream capabilities, some of which are intentionally unavailable in the House port. Illustrations attributed in the donor article to Patrick Hochstenbach remain credited; remote illustrations are not loaded.
 
-Media: original donor media files retained without trimming. Upstream README licenses media as CC BY 4.0 unless otherwise noted. Original logo and favicon remain identifiable as dokieli assets.
+Media: original donor media files retained without trimming. Upstream README licenses media as CC BY 4.0 unless otherwise noted. Original logo and favicon remain as attributed source assets; application chrome uses a neutral document icon.
 Ubuntu fonts: Ubuntu Font Licence 1.0, Canonical Ltd. https://canonical.com/legal/font-licence
 Font Awesome Free SVG icon markup: v7.1.0, Copyright 2026 Fonticons, Inc. Icons CC BY 4.0, code MIT, fonts SIL OFL 1.1. https://fontawesome.com/license/free
 
@@ -24,3 +24,5 @@ Font Awesome Free SVG icon markup: v7.1.0, Copyright 2026 Fonticons, Inc. Icons 
 All installed direct/transitive build and runtime dependency versions, declared licenses and available notices are listed in dependency-inventory.json. No npm dependency-graph audit was run.
 
 Supplemental exact-version notices: micromark 4.0.0 and @cfworker/json-schema 4.1.1 omit repository-root MIT license texts from their npm tarballs. These are included from each version's npm gitHead. uri-templates 0.2.0's published README explicitly releases its code to the public domain; the author-linked public-domain notice and that exact published README are included. URLs and SHA-256 hashes are in upstream-notices.json. Production notice coverage is enforced by the build.
+
+Additional block-tree starter: unchanged public Plate basic-blocks example at https://github.com/udecode/plate/blob/45aee8fd81a596fad5efc4e61ab377bb225fb11c/apps/www/src/registry/examples/values/basic-blocks-value.tsx. Attribution: Plate contributors. MIT license texts are retained as plate-MIT.txt and plate-www-MIT.txt. This separate representation is not converted to HTML.

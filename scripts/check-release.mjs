@@ -101,7 +101,7 @@ for (const file of files) {
     }
   }
 }
-for(const name of ['licenses/dokieli-Apache-2.0.txt','licenses/PROVENANCE.txt','licenses/CC-BY-4.0.txt','licenses/Ubuntu-Font-Licence-1.0.txt','licenses/Font-Awesome-Free-7.1.0.txt','favicon.ico'])assert(fs.existsSync(path.join(dist,name)),`Missing ${name}`);
+for(const name of ['licenses/dokieli-Apache-2.0.txt','licenses/PROVENANCE.txt','licenses/CC-BY-4.0.txt','licenses/Ubuntu-Font-Licence-1.0.txt','licenses/Font-Awesome-Free-7.1.0.txt','favicon.svg'])assert(fs.existsSync(path.join(dist,name)),`Missing ${name}`);
 const result = {
   result: "passed",
   files: files.length,
@@ -113,8 +113,9 @@ const result = {
   browserAcceptance:
     "Not claimed by static checks; see Porting hosted acceptance evidence.",
 };
+fs.mkdirSync(path.join(root, ".build"), { recursive: true });
 fs.writeFileSync(
-  path.join(root, "reports/release-check.json"),
+  path.join(root, ".build/release-check.json"),
   `${JSON.stringify(result, null, 2)}\n`,
 );
 console.log(result);
