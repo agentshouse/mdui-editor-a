@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-export const suites = ['tests/csv.test.js','tests/document-templates.test.js','tests/draft-session.test.js','tests/editor.test.js','tests/model.test.js','tests/storage.test.js','tests/ui.test.js'];
+export const suites = ['tests/csv.test.js','tests/document-templates.test.js','tests/draft-session.test.js','tests/editor.test.js','tests/model.test.js','tests/navigation.test.js','tests/storage.test.js','tests/ui.test.js'];
 export function assertDiscovery(discovered) {
   assert.deepEqual([...discovered].sort(), suites, 'Test discovery changed: review coverage before updating the complete suite list.');
 }

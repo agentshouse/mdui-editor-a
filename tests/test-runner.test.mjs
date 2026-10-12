@@ -8,7 +8,7 @@ test('discovery refuses an omitted or added suite', () => {
   assert.throws(() => assertDiscovery([...suites, 'tests/support/upstream/example.test.js']));
 });
 test('discovery refuses duplicate suites', () => assert.throws(() => assertDiscovery([...suites.slice(1), suites[1]])));
-test('aggregate reports every passed test', () => assert.deepEqual(aggregate(passing()), {suites: 7, tests: 14, passed: 14, failed: 0, skipped: 0}));
+test('aggregate reports every passed test', () => assert.deepEqual(aggregate(passing()), {suites: 8, tests: 16, passed: 16, failed: 0, skipped: 0}));
 test('aggregate cannot hide missing, failed, skipped or incomplete results', () => {
   assert.throws(() => aggregate(passing().slice(1)));
   for (const changes of [{success:false},{failed:1},{skipped:1},{passed:1},{total:0}]) {

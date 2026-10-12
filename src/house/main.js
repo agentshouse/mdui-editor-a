@@ -1,3 +1,4 @@
+import {ArticleNavigation} from './navigation';
 import {initMenuTabsEvents} from './menu.js';
 import {showSource} from './source.js';
 import {createDocumentTemplate,DOCUMENT_TEMPLATES,addDocumentSlide,selectDocumentSlide} from './document-templates.js';
@@ -10,6 +11,7 @@ import {parseMarkdown} from './markdown';
 const $=id=>document.getElementById(id), key=row=>`${row.room}\n${row.path}`;
 initMenuTabsEvents($('document-menu-tabs'));
 let runtime,bridge,rooms=[],articles=[],allDrafts=[],selected=null,session=null,newSession=null,room='',writable=false,blocker='',dataBlocker='',warningKind='',restoring=false,active=true,displayedHTML=null;
+let navigation=null,route={target:null,ready:false,error:null},navigationBlocker='';
 let syncStatus={lastCompleted:null,attentionRequired:[]},queryReceived=false,draftsReceived=false,modes={};
 const handles=[],sessions=new Map(),saving=new Set();
 const editor=new HouseEditor($('article-content'),captureEditor,mode=>{$('edit-article').textContent=mode==='author'?'Read':'Edit';});
@@ -46,7 +48,7 @@ function renderControls(){
  if(!active)return;
  const valid=!session||validArticle(session.fields);
  if(!valid)warning('The shared article draft has invalid fields. Its draft and the previous displayed content are preserved. Resolve it in House.','draft-invalid');else if(warningKind==='draft-invalid')warning();
- const allowed=writable&&!blocker&&!dataBlocker&&valid;
+ const allowed=writable&&!blocker&&!dataBlocker&&!navigationBlocker&&valid;
  $('new-article').disabled=!allowed;
  editor.setLocked(!allowed);
  for(const id of ['edit-article','archive-article','source-article','add-slide','prev-slide','next-slide'])$(id).disabled=!selected||!allowed;
@@ -67,9 +69,10 @@ function renderList(){
  const query=$('article-search').value.toLowerCase(),show=$('show-archived').checked;
  $('article-list').replaceChildren();
  for(const row of rows().filter(row=>validArticle(row.fields)&&rooms.length===1&&row.room===rooms[0].locator&&(show||!row.fields.archived)&&row.fields.title.toLowerCase().includes(query))){
-  const li=document.createElement('li'),button=document.createElement('button');button.type='button';button.textContent=(row.fields.title||'New article')+(row.fields.archived?' (archived)':'');button.setAttribute('aria-current',String(selected&&key(selected)===key(row)));button.addEventListener('click',()=>!row.markdown&&!row.fields.html?openNew(row):openArticle(row));li.append(button);$('article-list').append(li);
+  const li=document.createElement('li'),button=document.createElement('button');button.type='button';button.textContent=(row.fields.title||'New article')+(row.fields.archived?' (archived)':'');button.setAttribute('aria-current',String(selected&&key(selected)===key(row)));button.addEventListener('click',()=>navigateArticle(row));li.append(button);$('article-list').append(li);
  }
 }
+function navigateArticle(row,replace=false){navigation.navigate({room:row.room,path:row.path},replace);}
 function closeSource(){editor.sourceState?.aside.remove();editor.sourceState=null;}
 function openArticle(row){
  // Navigation is entirely local. Sessions outlive their views and keep writing
@@ -95,12 +98,21 @@ function updateReach(){
  renderControls();renderList();
 }
 function reconcileArticle(){
+ if(!route.ready)return;
+ if(route.error){navigationBlocker=route.error;warning(route.error,'navigation');renderControls();return;}
  if(syncStatus.lastCompleted===null||rooms.length!==1){if(!selected)$('article-content').textContent=syncStatus.lastCompleted===null?'Loading articles…':'';return;}
  if(!queryReceived||!draftsReceived||dataBlocker)return;
+ navigationBlocker='';
+ if(route.target){
+  const target=rooms[0].locator===route.target.room?rows().find(row=>row.room===route.target.room&&row.path===route.target.path):null;
+  if(!target){navigationBlocker='This article is unavailable in the connected collection.';warning(navigationBlocker,'navigation');if(!selected)$('article-content').textContent=navigationBlocker;renderControls();return;}
+  if(warningKind==='navigation')warning();
+  if(!selected||key(selected)!==key(target)){if(!target.markdown&&!target.fields.html)openNew(target);else openArticle(target);return;}
+ }
  const fresh=articles.find(row=>row.room===room&&row.path===selected?.path);
  if(fresh&&session&&!session.hasChanges&&!session.pending&&!saving.has(session)&&!editor.sourceState&&(fresh.fields.html!==selected.fields.html||fresh.fields.title!==selected.fields.title||fresh.fields.archived!==selected.fields.archived)){
   sessions.delete(key(fresh));openArticle(fresh);
- }else if(!selected){const first=rows().find(row=>row.room===room&&!row.fields.archived&&(row.markdown||row.fields.html));if(first)openArticle(first);else $('article-content').textContent='This collection has no articles yet.';}
+ }else if(!selected){const first=rows().find(row=>row.room===room&&!row.fields.archived&&(row.markdown||row.fields.html));if(first)navigateArticle(first,true);else $('article-content').textContent='This collection has no articles yet.';}
  renderControls();
 }
 function refreshRooms(value){rooms=value;updateReach();reconcileArticle();}
@@ -133,11 +145,14 @@ function openNew(row){
 $('new-article').addEventListener('click',()=>openNew());$('cancel-new').addEventListener('click',()=>$('new-dialog').close());
 function captureNew(){newSession?.enqueue({title:$('new-title').value});}
 $('new-title').addEventListener('input',captureNew);$('new-template').addEventListener('change',captureNew);
-$('new-form').addEventListener('submit',event=>{event.preventDefault();const title=$('new-title').value.trim();if(!title||!newSession)return;const content=createDocumentTemplate($('new-template').value,{title});newSession.enqueue({title,html:content.html||content});modes={...modes,[`${newSession.room}\n${newSession.path}`]:'author'};const s=newSession;$('new-dialog').close();newSession=null;openArticle({room:s.room,path:s.path,markdown:'',fields:s.fields});commit(s);});
+$('new-form').addEventListener('submit',event=>{event.preventDefault();const title=$('new-title').value.trim();if(!title||!newSession)return;const content=createDocumentTemplate($('new-template').value,{title});newSession.enqueue({title,html:content.html||content});modes={...modes,[`${newSession.room}\n${newSession.path}`]:'author'};const s=newSession;$('new-dialog').close();newSession=null;navigateArticle({room:s.room,path:s.path});commit(s);});
 // Half-typed popup controls remain donor UI state and may be lost on reload.
 async function watch(promise,fn){const obs=await promise;handles.push(obs);fn(obs.current());obs.subscribe(fn);}
 async function start(){try{
- ({runtime,bridge}=await connect());const presentation=await runtime.presentation.read();if(presentation&&typeof presentation==='object'&&presentation.editorModes&&typeof presentation.editorModes==='object')modes=presentation.editorModes;await watch(runtime.observe('rooms'),refreshRooms);await watch(runtime.observe('room-drafts'),acceptDrafts);await watch(runtime.observe('query',articleQuery),acceptQuery);await watch(runtime.observe('sync-status'),refreshSync);
+ ({runtime,bridge}=await connect());navigation=new ArticleNavigation(bridge);
+ const applyAddress=()=>{const next=navigation.snapshot(),changed=JSON.stringify(route.target)!==JSON.stringify(next.target);route=next;if(changed){closeSource();$('new-dialog').close();newSession=null;selected=null;session=null;displayedHTML=null;editor.load('');$('article-provenance').textContent='';}reconcileArticle();};
+ const stopAddress=navigation.subscribe(applyAddress);handles.push({close:stopAddress});applyAddress();
+ const presentation=await runtime.presentation.read();if(presentation&&typeof presentation==='object'&&presentation.editorModes&&typeof presentation.editorModes==='object')modes=presentation.editorModes;await watch(runtime.observe('rooms'),refreshRooms);await watch(runtime.observe('room-drafts'),acceptDrafts);await watch(runtime.observe('query',articleQuery),acceptQuery);await watch(runtime.observe('sync-status'),refreshSync);
  // A Provider write halt delays delivery, not local Room drafting or Save.
  // This App exposes no immediate remote Actions; access/refusal guards remain.
  await watch(runtime.observe('service-mode'),renderControls);

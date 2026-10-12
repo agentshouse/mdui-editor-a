@@ -4,7 +4,7 @@ import {held} from '../node_modules/@agentshouse/mdruntime/dist/room-draft.js';
 const fixtures=vi.hoisted(()=>({runtime:null,bridge:{setTab:vi.fn()},handlers:new Map()}));
 vi.mock('../src/house/runtime',()=>({connect:async()=>({runtime:fixtures.runtime,bridge:fixtures.bridge})}));
 const fields={title:'Title',html:'<h1>Title</h1><p>Original</p>',archived:false,source_url:'',source_revision:'',author:'',license:'',license_url:''};
-let docs,drafts,rooms,writeResolve,config,revision,presentation;
+let docs,drafts,rooms,writeResolve,config,revision,presentation,address,addressListeners;
 const $=id=>document.getElementById(id);
 const articleDraft=()=>drafts.find(d=>d.room==='r_a'&&d.path==='articles/one.md');
 const emit=(topic,value)=>fixtures.handlers.get(topic)?.(value);
@@ -13,6 +13,10 @@ function doc(id='r_a',path='articles/one.md'){return{room:id,path,markdown:'open
 function view(){return config.Editor.editorView;}
 function edit(text='Changed'){if(!$('edit-article').textContent.includes('Read'))$('edit-article').click();const v=view();v.dispatch(v.state.tr.insertText(text,1,6));}
 beforeEach(async()=>{
+ address='/';addressListeners=new Set();
+ fixtures.bridge.address=()=>address;fixtures.bridge.onAddress=fn=>{addressListeners.add(fn);return()=>addressListeners.delete(fn);};
+ const move=next=>{address=next;addressListeners.forEach(fn=>fn(next));return Promise.resolve(next);};
+ fixtures.bridge.push=vi.fn(move);fixtures.bridge.replace=vi.fn(move);
  vi.resetModules();fixtures.handlers.clear();fixtures.bridge.setTab.mockClear();docs=[doc(),doc('r_b')];drafts=[];rooms=[room('r_a')];writeResolve=null;revision=0;presentation={};
  document.documentElement.innerHTML=fs.readFileSync('index.html','utf8').replace(/<!DOCTYPE html>/i,'').replace(/<script[^>]*><\/script>/g,'');
  window.matchMedia=()=>({matches:false,addEventListener(){},removeEventListener(){}});globalThis.matchMedia=window.matchMedia;
@@ -61,11 +65,11 @@ it('changing collection reach keeps identical draft paths isolated',async()=>{ed
 it('revoking the open Room preserves dirty content for export',()=>{edit('Retain');rooms=[room('r_b')];emit('rooms',rooms);emit('query',{documents:[docs[1]]});expect($('article-content').textContent).toContain('Retain');expect($('export-article').disabled).toBe(false);expect($('save-article').disabled).toBe(true);expect($('article-content').textContent).toMatch(/Retain|Remain/);});
 it('archive commits typed drafts without discarding article edits or prompting',async()=>{edit('Retained');$('archive-article').click();await vi.waitFor(()=>expect(fixtures.runtime.save).toHaveBeenCalled());expect($('article-content').textContent).toContain('Retained');expect($('archive-article').textContent).toBe('Restore');expect(window.confirm).not.toHaveBeenCalled();});
 it('typing remains enabled while a local draft write is pending',async()=>{let release;writeResolve=new Promise(resolve=>{release=resolve;});edit('First');expect(view().editable).toBe(true);view().dispatch(view().state.tr.insertText('Newer',1,6));expect($('article-content').textContent).toContain('Newer');release();writeResolve=null;await vi.waitFor(()=>expect(articleDraft()?.parts.fields.html.value).toContain('Newer'));expect(window.confirm).not.toHaveBeenCalled();});
-it('navigation never prompts and returning immediately restores locally queued edits',()=>{edit('Remain');rooms=[room('r_b')];emit('rooms',rooms);emit('query',{documents:[docs[1]]});document.querySelector('#article-list button').click();expect($('article-content').textContent).toContain('Original');rooms=[room('r_a')];emit('rooms',rooms);emit('query',{documents:[docs[0]]});document.querySelector('#article-list button').click();expect($('article-content').textContent).toContain('Remain');expect(window.confirm).not.toHaveBeenCalled();});
+it('navigation never prompts and returning restores locally queued edits after the House address acknowledgement',async()=>{edit('Remain');rooms=[room('r_b')];emit('rooms',rooms);emit('query',{documents:[docs[1]]});document.querySelector('#article-list button').click();expect($('article-content').textContent).toContain('Original');rooms=[room('r_a')];emit('rooms',rooms);emit('query',{documents:[docs[0]]});document.querySelector('#article-list button').click();await vi.waitFor(()=>expect($('article-content').textContent).toContain('Remain'));expect(window.confirm).not.toHaveBeenCalled();});
 it('a rejected save preserves edits and the refused draft',async()=>{fixtures.runtime.save.mockResolvedValue({outcome:'refused',rule:'changed-underneath'});edit('Mine');$('save-article').click();await vi.waitFor(()=>expect($('house-warning').textContent).toContain('changed-underneath'));expect($('article-content').textContent).toContain('Mine');expect(fixtures.runtime.roomDraft.discard).not.toHaveBeenCalled();expect(drafts.filter(d=>d.path.startsWith('articles/'))).toHaveLength(1);});
 it('creates a user-titled article and enters real editor',async()=>{$('new-article').click();$('new-title').value='User authored';$('new-form').dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));await vi.waitFor(()=>expect($('article-content').textContent).toContain('User authored'));expect(document.querySelector('.ProseMirror')).toBeTruthy();expect($('new-dialog').open).toBe(false);});
 it('corrected malformed query recovers without clearing a connection refusal',()=>{emit('query',{documents:[{...docs[0],fields:{}}]});expect($('new-article').disabled).toBe(true);emit('query',{documents:docs});expect($('new-article').disabled).toBe(false);emit('connection-refusal',{reason:'revoked-authorization'});emit('query',{documents:docs});expect($('new-article').disabled).toBe(true);});
-it('source drafts persist per article and never apply across article navigation',async()=>{docs.push({...doc('r_a','articles/two.md'),fields:{...fields,title:'Second',html:'<h1>Second</h1><p>Second body</p>'}});emit('query',{documents:docs});$('source-article').click();$('source-edit').value='<h1>Source draft A</h1>';$('source-edit').dispatchEvent(new Event('input'));[...document.querySelectorAll('#article-list button')].find(node=>node.textContent==='Second').click();expect($('source-view')).toBeNull();expect($('article-content').textContent).toContain('Second body');[...document.querySelectorAll('#article-list button')].find(node=>node.textContent==='Title').click();$('source-article').click();expect($('source-edit').value).toContain('Source draft A');await vi.waitFor(()=>expect(articleDraft()?.parts.fields.html?.value).toContain('Source draft A'));expect(window.confirm).not.toHaveBeenCalled();});
+it('source drafts persist per article and never apply across article navigation',async()=>{docs.push({...doc('r_a','articles/two.md'),fields:{...fields,title:'Second',html:'<h1>Second</h1><p>Second body</p>'}});emit('query',{documents:docs});$('source-article').click();$('source-edit').value='<h1>Source draft A</h1>';$('source-edit').dispatchEvent(new Event('input'));[...document.querySelectorAll('#article-list button')].find(node=>node.textContent==='Second').click();expect($('source-view')).toBeNull();expect($('article-content').textContent).toContain('Second body');[...document.querySelectorAll('#article-list button')].find(node=>node.textContent==='Title').click();await vi.waitFor(()=>expect(address).toContain('path=articles%2Fone.md'));$('source-article').click();expect($('source-edit').value).toContain('Source draft A');await vi.waitFor(()=>expect(articleDraft()?.parts.fields.html?.value).toContain('Source draft A'));expect(window.confirm).not.toHaveBeenCalled();});
 it('query refresh preserves typed source and same-article rich edits invalidate stale Apply',()=>{$('source-article').click();$('source-edit').value='<h1>Source draft</h1>';$('source-edit').dispatchEvent(new Event('input'));docs[0].fields.html='<h1>Remote</h1>';emit('query',{documents:docs});expect($('source-edit').value).toContain('Source draft');expect($('article-content').textContent).toContain('Original');edit('New rich edit');document.querySelector('#source-view .update').click();expect($('article-content').textContent).toContain('New rich edit');expect(document.querySelector('#source-view [role="alert"]').textContent).toContain('not applied');});
 it('uses the donor menu tabs and theme controls without added Room selectors',()=>{expect($('room-select')).toBeNull();$('menu-toggle').click();expect($('document-menu').classList.contains('on')).toBe(true);document.querySelector('#document-menu-tabs a[href="#menu-tools"]').click();expect($('menu-tools').classList.contains('selected')).toBe(true);expect($('source-article').closest('#menu-tools')).toBeTruthy();document.querySelector('#document-menu-tabs a[href="#menu-settings"]').click();$('do-theme-dark').checked=true;$('do-theme-dark').dispatchEvent(new Event('change',{bubbles:true}));expect(document.documentElement.dataset.theme).toBe('dark');});
 
@@ -135,3 +139,49 @@ it('half-typed donor popup content is intentionally not stored as document or UI
 it('later shared draft typing redraws a tab that had already staged earlier typing',async()=>{edit('Earlier typing');await vi.waitFor(()=>expect(articleDraft()?.parts.fields.html?.value).toContain('Earlier typing'));const previous=articleDraft(),later={...previous,revision:'later-tab',parts:{...previous.parts,fields:{...previous.parts.fields,html:{...previous.parts.fields.html,value:'<h1>Later typing</h1><p>Other tab</p>'}}}};drafts=drafts.map(d=>d===previous?later:d);emit('room-drafts',drafts);await vi.waitFor(()=>expect($('article-content').textContent).toContain('Other tab'));expect(window.confirm).not.toHaveBeenCalled();});
 
 it('typing body text does not overwrite a disjoint shared title field',async()=>{edit();await vi.waitFor(()=>expect(presentation.editorModes?.['r_a\narticles/one.md']).toBe('author'));const previous=articleDraft(),later={room:'r_a',path:'articles/one.md',revision:'title-tab',parts:{fields:{...(previous?.parts.fields||{}),title:{value:'Shared metadata title',base:{value:'Title'}}}},returned:null,changedUnderneath:{}};drafts=[...drafts.filter(d=>d.path!=='articles/one.md'),later];emit('room-drafts',drafts);const v=view();v.dispatch(v.state.tr.insertText(' changed body',v.state.doc.content.size-1));await vi.waitFor(()=>expect(articleDraft()?.parts.fields.html?.value).toContain('changed body'));expect(articleDraft().parts.fields.title.value).toBe('Shared metadata title');});
+
+function hostOpen(next){address=next;addressListeners.forEach(fn=>fn(next));}
+const articleURL=(path,room='r_a')=>`/articles?${new URLSearchParams({room,path})}`;
+it('cold article link waits for sync and query without choosing the first article or writing',async()=>{
+ docs.push({...doc('r_a','articles/two.md'),fields:{...fields,title:'Second',html:'<h1>Second</h1><p>Linked body</p>'}});
+ address=articleURL('articles/two.md');await remount();
+ expect($('article-content').textContent).toContain('Linked body');
+ expect(fixtures.bridge.push).not.toHaveBeenCalled();
+ expect(fixtures.runtime.save).not.toHaveBeenCalled();expect(fixtures.runtime.roomDraft.write).not.toHaveBeenCalled();
+});
+it('host Back and Forward retain native drafts, with no echo, and reload restores the requested document',async()=>{
+ docs.push({...doc('r_a','articles/two.md'),fields:{...fields,title:'Second',html:'<h1>Second</h1><p>Other body</p>'}});emit('query',{documents:docs});
+ edit('Kept here');await vi.waitFor(()=>expect(articleDraft()?.parts.fields.html?.value).toContain('Kept here'));
+ const pushes=fixtures.bridge.push.mock.calls.length;
+ hostOpen(articleURL('articles/two.md'));expect($('article-content').textContent).toContain('Other body');
+ hostOpen(articleURL('articles/one.md'));expect($('article-content').textContent).toContain('Kept here');
+ await remount();expect($('article-content').textContent).toContain('Kept here');
+ expect(fixtures.bridge.push).toHaveBeenCalledTimes(pushes);expect(fixtures.runtime.save).not.toHaveBeenCalled();expect(fixtures.runtime.roomDraft.discard).not.toHaveBeenCalled();
+});
+it('missing or foreign article links never create content or fall back to the first article',()=>{
+ hostOpen(articleURL('articles/missing.md'));expect($('article-content').textContent).toContain('unavailable');expect($('save-article').disabled).toBe(true);
+ hostOpen(articleURL('articles/one.md','r_b'));expect($('article-content').textContent).toContain('unavailable');
+ expect(fixtures.runtime.save).not.toHaveBeenCalled();expect(fixtures.runtime.roomDraft.write).not.toHaveBeenCalled();
+ hostOpen(articleURL('articles/one.md'));expect($('article-content').textContent).toContain('Original');expect($('edit-article').disabled).toBe(false);
+});
+it('a host navigation closes a half-written new dialog but preserves its Room creation draft',async()=>{
+ $('new-article').click();$('new-title').value='Keep my title';$('new-title').dispatchEvent(new Event('input'));
+ await vi.waitFor(()=>expect(drafts.some(d=>d.parts.creation?.fields.title==='Keep my title')).toBe(true));
+ hostOpen(articleURL('articles/missing.md'));expect($('new-dialog').open).toBe(false);
+ expect(drafts.some(d=>d.parts.creation?.fields.title==='Keep my title')).toBe(true);expect(fixtures.runtime.save).not.toHaveBeenCalled();
+});
+it('a Save completion for the previous article cannot reopen it over the newer address',async()=>{
+ docs.push({...doc('r_a','articles/two.md'),fields:{...fields,title:'Second',html:'<h1>Second</h1><p>Current body</p>'}});emit('query',{documents:docs});
+ edit('Saved A');await vi.waitFor(()=>expect(articleDraft()?.parts.fields.html?.value).toContain('Saved A'));
+ let finish;const save=fixtures.runtime.save.getMockImplementation();fixtures.runtime.save.mockImplementation(async(...args)=>{await new Promise(resolve=>{finish=resolve;});return save(...args);});
+ $('save-article').click();await vi.waitFor(()=>expect(finish).toBeTypeOf('function'));hostOpen(articleURL('articles/two.md'));finish();
+ await vi.waitFor(()=>expect(docs[0].fields.html).toContain('Saved A'));expect($('article-content').textContent).toContain('Current body');expect(address).toBe(articleURL('articles/two.md'));
+});
+
+it('an initially unknown House address cannot overwrite a later deep link with the first article',async()=>{
+ address=null;fixtures.bridge.replace.mockClear();await remount();
+ expect(fixtures.bridge.replace).not.toHaveBeenCalled();expect($('article-content').textContent).not.toContain('Original');
+ hostOpen(articleURL('articles/later.md'));expect($('article-content').textContent).toContain('unavailable');
+ docs.push({...doc('r_a','articles/later.md'),fields:{...fields,title:'Later',html:'<h1>Later</h1><p>Arrived after address</p>'}});emit('query',{documents:docs});
+ expect($('article-content').textContent).toContain('Arrived after address');expect(fixtures.bridge.replace).not.toHaveBeenCalled();expect(fixtures.runtime.save).not.toHaveBeenCalled();
+});

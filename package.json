@@ -15,7 +15,8 @@
     "lint:donor": "eslint src/editor src/ui src/utils src/vendor src/config.js src/services.js src/uri.js src/table.js --rule 'no-unused-vars:off' --rule 'no-redeclare:off' --rule 'no-dupe-keys:off' --rule 'no-dupe-class-members:off' --rule 'no-useless-escape:off' --rule 'no-empty:off'",
     "starter:check": "node scripts/check-starter.mjs",
     "publish": "node publish.mjs",
-    "verify": "npm run typecheck && npm run lint && npm test && npm run starter:check && npm run lint:donor && npm run licenses:check && npm run build && npm run release:check"
+    "verify": "npm run test:publisher && npm run typecheck && npm run lint && npm test && npm run starter:check && npm run lint:donor && npm run licenses:check && npm run build && npm run release:check",
+    "test:publisher": "node --test scripts/publish-regression.mjs"
   },
   "dependencies": {
     "@agentshouse/app-bridge": "0.1.0-ce524f6608238",
