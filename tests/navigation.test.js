@@ -1,5 +1,5 @@
 import {describe,it,expect,vi} from 'vitest';
-import {connectHouseBridge} from '@agentshouse/app-bridge';
+import {houseBridge} from '@agentshouse/app-bridge';
 import {createHouseBridgeTestHost} from '@agentshouse/app-bridge/test-host';
 import {ArticleNavigation,articleAddress,readArticleAddress} from '../src/house/navigation';
 describe('Editor House addresses',()=>{
@@ -12,7 +12,7 @@ describe('Editor House addresses',()=>{
  });
  it('uses the official bridge for cold article, Back/Forward and explicit replace after deletion, without echo',async()=>{
   const target={room:'r',path:'articles/b.md'};
-  const host=createHouseBridgeTestHost({address:articleAddress(target)}),nav=new ArticleNavigation(connectHouseBridge(host));const off=nav.subscribe(vi.fn());
+  const host=createHouseBridgeTestHost({address:articleAddress(target)}),nav=new ArticleNavigation(houseBridge());const off=nav.subscribe(vi.fn());
   await vi.waitFor(()=>expect(nav.snapshot().target).toEqual(target));expect(host.navigations).toHaveLength(0);
   nav.navigate({room:'r',path:'articles/c.md'});await vi.waitFor(()=>expect(nav.snapshot().target?.path).toBe('articles/c.md'));
   host.open(articleAddress(target));await vi.waitFor(()=>expect(nav.snapshot().target).toEqual(target));expect(host.navigations).toHaveLength(1);

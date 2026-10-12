@@ -1,7 +1,7 @@
 [
   {
     "name": "@agentshouse/app-bridge",
-    "version": "0.1.0-ce524f6608238",
+    "version": "0.1.0-ca4ec913df08d",
     "license": "MIT",
     "source": "",
     "developmentOnly": false,
@@ -11,7 +11,7 @@
   },
   {
     "name": "@agentshouse/mdmodel",
-    "version": "0.1.0-c68e2039f1ca8",
+    "version": "0.1.0-c64dbada0730d",
     "license": "MIT",
     "source": "",
     "developmentOnly": false,
@@ -21,7 +21,7 @@
   },
   {
     "name": "@agentshouse/mdruntime",
-    "version": "0.1.0-cff8ba8fa2542",
+    "version": "0.1.0-cf6d5f0a5c9c8",
     "license": "MIT",
     "source": "",
     "developmentOnly": false,

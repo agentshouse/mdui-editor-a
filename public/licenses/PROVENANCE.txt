@@ -19,7 +19,7 @@ Media: original donor media files retained without trimming. Upstream README lic
 Ubuntu fonts: Ubuntu Font Licence 1.0, Canonical Ltd. https://canonical.com/legal/font-licence
 Font Awesome Free SVG icon markup: v7.1.0, Copyright 2026 Fonticons, Inc. Icons CC BY 4.0, code MIT, fonts SIL OFL 1.1. https://fontawesome.com/license/free
 
-@agentshouse/app-bridge 0.1.0-ce524f6608238 ships an MIT LICENSE (Copyright 2026 Anton (trof3039)); it is copied in this directory.
+@agentshouse/app-bridge 0.1.0-ca4ec913df08d ships an MIT LICENSE (Copyright 2026 Anton (trof3039)); it is copied in this directory.
 @dokieli/web-annotation 1.1.0 is Apache-2.0. Only transport-free DOM selection/marking helpers enter the bundle.
 All installed direct/transitive build and runtime dependency versions, declared licenses and available notices are listed in dependency-inventory.json. No npm dependency-graph audit was run.
 
