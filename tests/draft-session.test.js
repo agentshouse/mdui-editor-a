@@ -38,7 +38,7 @@ function runtime(initial = null) {
   save: vi.fn(async (_room, named) => {
    if (md.beforeSave) await md.beforeSave();
    const [{path, revision}] = named;
-   if (state.get(path)?.revision !== revision) return {outcome: 'refused', rule: 'stale', file: path};
+   if (state.get(path)?.revision !== revision) return {outcome: 'refused', code: 'stale', retryable: false, file: path};
    if (md.refuse) return clone(md.refuse);
    state.delete(path);
    md.emit(null);
@@ -249,7 +249,7 @@ describe('document-local Room Draft session', () => {
 
  it('keeps refused drafts editable without rebasing and returns the native refusal', async () => {
   const md = runtime(), errors = vi.fn(), session = new DraftSession(md, opened, null, {onError: errors});
-  md.refuse = {outcome: 'refused', rule: 'changed-underneath', parts: [{path: opened.path, part: 'field', name: 'html'}]};
+  md.refuse = {outcome: 'refused', code: 'changed-underneath', retryable: false, parts: [{path: opened.path, part: 'field', name: 'html'}]};
   session.enqueue({html: 'My draft'});
   expect(await session.save()).toEqual(md.refuse);
   const firstRevision = session.draft.revision;
@@ -443,7 +443,7 @@ describe('document-local Room Draft session', () => {
   expect(session.draft.changedUnderneath).toEqual(returned.changedUnderneath);
   expect(session.draft.parts.fields.html).toEqual({value: 'Later local input', base: {value: 'Original provider base'}});
   expect(session.draft.parts.fields.title).toEqual(returned.parts.fields.title);
-  md.refuse = {outcome: 'refused', rule: 'changed-underneath'};
+  md.refuse = {outcome: 'refused', code: 'changed-underneath', retryable: false};
   expect(await session.save()).toEqual(md.refuse);
   expect(session.draft.returned).toEqual(returned.returned);
  });

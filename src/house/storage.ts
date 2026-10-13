@@ -32,7 +32,7 @@ export class HouseStorage extends StorageBackend {
    const draft = await this.runtime.roomDraft.write(this.room,path,null,parts);
    if (draft.outcome !== 'written' || !draft.roomDraft) throw new Error('Another tab changed the draft. Your edits remain on screen.');
    const saved = await this.runtime.save(this.room,[{path,revision:draft.roomDraft.revision}]);
-   if (saved.outcome !== 'saved') throw new Error(`House refused this save (${saved.rule}). Drafts have been preserved. ${JSON.stringify(saved)}`);
+   if (saved.outcome !== 'saved') throw new Error(`House refused this save (${saved.code}). Drafts have been preserved. ${JSON.stringify(saved)}`);
    return saved;
   } finally { this.busy = false; }
  }

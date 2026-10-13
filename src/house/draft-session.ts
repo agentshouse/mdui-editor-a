@@ -159,8 +159,8 @@ export class DraftSession {
      throw this.fail('save-failed', 'The local save could not be confirmed. Your draft and latest text have been kept.', this.held, cause, true);
     }
     if (result.outcome !== 'saved') {
-     if (result.rule === 'stale') { await this.readShared(); continue; }
-     this.fail('save-refused', `House refused this save (${result.rule}). Your draft and latest text have been kept.`, this.held, result);
+     if (result.code === 'stale') { await this.readShared(); continue; }
+     this.fail('save-refused', `House refused this save (${result.code}). Your draft and latest text have been kept.`, this.held, result);
      return result;
     }
     this.baseline = savedFields;

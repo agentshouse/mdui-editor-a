@@ -157,7 +157,7 @@ async function start(){try{
  // This App exposes no immediate remote Actions; access/refusal guards remain.
  await watch(runtime.observe('service-mode'),renderControls);
  await watch(runtime.observe('storage-loss'),value=>{if(value){blocker=`House reported storage loss: ${value}`;warning(blocker);renderControls();}});
- await watch(runtime.observe('connection-refusal'),value=>{if(value){blocker=`House connection refused: ${value.reason}. Reopen after resolving access.`;warning(blocker);renderControls();}});
+ await watch(runtime.observe('connection-refusal'),value=>{if(value){blocker=`House connection refused: ${value.code}. Reopen after resolving access.`;warning(blocker);renderControls();}});
  if(!(await runtime.persistence()))warning('House reports non-durable browser storage. Export important local drafts before closing.');
 }catch(error){blocker=error.message;warning(`Could not load House: ${blocker}`);renderControls();}}
 window.addEventListener('pagehide',()=>{active=false;handles.forEach(handle=>handle.close());editor.dispose();});

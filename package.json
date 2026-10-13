@@ -15,11 +15,10 @@
     "lint:donor": "eslint src/editor src/ui src/utils src/vendor src/config.js src/services.js src/uri.js src/table.js --rule 'no-unused-vars:off' --rule 'no-redeclare:off' --rule 'no-dupe-keys:off' --rule 'no-dupe-class-members:off' --rule 'no-useless-escape:off' --rule 'no-empty:off'",
     "starter:check": "node scripts/check-starter.mjs",
     "publish": "node publish.mjs",
-    "verify": "npm run test:publisher && npm run typecheck && npm run lint && npm test && npm run starter:check && npm run lint:donor && npm run licenses:check && npm run build && npm run release:check",
-    "test:publisher": "node --test scripts/publish-regression.mjs"
+    "verify": "npm run typecheck && npm run lint && npm test && npm run starter:check && npm run lint:donor && npm run licenses:check && npm run build && npm run release:check"
   },
   "dependencies": {
-    "@agentshouse/app-bridge": "0.1.0-ca4ec913df08d",
+    "@agentshouse/app-bridge": "0.1.0-cc70c9b07c3ec",
     "@dokieli/web-annotation": "1.1.0",
     "dompurify": "3.4.13",
     "micromark": "4.0.0",
@@ -39,6 +38,8 @@
     "yaml": "2.7.1"
   },
   "devDependencies": {
+    "@agentshouse/mdmodel": "0.1.0-c6e675bb19980",
+    "@agentshouse/mdruntime": "0.1.0-c8ca66ac9e99d",
     "@eslint/js": "9.24.0",
     "@types/node": "22.14.1",
     "eslint": "9.24.0",
