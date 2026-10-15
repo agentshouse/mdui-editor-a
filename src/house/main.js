@@ -117,7 +117,7 @@ function reconcileArticle(){
 }
 function refreshRooms(value){rooms=value;updateReach();reconcileArticle();}
 function refreshSync(value){syncStatus=value;if(value.attentionRequired.length)warning('A save was returned and needs attention. Your local drafts have been kept.','sync-error');else if(warningKind==='sync-error')warning();updateReach();reconcileArticle();}
-function acceptQuery(result){try{articles=result.documents.map(decodeArticle);dataBlocker='';queryReceived=true;}catch(error){dataBlocker=error.message;warning(dataBlocker);renderControls();return;}renderList();reconcileArticle();renderControls();}
+function acceptQuery(result){if('pending' in result){queryReceived=false;dataBlocker='';renderControls();return;}try{articles=result.documents.map(decodeArticle);dataBlocker='';queryReceived=true;}catch(error){dataBlocker=error.message;warning(dataBlocker);renderControls();return;}renderList();reconcileArticle();renderControls();}
 function acceptDrafts(value){allDrafts=value;draftsReceived=true;for(const s of sessions.values())s.observe(value.find(d=>d.room===s.room&&d.path===s.path)||null);renderList();reconcileArticle();renderControls();}
 async function commit(s){
  if(!s||!s.path.startsWith('articles/')||saving.has(s)||!writable||blocker||dataBlocker)return;

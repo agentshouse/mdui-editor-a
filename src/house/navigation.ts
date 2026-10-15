@@ -18,6 +18,7 @@ export function readArticleAddress(address: string | null): ArticleRoute {
   if(address===null)return {target:null,ready:false,error:null};
   try {
     if(address.length>1000||[...address].some(c=>c.charCodeAt(0)<=32||c.charCodeAt(0)===127)||address.includes('?')||address.includes('#'))throw new Error();
+    if(address==='/')return {target:null,ready:true,error:null};
     const segments=address.split('/');
     if(segments.shift()!==''||segments[0]!==ARTICLE_SLOT)throw new Error();
     if(segments.length===1)return {target:null,ready:true,error:null};

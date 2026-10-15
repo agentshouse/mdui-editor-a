@@ -7,6 +7,7 @@ describe('Editor House addresses',()=>{
   const target={room:'r_19.z',path:'articles/Привет #1.md'};
   expect(readArticleAddress(articleAddress(target))).toEqual({target,ready:true,error:null});
   expect(readArticleAddress(null).ready).toBe(false);
+  expect(readArticleAddress('/').target).toBeNull();
   expect(readArticleAddress('/articles').target).toBeNull();
   for(const input of ['//evil.test','https://evil.test','/articles?room=r&path=a.md','/articles/r','/articles/r/../private','/articles/r/a.md?text=secret','/articles/r/%2Fprivate','/articles/r/a.md#save','/articles/r/a.md\n'])expect(readArticleAddress(input).error).toBeTruthy();
  });
