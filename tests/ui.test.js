@@ -8,7 +8,7 @@ let docs,drafts,rooms,writeResolve,config,revision,presentation,address,addressL
 const $=id=>document.getElementById(id);
 const articleDraft=()=>drafts.find(d=>d.room==='r_a'&&d.path==='articles/one.md');
 const emit=(topic,value)=>fixtures.handlers.get(topic)?.(value);
-const room=id=>({locator:id,name:id,operations:{write:['/']},replica:{admission:'admitted'},refusal:null});
+const room=(id,handle=id==='r_a'?'lively-ember-6ajm':id)=>({locator:id,handle,name:id,operations:{write:['/']},replica:{admission:'admitted'},refusal:null});
 function doc(id='r_a',path='articles/one.md'){return{room:id,path,markdown:'opened',fields:{...fields}};}
 function view(){return config.Editor.editorView;}
 function edit(text='Changed'){if(!$('edit-article').textContent.includes('Read'))$('edit-article').click();const v=view();v.dispatch(v.state.tr.insertText(text,1,6));}
@@ -151,7 +151,12 @@ it('later shared draft typing redraws a tab that had already staged earlier typi
 it('typing body text does not overwrite a disjoint shared title field',async()=>{edit();await vi.waitFor(()=>expect(presentation.editorModes?.['r_a\narticles/one.md']).toBe('author'));const previous=articleDraft(),later={room:'r_a',path:'articles/one.md',revision:'title-tab',parts:{fields:{...(previous?.parts.fields||{}),title:{value:'Shared metadata title',base:{value:'Title'}}}},returned:null,changedUnderneath:{}};drafts=[...drafts.filter(d=>d.path!=='articles/one.md'),later];emit('room-drafts',drafts);const v=view();v.dispatch(v.state.tr.insertText(' changed body',v.state.doc.content.size-1));await vi.waitFor(()=>expect(articleDraft()?.parts.fields.html?.value).toContain('changed body'));expect(articleDraft().parts.fields.title.value).toBe('Shared metadata title');});
 
 function hostOpen(next){address=next;addressListeners.forEach(fn=>fn(next));}
-const articleURL=(path,room='r_a')=>`/articles/${encodeURIComponent(room)}/${path.split('/').map(encodeURIComponent).join('/')}`;
+const articleURL=(path,handle='lively-ember-6ajm')=>`/articles/${encodeURIComponent(handle)}/${path.slice(0,-3).split('/').map(encodeURIComponent).join('/')}`;
+it('opens the canonical Site handle address in its Room and restores the markdown suffix',()=>{
+ hostOpen('/articles/lively-ember-6ajm/articles/one');
+ expect($('article-content').textContent).toContain('Original');
+ expect($('edit-article').disabled).toBe(false);
+});
 it('cold article link waits for sync and query without choosing the first article or writing',async()=>{
  docs.push({...doc('r_a','articles/two.md'),fields:{...fields,title:'Second',html:'<h1>Second</h1><p>Linked body</p>'}});
  address=articleURL('articles/two.md');await remount();
