@@ -1,0 +1,18 @@
+{
+  "micromark@4.0.0": {
+    "source": "https://raw.githubusercontent.com/micromark/micromark/18f2fa6842f964ef6a488f423c291aa06fef7999/license",
+    "notice": "micromark-4.0.0-upstream-license.txt",
+    "sha256": "536804b3adbff17dbbb9ed0d2bf9655b78f07640278581e37e3d7475282d5e61"
+  },
+  "@cfworker/json-schema@4.1.1": {
+    "source": "https://raw.githubusercontent.com/cfworker/cfworker/5409fdc2bd144f68e8b28c61c71fcb16600000a6/LICENSE.md",
+    "notice": "cfworker-json-schema-4.1.1-upstream-license.txt",
+    "sha256": "376944252ab78ca6b41aee44ddea8894927ee67891e77e61eb9d59af63e35094"
+  },
+  "uri-templates@0.2.0": {
+    "source": "https://geraintluff.github.io/tv4/LICENSE.txt",
+    "notice": "uri-templates-0.2.0-public-domain.txt",
+    "sha256": "3b0d3cf682febc6dd562c9ce031d9a5e87c21c55e115bfaa4a5f0e9b6990651f",
+    "versionEvidence": "Published package gitHead 3c65c2e1809e8c0dca1fb6b440c18fbc7acd85da; package README and package.json both identify the public-domain notice URL."
+  }
+}

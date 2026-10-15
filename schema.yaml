@@ -1,0 +1,24 @@
+document_article:
+  type: object
+  properties:
+    title: { type: string }
+    html: { type: string }
+    archived: { type: boolean }
+    source_url: { type: string }
+    source_revision: { type: string }
+    author: { type: string }
+    license: { type: string }
+    license_url: { type: string }
+  required: [title, html, archived, source_url, source_revision, author, license, license_url]
+
+plate_article:
+  type: object
+  properties:
+    title: { type: string }
+    content: { type: string }
+    archived: { type: boolean }
+    source_url: { type: string }
+    source_revision: { type: string }
+    author: { type: string }
+    license: { type: string }
+  required: [title, content, archived, source_url, source_revision, author, license]

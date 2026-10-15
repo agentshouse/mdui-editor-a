@@ -1,0 +1,1 @@
+Source notices are generated into licenses/ at build time.
