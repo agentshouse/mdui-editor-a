@@ -8,7 +8,7 @@ describe('Editor House addresses',()=>{
   expect(readArticleAddress(articleAddress(target))).toEqual({target,ready:true,error:null});
   expect(readArticleAddress(null).ready).toBe(false);
   expect(readArticleAddress('/articles').target).toBeNull();
-  for(const input of ['//evil.test','https://evil.test','/articles?room=r','/articles?path=a.md','/articles?room=r&path=../private','/articles?room=r&path=a.md&path=b.md','/articles?room=r&path=a.md&text=secret','/articles?room=r&path=%2Fprivate','/articles?room=r&path=a.md#save','/articles?room=r&path=a.md\n'])expect(readArticleAddress(input).error).toBeTruthy();
+  for(const input of ['//evil.test','https://evil.test','/articles?room=r&path=a.md','/articles/r','/articles/r/../private','/articles/r/a.md?text=secret','/articles/r/%2Fprivate','/articles/r/a.md#save','/articles/r/a.md\n'])expect(readArticleAddress(input).error).toBeTruthy();
  });
  it('uses the official bridge for cold article, Back/Forward and explicit replace after deletion, without echo',async()=>{
   const target={room:'r',path:'articles/b.md'};

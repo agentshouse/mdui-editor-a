@@ -43,7 +43,7 @@ After a failed or uncertain push, inspect that state before deciding whether to 
 
 ## House navigation
 
-The outer App address identifies the open article as `/articles?room=<Room locator>&path=<document path>`.
+The outer App address identifies the open article as `/articles/<room>/<document path>`, the Site document-page contract. The `articles` slot and its stored Room segment are the canonical owner of that address; query-string article routes are not accepted.
 Initial links wait for the Room, query, draft and completed-sync observations. A missing or foreign article is unavailable; a URL never creates or authorizes a document. Root opens the first available article with a history replacement.
 
 Article choices use the existing House bridge. Back, Forward and reload restore the addressed article without saving or discarding its native Room draft. Each document's existing presentation mode remains in House presentation storage. Native drafts survive closing a source view or a new-article dialog. Query refresh and a previous article's Save completion cannot select a different article.

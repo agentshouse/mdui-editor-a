@@ -141,7 +141,7 @@ it('later shared draft typing redraws a tab that had already staged earlier typi
 it('typing body text does not overwrite a disjoint shared title field',async()=>{edit();await vi.waitFor(()=>expect(presentation.editorModes?.['r_a\narticles/one.md']).toBe('author'));const previous=articleDraft(),later={room:'r_a',path:'articles/one.md',revision:'title-tab',parts:{fields:{...(previous?.parts.fields||{}),title:{value:'Shared metadata title',base:{value:'Title'}}}},returned:null,changedUnderneath:{}};drafts=[...drafts.filter(d=>d.path!=='articles/one.md'),later];emit('room-drafts',drafts);const v=view();v.dispatch(v.state.tr.insertText(' changed body',v.state.doc.content.size-1));await vi.waitFor(()=>expect(articleDraft()?.parts.fields.html?.value).toContain('changed body'));expect(articleDraft().parts.fields.title.value).toBe('Shared metadata title');});
 
 function hostOpen(next){address=next;addressListeners.forEach(fn=>fn(next));}
-const articleURL=(path,room='r_a')=>`/articles?${new URLSearchParams({room,path})}`;
+const articleURL=(path,room='r_a')=>`/articles/${encodeURIComponent(room)}/${path.split('/').map(encodeURIComponent).join('/')}`;
 it('cold article link waits for sync and query without choosing the first article or writing',async()=>{
  docs.push({...doc('r_a','articles/two.md'),fields:{...fields,title:'Second',html:'<h1>Second</h1><p>Linked body</p>'}});
  address=articleURL('articles/two.md');await remount();
