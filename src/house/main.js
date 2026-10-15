@@ -72,7 +72,7 @@ function renderList(){
   const li=document.createElement('li'),button=document.createElement('button');button.type='button';button.textContent=(row.fields.title||'New article')+(row.fields.archived?' (archived)':'');button.setAttribute('aria-current',String(selected&&key(selected)===key(row)));button.addEventListener('click',()=>navigateArticle(row));li.append(button);$('article-list').append(li);
  }
 }
-function navigateArticle(row,replace=false){navigation.navigate({room:row.room,path:row.path},replace);}
+function navigateArticle(row,replace=false){const source=rooms.find(candidate=>candidate.locator===row.room);if(source)navigation.navigate({handle:source.handle,path:row.path},replace);}
 function closeSource(){editor.sourceState?.aside.remove();editor.sourceState=null;}
 function openArticle(row){
  // Navigation is entirely local. Sessions outlive their views and keep writing
@@ -104,7 +104,7 @@ function reconcileArticle(){
  if(!queryReceived||!draftsReceived||dataBlocker)return;
  navigationBlocker='';
  if(route.target){
-  const target=rooms[0].locator===route.target.room?rows().find(row=>row.room===route.target.room&&row.path===route.target.path):null;
+  const source=rooms.find(candidate=>candidate.handle===route.target.handle),target=source?rows().find(row=>row.room===source.locator&&row.path===route.target.path):null;
   if(!target){navigationBlocker='This article is unavailable in the connected collection.';warning(navigationBlocker,'navigation');if(!selected)$('article-content').textContent=navigationBlocker;renderControls();return;}
   if(warningKind==='navigation')warning();
   if(!selected||key(selected)!==key(target)){if(!target.markdown&&!target.fields.html)openNew(target);else openArticle(target);return;}
@@ -117,7 +117,7 @@ function reconcileArticle(){
 }
 function refreshRooms(value){rooms=value;updateReach();reconcileArticle();}
 function refreshSync(value){syncStatus=value;if(value.attentionRequired.length)warning('A save was returned and needs attention. Your local drafts have been kept.','sync-error');else if(warningKind==='sync-error')warning();updateReach();reconcileArticle();}
-function acceptQuery(result){try{articles=result.documents.map(decodeArticle);dataBlocker='';queryReceived=true;}catch(error){dataBlocker=error.message;warning(dataBlocker);renderControls();return;}renderList();reconcileArticle();renderControls();}
+function acceptQuery(result){if('pending' in result){queryReceived=false;dataBlocker='';renderControls();return;}try{articles=result.documents.map(decodeArticle);dataBlocker='';queryReceived=true;}catch(error){dataBlocker=error.message;warning(dataBlocker);renderControls();return;}renderList();reconcileArticle();renderControls();}
 function acceptDrafts(value){allDrafts=value;draftsReceived=true;for(const s of sessions.values())s.observe(value.find(d=>d.room===s.room&&d.path===s.path)||null);renderList();reconcileArticle();renderControls();}
 async function commit(s){
  if(!s||!s.path.startsWith('articles/')||saving.has(s)||!writable||blocker||dataBlocker)return;

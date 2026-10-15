@@ -1,30 +1,32 @@
 import type { HouseBridge } from '@agentshouse/app-bridge';
-export type ArticleTarget = { room: string; path: string };
+export type ArticleTarget = { handle: string; path: string };
 export type NavigationBridge = Pick<HouseBridge,'address'|'onAddress'|'push'|'replace'>;
 export type ArticleRoute = { target: ArticleTarget | null; ready: boolean; error: string | null };
-const safeRoom = (value: string) => /^[a-zA-Z0-9_.-]{1,256}$/.test(value);
+const ARTICLE_SLOT = 'articles';
+const safeHandle = (value: string) => /^[a-zA-Z0-9_.-]{1,256}$/.test(value);
 const safePath = (value: string) => value.length > 0 && value.length <= 512 && !value.includes('\\') && ![...value].some(c=>c.charCodeAt(0)<32||c.charCodeAt(0)===127) && value.split('/').every(part=>part!==''&&part!=='.'&&part!=='..');
+const encodePath = (path: string) => path.split('/').map(encodeURIComponent).join('/');
+const decodePath = (segments: readonly string[]) => segments.map(segment=>decodeURIComponent(segment)).join('/');
+const markdownPath = (path: string) => path.endsWith('.md') && path.length > 3;
 export function articleAddress(target: ArticleTarget | null): string {
-  if (!target) return '/articles';
-  if (!safeRoom(target.room)||!safePath(target.path)) throw new Error('Invalid article address.');
-  const query = new URLSearchParams({room:target.room,path:target.path});
-  const address=`/articles?${query}`;
+  if (!target) return `/${ARTICLE_SLOT}`;
+  if (!safeHandle(target.handle)||!safePath(target.path)||!markdownPath(target.path)) throw new Error('Invalid article address.');
+  const path=target.path.slice(0,-3),address=`/${ARTICLE_SLOT}/${encodeURIComponent(target.handle)}/${encodePath(path)}`;
   if(address.length>1000)throw new Error('This article link is too long.');
   return address;
 }
 export function readArticleAddress(address: string | null): ArticleRoute {
   if(address===null)return {target:null,ready:false,error:null};
   try {
-    if(address.length>1000||[...address].some(c=>c.charCodeAt(0)<=32||c.charCodeAt(0)===127)||!/^\/(?:articles)?(?:\?|$)/.test(address))throw new Error();
-    const [pathname,query='']=address.split('?');
-    if(address.includes('#')||!['/','/articles'].includes(pathname)||address.split('?').length>2)throw new Error();
-    const searchParams=new URLSearchParams(query);
-    const keys=[...searchParams.keys()];
-    if(keys.some(key=>!['room','path'].includes(key))||new Set(keys).size!==keys.length)throw new Error();
-    if(!keys.length)return {target:null,ready:true,error:null};
-    const room=searchParams.get('room'),path=searchParams.get('path');
-    if(!room||!path||!safeRoom(room)||!safePath(path))throw new Error();
-    return {target:{room,path},ready:true,error:null};
+    if(address.length>1000||[...address].some(c=>c.charCodeAt(0)<=32||c.charCodeAt(0)===127)||address.includes('?')||address.includes('#'))throw new Error();
+    if(address==='/')return {target:null,ready:true,error:null};
+    const segments=address.split('/');
+    if(segments.shift()!==''||segments[0]!==ARTICLE_SLOT)throw new Error();
+    if(segments.length===1)return {target:null,ready:true,error:null};
+    if(segments.length<3)throw new Error();
+    const handle=decodeURIComponent(segments[1]),path=decodePath(segments.slice(2));
+    if(!safeHandle(handle)||!safePath(path)||path.endsWith('.md'))throw new Error();
+    return {target:{handle,path:`${path}.md`},ready:true,error:null};
   } catch { return {target:null,ready:true,error:'This article link is invalid. Choose an article from the library.'}; }
 }
 
